@@ -29,6 +29,7 @@ Remote execution additionally requires Python 3 in the terminal backend.
 """
 
 import base64
+import contextlib
 import functools
 import json
 import logging
@@ -436,6 +437,20 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
 
+# sys.stdout/stderr are process-global. The lock makes the swap+restore
+# atomic across concurrent RPC handlers, preventing the wrong file handle
+# from being restored when two dispatches race.
+_stdio_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _silenced_stdio():
+    with _stdio_lock:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                yield
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -516,17 +531,10 @@ def _rpc_server_loop(
                 # Suppress stdout/stderr from internal tool handlers so
                 # their status prints don't leak into the CLI spinner.
                 try:
-                    _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                    devnull = open(os.devnull, "w", encoding="utf-8")
-                    try:
-                        sys.stdout = devnull
-                        sys.stderr = devnull
+                    with _silenced_stdio():
                         result = handle_function_call(
                             tool_name, tool_args, task_id=task_id
                         )
-                    finally:
-                        sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                        devnull.close()
                 except Exception as exc:
                     logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
                     result = tool_error(str(exc))
@@ -790,17 +798,10 @@ def _rpc_poll_loop(
 
                     # Dispatch through the standard tool handler
                     try:
-                        _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                        devnull = open(os.devnull, "w", encoding="utf-8")
-                        try:
-                            sys.stdout = devnull
-                            sys.stderr = devnull
+                        with _silenced_stdio():
                             tool_result = handle_function_call(
                                 tool_name, tool_args, task_id=task_id
                             )
-                        finally:
-                            sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                            devnull.close()
                     except Exception as exc:
                         logger.error("Tool call failed in remote sandbox: %s",
                                      exc, exc_info=True)
