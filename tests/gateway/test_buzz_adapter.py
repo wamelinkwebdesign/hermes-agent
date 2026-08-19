@@ -427,6 +427,34 @@ class TestBuzzAdapterSend:
 
 class TestBuzzAdapterLifecycle:
 
+    @pytest.mark.asyncio
+    async def test_processing_complete_removes_in_progress_reaction(self):
+        from gateway.platforms.base import ProcessingOutcome
+        from types import SimpleNamespace
+
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        cli = _ScriptedCli()
+        cli.script(
+            "reactions",
+            "remove",
+            {"accepted": True, "event_id": "reaction-remove"},
+        )
+        adapter._run_cli = cli
+        event = SimpleNamespace(
+            message_id="e" * 64,
+            source=SimpleNamespace(chat_id=CHANNEL),
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        assert cli.calls == [
+            ([
+                "reactions", "remove",
+                "--event", "e" * 64,
+                "--emoji", "👀",
+            ], None),
+        ]
 
     @pytest.mark.asyncio
     async def test_disconnect_releases_scoped_lock(self, monkeypatch):

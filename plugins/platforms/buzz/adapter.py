@@ -664,6 +664,38 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
         return True
 
+    async def remove_reaction(
+        self,
+        chat_id: str,
+        message_id: str,
+        emoji: str = "👀",
+    ) -> bool:
+        """Remove one of this agent's reactions from a Buzz message."""
+        if not self.cli_path or not emoji or not message_id:
+            return False
+        args = [
+            "reactions", "remove",
+            "--event", str(message_id),
+            "--emoji", emoji,
+        ]
+        code, _out, err = await self._run_cli(args)
+        if code != 0:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    async def on_processing_complete(self, event, outcome) -> None:
+        """Clear the in-progress eyes reaction after every terminal outcome."""
+        message_id = getattr(event, "message_id", None) or getattr(
+            event.source, "message_id", None
+        )
+        chat_id = getattr(event.source, "chat_id", None)
+        if message_id and chat_id:
+            await self.remove_reaction(str(chat_id), str(message_id), "👀")
+
     async def send_image(
         self,
         chat_id: str,
