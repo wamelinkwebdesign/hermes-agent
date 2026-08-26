@@ -133,13 +133,28 @@ class TelegramTeamConfig:
 
 @dataclass(frozen=True)
 class TelegramTeamRouteContext:
-    """Stable adapter-to-runner input for one Telegram group message."""
+    """Stable adapter-to-runner input for one Telegram group message.
+
+    Message identifiers are normalized only from the current Telegram Message
+    and its immediate ``reply_to_message`` target. Invalid identifiers become
+    ``None``; quoted text is never a routing input.
+    """
 
     mentions: frozenset[str]
     reply_author_username: str | None
     chat_id: str
     owner_profile: str
     owner_username: str
+    message_id: str | None = None
+    reply_to_message_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "message_id", _normalize_message_id(self.message_id))
+        object.__setattr__(
+            self,
+            "reply_to_message_id",
+            _normalize_message_id(self.reply_to_message_id),
+        )
 
 
 @dataclass(frozen=True)

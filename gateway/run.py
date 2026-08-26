@@ -7090,6 +7090,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._telegram_team_coordinator_profile: Optional[str] = None
         self._telegram_team_dispatcher = None
         self._telegram_team_route_gate_callback = None
+        self._telegram_team_ingress_callback = None
+        # Process-local object identity authorizes runner-built routed events.
+        # It is attached dynamically to MessageEvent and never serialized.
+        self._telegram_team_route_capability = object()
         self._telegram_team_gate_adapters: Dict[str, BasePlatformAdapter] = {}
         self._telegram_team_routing_enabled = False
         self._telegram_team_profiles: tuple[str, ...] = ()
@@ -16055,9 +16059,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         callback = self.__dict__.get("_telegram_team_route_gate_callback")
         if callback is None:
-            # Capture the one runner-owned dispatcher identity even though the
-            # current-message gate deliberately does not claim ingress. Task 3
-            # will consume dispatcher state at central intake, not here.
+            # Capture the one runner-owned dispatcher identity. The lightweight
+            # gate only selects the structural owner; central ingress below owns
+            # claims, root aliases, and event preparation.
             shared_dispatcher = dispatcher
 
             def _team_gate(context):
@@ -16075,6 +16079,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     return False
                 try:
+                    ownership = shared_dispatcher.resolve_reply_owner(
+                        context.chat_id,
+                        context.reply_to_message_id,
+                    )
+                    if ownership is not None:
+                        return context.owner_profile == ownership.owner_profile
                     decision = resolve_addressed_owner(
                         mentions=set(context.mentions),
                         reply_author_username=context.reply_author_username,
@@ -16094,28 +16104,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             callback = _team_gate
             self._telegram_team_route_gate_callback = callback
+
+        ingress_callback = self.__dict__.get("_telegram_team_ingress_callback")
+        if ingress_callback is None:
+            shared_dispatcher = dispatcher
+
+            async def _team_ingress(adapter, event: MessageEvent) -> bool:
+                return await self._handle_telegram_team_ingress(
+                    shared_dispatcher,
+                    adapter,
+                    event,
+                )
+
+            ingress_callback = _team_ingress
+            self._telegram_team_ingress_callback = ingress_callback
         self._telegram_team_prepared = True
         return True
 
     @staticmethod
     def _clear_telegram_team_gate(adapter: Any) -> None:
-        """Best-effort clear with a direct fallback for a broken setter."""
-        setter = getattr(adapter, "set_team_route_gate", None)
-        try:
-            if callable(setter):
-                setter(None)
-                return
-        except Exception:
-            pass
-        try:
-            adapter._team_route_gate = None
-        except Exception:
-            pass
+        """Best-effort clear both team callbacks, even with broken setters."""
+        for setter_name, attribute_name in (
+            ("set_team_ingress_handler", "_team_ingress_handler"),
+            ("set_team_route_gate", "_team_route_gate"),
+        ):
+            setter = getattr(adapter, setter_name, None)
+            cleared = False
+            try:
+                if callable(setter):
+                    setter(None)
+                    cleared = True
+            except Exception:
+                pass
+            if cleared:
+                continue
+            try:
+                setattr(adapter, attribute_name, None)
+            except Exception:
+                pass
 
     def _disable_telegram_team_runtime(
         self, reason: str, *, log: bool = True
     ) -> None:
-        """Suspend runner-installed team gates without clearing reachable adapters."""
+        """Suspend runner-installed team callbacks without clearing adapters."""
         self._telegram_team_routing_enabled = False
         self._telegram_team_profiles = ()
         # A present team-routing mode must never fall back to an adapter's legacy
@@ -16134,6 +16165,324 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if owner is None and profile == "default":
             return "default"
         return None
+
+    def _telegram_team_profile_for_adapter(self, adapter: Any) -> Optional[str]:
+        """Return the one currently installed team profile for ``adapter``."""
+        installed = self.__dict__.get("_telegram_team_gate_adapters")
+        if not isinstance(installed, dict):
+            return None
+        profiles = [profile for profile, current in installed.items() if current is adapter]
+        return profiles[0] if len(profiles) == 1 else None
+
+    async def _handle_telegram_team_ingress(
+        self,
+        dispatcher: Any,
+        adapter: BasePlatformAdapter,
+        event: MessageEvent,
+    ) -> bool:
+        """Claim and prepare one structurally routed Telegram team event.
+
+        ``True`` means fail-closed/consumed. ``False`` leaves the normalized
+        event on Telegram's existing BasePlatformAdapter path. This seam does
+        no model routing, context retrieval, specialist dispatch, or delivery.
+        """
+        from gateway.telegram_team_routing import (
+            TelegramTeamRouteContext,
+            _normalize_group_chat_id,
+            _normalize_message_id,
+            resolve_addressed_owner,
+        )
+
+        metadata = event.metadata if isinstance(event.metadata, dict) else {}
+        routed_marker_present = "telegram_team_routed" in metadata
+        if routed_marker_present and metadata.get("telegram_team_routed") is not True:
+            return True
+
+        source = event.source
+        raw_message = event.raw_message
+        raw_chat = getattr(raw_message, "chat", None)
+        raw_chat_id = _normalize_group_chat_id(getattr(raw_chat, "id", None))
+        source_chat_id = _normalize_group_chat_id(
+            getattr(source, "chat_id", None) if source is not None else None
+        )
+        team_config = self.__dict__.get("_telegram_team_config")
+        allowed_chats = (
+            team_config.allowed_chats if team_config is not None else frozenset()
+        )
+        raw_is_team_chat = raw_chat_id in allowed_chats
+        source_is_team_chat = source_chat_id in allowed_chats
+
+        # DMs and unrelated groups retain the legacy path. If either side says
+        # this is an allowed team chat, however, disagreement is malformed and
+        # must not be allowed to bypass central ingress.
+        if not raw_is_team_chat and not source_is_team_chat:
+            return True if routed_marker_present else False
+        if (
+            not raw_is_team_chat
+            or not source_is_team_chat
+            or raw_chat_id != source_chat_id
+        ):
+            return True
+        raw_chat_id = cast(str, raw_chat_id)
+
+        # Commands keep the existing command/session path and are never claimed.
+        if not routed_marker_present and (
+            event.message_type is MessageType.COMMAND or event.is_command()
+        ):
+            return False
+
+        if (
+            self.__dict__.get("_telegram_team_routing_enabled") is not True
+            or self.__dict__.get("_telegram_team_dispatcher") is not dispatcher
+            or team_config is None
+        ):
+            return True
+        if not self._telegram_team_live_usernames_match():
+            self._disable_telegram_team_runtime(
+                "a configured live bot identity is stale or no longer matches",
+                log=False,
+            )
+            return True
+
+        profile = self._telegram_team_profile_for_adapter(adapter)
+        if (
+            profile is None
+            or profile not in team_config.members
+            or self._telegram_team_adapter_owner(adapter, profile) != profile
+            or source is None
+            or getattr(source, "platform", None) is not Platform.TELEGRAM
+            or self._adapter_for_source(source) is not adapter
+            or getattr(source, "profile_route_rejected", False) is True
+        ):
+            return True
+        source_profile = getattr(source, "profile", None)
+        if source_profile not in (None, profile):
+            return True
+
+        context_builder = getattr(adapter, "_team_route_context", None)
+        if not callable(context_builder):
+            return True
+        try:
+            context = cast(
+                TelegramTeamRouteContext,
+                context_builder(raw_message, raw_chat_id),
+            )
+        except Exception:
+            logger.warning(
+                "Telegram team ingress could not construct routing context",
+                exc_info=True,
+            )
+            return True
+        event_message_id = _normalize_message_id(event.message_id)
+        source_message_id = _normalize_message_id(getattr(source, "message_id", None))
+        event_reply_id = _normalize_message_id(event.reply_to_message_id)
+        if (
+            context.chat_id != raw_chat_id
+            or context.owner_profile != profile
+            or context.message_id is None
+            or context.message_id != event_message_id
+            or context.message_id != source_message_id
+            or context.reply_to_message_id != event_reply_id
+        ):
+            return True
+
+        if routed_marker_present:
+            capability = self.__dict__.get("_telegram_team_route_capability")
+            root_message_id = _normalize_message_id(
+                metadata.get("telegram_team_root_message_id")
+            )
+            route_reason = metadata.get("telegram_team_route_reason")
+            expected_scope = (
+                f"telegram-team:{raw_chat_id}:{root_message_id}"
+                if root_message_id is not None
+                else None
+            )
+            if (
+                capability is None
+                or getattr(event, "_telegram_team_route_capability", None)
+                is not capability
+                or metadata.get("telegram_team_owner_profile") != profile
+                or metadata.get("telegram_team_ingress_claimed") is not True
+                or root_message_id is None
+                or not isinstance(route_reason, str)
+                or not route_reason
+                or len(route_reason) > 128
+                or source_profile != profile
+                or getattr(source, "session_scope_id", None) != expected_scope
+            ):
+                return True
+            return False
+
+        claim = dispatcher.claim_ingress(raw_chat_id, context.message_id, profile)
+        if claim.duplicate:
+            return True
+        if not claim.claimed or claim.adapter_profile != profile:
+            return True
+
+        ownership = dispatcher.resolve_reply_owner(
+            raw_chat_id,
+            context.reply_to_message_id,
+        )
+        deferred_root_binding = False
+        if ownership is not None:
+            if ownership.owner_profile != profile or context.reply_to_message_id is None:
+                return True
+            if not dispatcher.record_inbound_alias(
+                raw_chat_id,
+                context.message_id,
+                context.reply_to_message_id,
+            ):
+                return True
+            root_message_id = ownership.root_message_id
+            owner_profile = ownership.owner_profile
+            route_reason = "reply_to_root_chain"
+        else:
+            try:
+                decision = resolve_addressed_owner(
+                    mentions=set(context.mentions),
+                    reply_author_username=context.reply_author_username,
+                    config=team_config,
+                    chat_id=raw_chat_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Telegram team structural ingress resolution failed",
+                    exc_info=True,
+                )
+                return True
+            if not decision.accepted or decision.owner_profile != profile:
+                return True
+            root_message_id = context.message_id
+            owner_profile = decision.owner_profile
+            route_reason = decision.reason
+            if route_reason == "unaddressed_ingress":
+                deferred_root_binding = True
+            elif not dispatcher.record_root(
+                raw_chat_id,
+                root_message_id,
+                owner_profile,
+            ):
+                return True
+
+        source.profile = owner_profile
+        source.session_scope_id = (
+            f"telegram-team:{raw_chat_id}:{root_message_id}"
+        )
+        prepared_metadata = dict(metadata)
+        prepared_metadata.update(
+            {
+                "telegram_team_root_message_id": root_message_id,
+                "telegram_team_owner_profile": owner_profile,
+                "telegram_team_route_reason": route_reason,
+                "telegram_team_ingress_claimed": True,
+            }
+        )
+        if deferred_root_binding:
+            prepared_metadata["telegram_team_root_binding_deferred"] = True
+        else:
+            prepared_metadata.pop("telegram_team_root_binding_deferred", None)
+        event.metadata = prepared_metadata
+        return False
+
+    def build_target_event(
+        self,
+        original: MessageEvent,
+        target_adapter: BasePlatformAdapter,
+        owner_profile: str,
+        root_message_id: str,
+        *,
+        route_reason: str,
+        context_text: Optional[str] = None,
+    ) -> MessageEvent:
+        """Construct a fresh, internally authorized Telegram team target event."""
+        from gateway.telegram_team_routing import (
+            _normalize_group_chat_id,
+            _normalize_message_id,
+        )
+
+        team_config = self.__dict__.get("_telegram_team_config")
+        source = original.source
+        chat_id = _normalize_group_chat_id(
+            getattr(source, "chat_id", None) if source is not None else None
+        )
+        root_id = _normalize_message_id(root_message_id)
+        message_id = _normalize_message_id(
+            getattr(source, "message_id", None) if source is not None else None
+        )
+        if message_id is None:
+            message_id = _normalize_message_id(original.message_id)
+        if (
+            team_config is None
+            or source is None
+            or getattr(source, "platform", None) is not Platform.TELEGRAM
+            or chat_id not in team_config.allowed_chats
+            or root_id is None
+            or message_id is None
+            or owner_profile not in team_config.members
+            or self._telegram_team_adapter_for_profile(owner_profile) is not target_adapter
+            or not isinstance(route_reason, str)
+            or not route_reason
+            or len(route_reason) > 128
+        ):
+            raise ValueError("invalid Telegram team target event parameters")
+
+        original_adapter = self._adapter_for_source(source)
+        target_source = target_adapter.build_source(
+            chat_id=source.chat_id,
+            chat_name=source.chat_name,
+            chat_type=source.chat_type,
+            user_id=source.user_id,
+            user_name=source.user_name,
+            thread_id=source.thread_id,
+            chat_topic=source.chat_topic,
+            user_id_alt=source.user_id_alt,
+            chat_id_alt=source.chat_id_alt,
+            is_bot=source.is_bot,
+            scope_id=source.scope_id,
+            guild_id=source.guild_id,
+            parent_chat_id=source.parent_chat_id,
+            message_id=message_id,
+            role_authorized=source.role_authorized,
+            auto_thread_created=source.auto_thread_created,
+            auto_thread_initial_name=source.auto_thread_initial_name,
+        )
+        target_source.profile = owner_profile
+        target_source.profile_route_rejected = False
+        target_source.session_scope_id = f"telegram-team:{chat_id}:{root_id}"
+        if self._adapter_for_source(target_source) is not target_adapter:
+            raise RuntimeError("target source does not resolve to target adapter")
+        if self._adapter_for_source(source) is not original_adapter:
+            raise RuntimeError("original source provenance changed")
+
+        metadata = dict(original.metadata or {})
+        metadata.pop("telegram_team_context_text", None)
+        metadata.update(
+            {
+                "telegram_team_routed": True,
+                "telegram_team_root_message_id": root_id,
+                "telegram_team_owner_profile": owner_profile,
+                "telegram_team_route_reason": route_reason,
+                "telegram_team_ingress_claimed": True,
+            }
+        )
+        if context_text is not None:
+            if not isinstance(context_text, str):
+                raise ValueError("context_text must be a string")
+            metadata["telegram_team_context_text"] = context_text[:4000]
+
+        routed = dataclasses.replace(
+            original,
+            source=target_source,
+            media_urls=list(original.media_urls),
+            media_types=list(original.media_types),
+            metadata=metadata,
+        )
+        capability = self.__dict__.get("_telegram_team_route_capability")
+        if capability is None:
+            capability = object()
+            self._telegram_team_route_capability = capability
+        setattr(routed, "_telegram_team_route_capability", capability)
+        return routed
 
     @staticmethod
     def _telegram_team_adapter_token(adapter: Any) -> Optional[str]:
@@ -16217,36 +16566,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _set_pending_telegram_team_gate(
         self, profile: str, adapter: BasePlatformAdapter
     ) -> bool:
-        """Set the shared rejecting-capable callback without validating credentials."""
+        """Atomically install the shared gate and Telegram ingress callback."""
         installed = self.__dict__.get("_telegram_team_gate_adapters")
         if not isinstance(installed, dict):
             installed = {}
             self._telegram_team_gate_adapters = installed
         previous = installed.get(profile)
-        callback = self.__dict__.get("_telegram_team_route_gate_callback")
-        if previous is adapter and getattr(adapter, "_team_route_gate", None) is callback:
+        gate_callback = self.__dict__.get("_telegram_team_route_gate_callback")
+        ingress_callback = self.__dict__.get("_telegram_team_ingress_callback")
+        if (
+            previous is adapter
+            and getattr(adapter, "_team_route_gate", None) is gate_callback
+            and getattr(adapter, "_team_ingress_handler", None) is ingress_callback
+        ):
             return True
-        if previous is not None and previous is not adapter:
-            if self.telegram_team_routing_enabled:
-                self._disable_telegram_team_runtime(
-                    f"replacement pending for profile '{profile}'"
-                )
-            self._clear_telegram_team_gate(previous)
-            installed.pop(profile, None)
 
-        setter = getattr(adapter, "set_team_route_gate", None)
-        if not callable(setter) or not callable(callback):
+        if previous is not None or self.telegram_team_routing_enabled:
+            self._disable_telegram_team_runtime(
+                f"callback replacement pending for profile '{profile}'",
+                log=previous is not adapter,
+            )
+
+        gate_setter = getattr(adapter, "set_team_route_gate", None)
+        ingress_setter = getattr(adapter, "set_team_ingress_handler", None)
+        if not (
+            callable(gate_setter)
+            and callable(ingress_setter)
+            and callable(gate_callback)
+            and callable(ingress_callback)
+        ):
             return False
         try:
-            setter(callback)
+            gate_setter(gate_callback)
+            ingress_setter(ingress_callback)
         except Exception:
-            # Adapter exceptions are intentionally not interpolated: a custom
-            # adapter could include its token in exception text.
+            # Roll back the candidate as one unit. Keep an older tracked adapter
+            # intact so its installed callbacks remain fail-closed and can be
+            # reactivated after a healthy replacement arrives.
+            self._clear_telegram_team_gate(adapter)
+            if previous is adapter:
+                installed.pop(profile, None)
             logger.warning(
-                "Telegram team gate installation failed for profile '%s'",
+                "Telegram team callback installation failed for profile '%s'",
                 profile,
             )
             return False
+
+        if previous is not None and previous is not adapter:
+            self._clear_telegram_team_gate(previous)
         installed[profile] = adapter
         return True
 
@@ -16305,7 +16672,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return self._set_pending_telegram_team_gate(profile, adapter)
 
     def _remove_telegram_team_gate(self, adapter: Any) -> None:
-        """Disable a tracked gate before a failed/stale adapter is discarded."""
+        """Disable tracked callbacks before a failed/stale adapter is discarded."""
         installed = self.__dict__.get("_telegram_team_gate_adapters")
         if not isinstance(installed, dict):
             return
@@ -16327,7 +16694,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _configure_primary_telegram_team_adapter(
         self, adapter: BasePlatformAdapter
     ) -> None:
-        """Apply pending/current team ownership and gate to a primary adapter."""
+        """Apply pending/current team ownership and callbacks to a primary adapter."""
         if not self._prepare_telegram_team_runtime():
             return
         profile = self.__dict__.get("_telegram_team_coordinator_profile")

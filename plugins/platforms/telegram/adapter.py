@@ -676,6 +676,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._team_route_gate: Optional[
             Callable[[TelegramTeamRouteContext], Optional[bool]]
         ] = None
+        self._team_ingress_handler: Optional[
+            Callable[["TelegramAdapter", MessageEvent], Awaitable[bool]]
+        ] = None
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
@@ -9028,6 +9031,65 @@ class TelegramAdapter(BasePlatformAdapter):
         """Register a runner-owned deterministic Telegram team route gate."""
         self._team_route_gate = callback
 
+    def set_team_ingress_handler(
+        self,
+        callback: Optional[
+            Callable[["TelegramAdapter", MessageEvent], Awaitable[bool]]
+        ],
+    ) -> None:
+        """Register the runner-owned Telegram-only normalized ingress seam."""
+        self._team_ingress_handler = callback
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Run every normalized Telegram event through central team ingress."""
+        handler = getattr(self, "_team_ingress_handler", None)
+        if handler is not None:
+            try:
+                consumed = await handler(self, event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "[%s] Telegram team ingress raised; consuming message",
+                    self.name,
+                    exc_info=True,
+                )
+                return
+            if not isinstance(consumed, bool):
+                logger.warning(
+                    "[%s] Telegram team ingress returned invalid decision %r; "
+                    "consuming message",
+                    self.name,
+                    consumed,
+                )
+                return
+            if consumed:
+                return
+        await super().handle_message(event)
+
+    def _team_route_context(
+        self,
+        message: Any,
+        chat_id: str,
+    ) -> TelegramTeamRouteContext:
+        """Build routing context from only the current message structure."""
+        reply_message = getattr(message, "reply_to_message", None)
+        reply_user = getattr(reply_message, "from_user", None)
+        reply_username = getattr(reply_user, "username", None)
+        if isinstance(reply_username, str):
+            reply_username = reply_username.lstrip("@").lower() or None
+        else:
+            reply_username = None
+        return TelegramTeamRouteContext(
+            mentions=self._extract_team_route_mentions(message),
+            reply_author_username=reply_username,
+            chat_id=chat_id,
+            owner_profile=getattr(self, "_owner_profile", None) or "default",
+            owner_username=self._current_bot_username(),
+            message_id=getattr(message, "message_id", None),
+            reply_to_message_id=getattr(reply_message, "message_id", None),
+        )
+
     def _team_route_gate_decision(
         self,
         message: Any,
@@ -9036,19 +9098,7 @@ class TelegramAdapter(BasePlatformAdapter):
         callback = getattr(self, "_team_route_gate", None)
         if callback is None:
             return None
-        reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
-        reply_username = getattr(reply_user, "username", None)
-        if isinstance(reply_username, str):
-            reply_username = reply_username.lstrip("@").lower() or None
-        else:
-            reply_username = None
-        context = TelegramTeamRouteContext(
-            mentions=self._extract_team_route_mentions(message),
-            reply_author_username=reply_username,
-            chat_id=chat_id,
-            owner_profile=getattr(self, "_owner_profile", None) or "default",
-            owner_username=self._current_bot_username(),
-        )
+        context = self._team_route_context(message, chat_id)
         try:
             decision = callback(context)
         except Exception:
@@ -9347,7 +9397,20 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _telegram_group_observe_shared_source(self, source):
         """Return a chat/topic-scoped source for observed Telegram group context."""
-        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+        shared_source = dataclasses.replace(
+            source,
+            user_id=None,
+            user_name=None,
+            user_id_alt=None,
+        )
+        # ``dataclasses.replace`` intentionally copies declared fields only.
+        # Preserve the live transport provenance created by build_source so the
+        # runner-owned Telegram team ingress can still prove which adapter
+        # normalized this event before accepting it.
+        adapter_ref = getattr(source, "_transport_adapter_ref", None)
+        if adapter_ref is not None:
+            shared_source._transport_adapter_ref = adapter_ref
+        return shared_source
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"

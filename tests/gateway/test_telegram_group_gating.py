@@ -537,6 +537,7 @@ def test_team_route_gate_receives_current_message_routing_context_only():
         entities=[_mention_entity(current_text, "@Woz_Bot")],
     )
     message.reply_to_message = SimpleNamespace(
+        message_id=17,
         from_user=SimpleNamespace(id=321, username="Human_User"),
         text="historical quote for @Ace_Bot and @Virgil_Bot",
         caption=None,
@@ -550,6 +551,27 @@ def test_team_route_gate_receives_current_message_routing_context_only():
     assert context.chat_id == "-100"
     assert context.owner_profile == "engineering"
     assert context.owner_username == "hermes_bot"
+    assert context.message_id == "42"
+    assert context.reply_to_message_id == "17"
+
+
+def test_team_route_context_rejects_invalid_current_message_ids_without_quote_fallback():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    contexts = []
+    adapter.set_team_route_gate(lambda context: contexts.append(context) or False)
+    message = _group_message("hello", chat_id=-100)
+    message.message_id = 0
+    message.reply_to_message = SimpleNamespace(
+        message_id="01",
+        from_user=SimpleNamespace(id=321, username="Human_User"),
+        text="quoted message id 999 and @Woz_Bot",
+        caption=None,
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert contexts[0].message_id is None
+    assert contexts[0].reply_to_message_id is None
+    assert contexts[0].mentions == frozenset()
 
 
 def test_team_route_gate_extracts_entityless_current_caption_mentions():

@@ -54,6 +54,7 @@ def _telegram_adapter(
     adapter.platform = Platform.TELEGRAM
     adapter.config = PlatformConfig(enabled=True, token=token, extra={})
     adapter._team_route_gate = None
+    adapter._team_ingress_handler = None
     adapter._bot_username_observed = (
         str(live_username).lstrip("@").lower() if live_username else None
     )
@@ -113,6 +114,8 @@ def _context(
     mentions: set[str] | None = None,
     reply_author_username: str | None = None,
     chat_id: str = _ALLOWED_CHAT,
+    message_id: str | None = "500",
+    reply_to_message_id: str | None = None,
 ) -> TelegramTeamRouteContext:
     usernames = {
         "default": "ace_bot",
@@ -125,12 +128,21 @@ def _context(
         chat_id=chat_id,
         owner_profile=profile,
         owner_username=usernames[profile],
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
     )
 
 
 def _gates(roster: dict[str, Any]) -> dict[str, Any]:
     return {
         profile: getattr(adapter, "_team_route_gate", None)
+        for profile, adapter in roster.items()
+    }
+
+
+def _ingresses(roster: dict[str, Any]) -> dict[str, Any]:
+    return {
+        profile: getattr(adapter, "_team_ingress_handler", None)
         for profile, adapter in roster.items()
     }
 
@@ -148,7 +160,7 @@ def _stub_profile_adapter_dependencies(runner: Any) -> None:
     runner._make_profile_platform_event_handler = lambda _profile: object()
 
 
-def test_valid_complete_roster_installs_one_shared_gate_and_dispatcher():
+def test_valid_complete_roster_installs_one_shared_gate_ingress_and_dispatcher():
     runner, roster = _runner()
 
     assert runner._validate_and_install_telegram_team_runtime() is True
@@ -160,17 +172,21 @@ def test_valid_complete_roster_installs_one_shared_gate_and_dispatcher():
     callbacks = list(_gates(roster).values())
     assert all(callable(callback) for callback in callbacks)
     assert len({id(callback) for callback in callbacks}) == 1
+    ingress_callbacks = list(_ingresses(roster).values())
+    assert all(callable(callback) for callback in ingress_callbacks)
+    assert len({id(callback) for callback in ingress_callbacks}) == 1
     assert {
         profile: adapter._current_bot_username() for profile, adapter in roster.items()
     } == dict(runner._telegram_team_config.members)
 
 
-def test_absent_team_routing_key_preserves_legacy_none_gate():
+def test_absent_team_routing_key_preserves_legacy_none_gate_and_ingress():
     runner, roster = _runner(include_team_routing=False)
 
     assert runner._prepare_telegram_team_runtime() is False
     assert runner._validate_and_install_telegram_team_runtime() is False
     assert all(gate is None for gate in _gates(roster).values())
+    assert all(handler is None for handler in _ingresses(roster).values())
 
 
 @pytest.mark.parametrize(
@@ -355,6 +371,58 @@ def test_gate_accepts_only_resolved_owner(mentions, reply_author, expected_owner
     assert decisions == {profile: profile == expected_owner for profile in roster}
 
 
+def test_gate_known_root_alias_precedes_reply_author_and_mentions():
+    runner, roster = _runner()
+    assert runner._validate_and_install_telegram_team_runtime() is True
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher.record_root(_ALLOWED_CHAT, 100, "engineering") is True
+    assert dispatcher.record_inbound_alias(_ALLOWED_CHAT, 101, 100) is True
+
+    decisions = {
+        profile: adapter._team_route_gate(
+            _context(
+                profile,
+                mentions={"Virgil_Bot"},
+                reply_author_username="Ace_Bot",
+                message_id="102",
+                reply_to_message_id="101",
+            )
+        )
+        for profile, adapter in roster.items()
+    }
+
+    assert decisions == {
+        "default": False,
+        "engineering": True,
+        "design": False,
+    }
+
+
+def test_gate_keeps_interleaved_three_hop_human_reply_roots_separate():
+    runner, roster = _runner()
+    assert runner._validate_and_install_telegram_team_runtime() is True
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher.record_root(_ALLOWED_CHAT, 100, "engineering") is True
+    assert dispatcher.record_root(_ALLOWED_CHAT, 200, "design") is True
+    assert dispatcher.record_inbound_alias(_ALLOWED_CHAT, 101, 100) is True
+    assert dispatcher.record_inbound_alias(_ALLOWED_CHAT, 201, 200) is True
+    assert dispatcher.record_inbound_alias(_ALLOWED_CHAT, 102, 101) is True
+
+    for reply_id, expected_owner in (("102", "engineering"), ("201", "design")):
+        assert {
+            profile: adapter._team_route_gate(
+                _context(
+                    profile,
+                    mentions={"Ace_Bot"},
+                    reply_author_username="Human_User",
+                    message_id="300",
+                    reply_to_message_id=reply_id,
+                )
+            )
+            for profile, adapter in roster.items()
+        } == {profile: profile == expected_owner for profile in roster}
+
+
 def test_gate_rejects_every_team_adapter_outside_allowed_chats():
     runner, roster = _runner()
     assert runner._validate_and_install_telegram_team_runtime() is True
@@ -378,21 +446,54 @@ def test_nonowner_arrival_cannot_steal_dispatcher_claim():
     runner._telegram_team_dispatcher.claim_ingress.assert_not_called()
 
 
-def test_replacement_receives_shared_gate_and_stale_gate_is_removed():
+def test_replacement_receives_shared_callbacks_and_stale_callbacks_are_removed():
     runner, roster = _runner()
     unrelated_gate = object()
-    unrelated = SimpleNamespace(_team_route_gate=unrelated_gate)
+    unrelated_ingress = object()
+    unrelated = SimpleNamespace(
+        _team_route_gate=unrelated_gate,
+        _team_ingress_handler=unrelated_ingress,
+    )
     assert runner._validate_and_install_telegram_team_runtime() is True
     shared_callback = roster["engineering"]._team_route_gate
+    shared_ingress = roster["engineering"]._team_ingress_handler
     stale = roster["engineering"]
     replacement = _telegram_adapter("engineering", "replacement-token")
 
     assert runner._install_telegram_team_gate("engineering", replacement) is True
 
     assert replacement._team_route_gate is shared_callback
+    assert replacement._team_ingress_handler is shared_ingress
     assert stale._team_route_gate is None
+    assert stale._team_ingress_handler is None
     assert unrelated._team_route_gate is unrelated_gate
+    assert unrelated._team_ingress_handler is unrelated_ingress
     assert runner._telegram_team_gate_adapters["engineering"] is replacement
+
+
+def test_replacement_ingress_install_failure_rolls_back_both_callbacks():
+    runner, roster = _runner()
+    assert runner._validate_and_install_telegram_team_runtime() is True
+    stale = roster["engineering"]
+    stale_gate = stale._team_route_gate
+    stale_ingress = stale._team_ingress_handler
+    replacement = _telegram_adapter("engineering", "replacement-token")
+
+    def fail_ingress(callback):
+        if callback is not None:
+            raise RuntimeError("ingress setter failed")
+        replacement._team_ingress_handler = None
+
+    replacement.set_team_ingress_handler = fail_ingress
+
+    assert runner._install_telegram_team_gate("engineering", replacement) is False
+
+    assert replacement._team_route_gate is None
+    assert replacement._team_ingress_handler is None
+    assert stale._team_route_gate is stale_gate
+    assert stale._team_ingress_handler is stale_ingress
+    assert runner._telegram_team_gate_adapters["engineering"] is stale
+    assert runner.telegram_team_routing_enabled is False
 
 
 def test_pending_shared_gate_rejects_until_complete_roster_is_activated():
@@ -412,6 +513,7 @@ def test_secondary_adapter_configuration_installs_replacement_gate_before_connec
     runner, roster = _runner()
     assert runner._validate_and_install_telegram_team_runtime() is True
     shared_callback = roster["engineering"]._team_route_gate
+    shared_ingress = roster["engineering"]._team_ingress_handler
     stale = roster["engineering"]
     replacement = _telegram_adapter(
         "engineering", "replacement-token", live_username=None
@@ -425,7 +527,9 @@ def test_secondary_adapter_configuration_installs_replacement_gate_before_connec
     )
 
     assert replacement._team_route_gate is shared_callback
+    assert replacement._team_ingress_handler is shared_ingress
     assert stale._team_route_gate is None
+    assert stale._team_ingress_handler is None
     assert replacement._owner_profile == "engineering"
     assert runner._telegram_team_gate_adapters["engineering"] is replacement
     assert replacement._current_bot_username() == ""
@@ -477,8 +581,11 @@ def test_member_outage_suspends_all_gates_and_valid_replacement_can_reactivate()
     assert runner.telegram_team_profiles == ()
     assert runner._telegram_team_config is not None
     assert roster["engineering"]._team_route_gate is None
+    assert roster["engineering"]._team_ingress_handler is None
     assert roster["default"]._team_route_gate is shared_callback
     assert roster["design"]._team_route_gate is shared_callback
+    assert callable(roster["default"]._team_ingress_handler)
+    assert roster["default"]._team_ingress_handler is roster["design"]._team_ingress_handler
     assert shared_callback(_context("default")) is False
     assert shared_callback(_context("design")) is False
 
