@@ -9689,6 +9689,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
+        team_route_decision = self._team_route_gate_decision(message, chat_id_str)
+        if team_route_decision is not None:
+            return team_route_decision
+
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.
         guest_mention = self._is_guest_mention(message)
@@ -9699,10 +9703,6 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
             return guest_mention
-
-        team_route_decision = self._team_route_gate_decision(message, chat_id_str)
-        if team_route_decision is not None:
-            return team_route_decision
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False

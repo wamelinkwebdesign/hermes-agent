@@ -560,6 +560,49 @@ def test_team_route_gate_extracts_entityless_current_caption_mentions():
     assert contexts[0].mentions == frozenset({"virgil_bot"})
 
 
+def test_team_route_gate_false_precedes_guest_mode_outside_allowed_chats():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-200"],
+        guest_mode=True,
+    )
+    gate = Mock(return_value=False)
+    adapter.set_team_route_gate(gate)
+    text = "hi @hermes_bot"
+    message = _group_message(
+        text,
+        chat_id=-201,
+        entities=[_mention_entity(text)],
+    )
+
+    assert adapter._should_process_message(message) is False
+    gate.assert_called_once()
+
+
+def test_text_handler_authorization_rejects_before_team_gate_and_dispatch():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allow_from=["222"],
+        )
+        gate = Mock(return_value=True)
+        adapter.set_team_route_gate(gate)
+        adapter._enqueue_text_event = Mock()
+        update = SimpleNamespace(
+            update_id=1002,
+            message=_group_message("hello", chat_id=-100, from_user_id=111),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        gate.assert_not_called()
+        adapter._enqueue_text_event.assert_not_called()
+
+    asyncio.run(_run())
+
+
 def test_team_route_gate_false_precedes_legacy_group_acceptance_fallbacks():
     cases = [
         (
