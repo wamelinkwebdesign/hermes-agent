@@ -7087,6 +7087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # roster has been validated after secondary startup.
         self._telegram_team_prepared = False
         self._telegram_team_config = None
+        self._telegram_team_coordinator_profile: Optional[str] = None
         self._telegram_team_dispatcher = None
         self._telegram_team_route_gate_callback = None
         self._telegram_team_gate_adapters: Dict[str, BasePlatformAdapter] = {}
@@ -15985,6 +15986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._telegram_team_routing_enabled = False
         self._telegram_team_profiles = ()
         self._telegram_team_gate_adapters = {}
+        self._telegram_team_coordinator_profile = None
 
         telegram_config = getattr(self, "config", None)
         platforms = getattr(telegram_config, "platforms", None)
@@ -16040,6 +16042,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 + ", ".join(missing_from_allowlist)
             )
 
+        # This is process ownership, not turn ownership. A secondary reconnect
+        # runs inside that profile's runtime scope, where _active_profile_name()
+        # deliberately changes; adapter lookup must keep using the coordinator
+        # validated before any secondary scope was entered.
+        self._telegram_team_coordinator_profile = active_profile
         self._telegram_team_config = team_config
         dispatcher = self.__dict__.get("_telegram_team_dispatcher")
         if dispatcher is None:
@@ -16063,7 +16070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return False
                 if not self._telegram_team_live_usernames_match():
                     self._disable_telegram_team_runtime(
-                        "a configured live bot username no longer matches",
+                        "a configured live bot identity is stale or no longer matches",
                         log=False,
                     )
                     return False
@@ -16140,7 +16147,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         adapters: Optional[Dict[str, BasePlatformAdapter]] = None,
     ) -> bool:
-        """Compare cached live identities with the configured roster, without I/O."""
+        """Require fresh cached identities matching the roster, without I/O."""
         team_config = self.__dict__.get("_telegram_team_config")
         if team_config is None:
             return False
@@ -16153,6 +16160,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         for profile, expected in team_config.members.items():
             adapter = roster.get(profile)
+            freshness_check = getattr(adapter, "_bot_identity_is_fresh", None)
+            identity_is_fresh = False
+            if callable(freshness_check):
+                try:
+                    identity_is_fresh = freshness_check() is True
+                except Exception:
+                    identity_is_fresh = False
+            if not identity_is_fresh:
+                # Never log adapter exceptions here: a custom implementation
+                # could include credentials in its exception text.
+                logger.warning(
+                    "Telegram team live identity is stale or unverifiable for "
+                    "profile '%s'",
+                    profile,
+                )
+                return False
             getter = getattr(adapter, "_current_bot_username", None)
             observed = ""
             if callable(getter):
@@ -16175,9 +16198,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return True
 
     def _telegram_team_adapter_for_profile(
-        self, profile: str, active_profile: str
+        self, profile: str
     ) -> Optional[BasePlatformAdapter]:
-        if profile == active_profile:
+        coordinator_profile = self.__dict__.get(
+            "_telegram_team_coordinator_profile"
+        )
+        if profile == coordinator_profile:
             adapters = getattr(self, "adapters", None)
         else:
             profile_adapters = getattr(self, "_profile_adapters", None)
@@ -16260,13 +16286,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 profile,
             )
             return False
-        active_profile = self._active_profile_name()
         for other_profile in team_config.members:
             if other_profile == profile:
                 continue
-            other_adapter = self._telegram_team_adapter_for_profile(
-                other_profile, active_profile
-            )
+            other_adapter = self._telegram_team_adapter_for_profile(other_profile)
             if (
                 other_adapter is not None
                 and self._telegram_team_adapter_token(other_adapter) == token
@@ -16307,7 +16330,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Apply pending/current team ownership and gate to a primary adapter."""
         if not self._prepare_telegram_team_runtime():
             return
-        profile = self._active_profile_name()
+        profile = self.__dict__.get("_telegram_team_coordinator_profile")
+        if not isinstance(profile, str):
+            raise MultiplexConfigError(
+                "Telegram team coordinator ownership is unavailable"
+            )
         team_config = self.__dict__.get("_telegram_team_config")
         if (
             getattr(adapter, "platform", None) is not Platform.TELEGRAM
@@ -16337,12 +16364,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._disable_telegram_team_runtime("TelegramAdapter is unavailable")
             return False
 
-        active_profile = self._active_profile_name()
         candidates: Dict[str, BasePlatformAdapter] = {}
         token_owners: Dict[str, str] = {}
         failure_reason: Optional[str] = None
         for profile in team_config.members:
-            adapter = self._telegram_team_adapter_for_profile(profile, active_profile)
+            adapter = self._telegram_team_adapter_for_profile(profile)
             if adapter is None:
                 failure_reason = failure_reason or (
                     f"team profile '{profile}' is not served in this process"

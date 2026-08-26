@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -56,6 +58,7 @@ def _telegram_adapter(
         str(live_username).lstrip("@").lower() if live_username else None
     )
     adapter._bot = SimpleNamespace(username=live_username)
+    adapter._bot_identity_checked_at = time.monotonic()
     adapter.set_owner_profile(profile)
     return adapter
 
@@ -511,6 +514,92 @@ def test_incomplete_startup_roster_can_revalidate_after_missing_member_connects(
     assert runner.telegram_team_profiles == ("default", "design", "engineering")
 
 
+def _break_identity_freshness(
+    adapter: TelegramAdapter, failure: str, secret: str
+) -> None:
+    if failure == "stale":
+        adapter._bot_identity_checked_at = None
+    elif failure == "missing-helper":
+        setattr(adapter, "_bot_identity_is_fresh", None)
+    else:
+
+        def raise_with_secret():
+            raise RuntimeError(secret)
+
+        setattr(adapter, "_bot_identity_is_fresh", raise_with_secret)
+
+
+def _restore_identity_freshness(adapter: TelegramAdapter, failure: str) -> None:
+    if failure == "stale":
+        adapter._bot_identity_checked_at = time.monotonic()
+    else:
+        delattr(adapter, "_bot_identity_is_fresh")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["stale", "missing-helper", "raising-helper"],
+)
+def test_activation_rejects_unverifiable_identity_freshness_without_network_or_secrets(
+    failure, caplog
+):
+    secret = "identity-freshness-secret-never-log-6d2a"
+    runner, roster = _runner()
+    target = roster["engineering"]
+    target.config.token = secret
+    target._bot.get_me = Mock(side_effect=AssertionError("network call forbidden"))
+    _break_identity_freshness(target, failure, secret)
+    caplog.set_level(logging.WARNING, logger="gateway.run")
+
+    assert runner._validate_and_install_telegram_team_runtime() is False
+
+    callbacks = _gates(roster)
+    assert runner.telegram_team_routing_enabled is False
+    assert all(
+        callback(_context(profile)) is False for profile, callback in callbacks.items()
+    )
+    target._bot.get_me.assert_not_called()
+    assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["stale", "missing-helper", "raising-helper"],
+)
+def test_post_activation_identity_failure_rejects_all_gates_then_freshness_restores(
+    failure,
+):
+    secret = "post-activation-identity-secret-never-log-a91e"
+    runner, roster = _runner()
+    assert runner._validate_and_install_telegram_team_runtime() is True
+    dispatcher = runner._telegram_team_dispatcher
+    shared_callback = roster["default"]._team_route_gate
+    target = roster["design"]
+    target._bot.get_me = Mock(side_effect=AssertionError("network call forbidden"))
+    _break_identity_freshness(target, failure, secret)
+
+    decisions = {
+        profile: adapter._team_route_gate(_context(profile))
+        for profile, adapter in roster.items()
+    }
+
+    assert decisions == {profile: False for profile in roster}
+    assert runner.telegram_team_routing_enabled is False
+    assert all(
+        adapter._team_route_gate is shared_callback for adapter in roster.values()
+    )
+    target._bot.get_me.assert_not_called()
+
+    _restore_identity_freshness(target, failure)
+
+    assert runner._validate_and_install_telegram_team_runtime() is True
+    assert runner._telegram_team_dispatcher is dispatcher
+    assert all(
+        adapter._team_route_gate is shared_callback for adapter in roster.values()
+    )
+    assert shared_callback(_context("default")) is True
+
+
 @pytest.mark.parametrize(
     ("profile", "live_username", "observed_label"),
     [
@@ -582,6 +671,68 @@ def test_post_activation_username_rename_makes_every_team_gate_fail_closed():
         adapter._team_route_gate is shared_callback for adapter in roster.values()
     )
     runner._telegram_team_dispatcher.claim_ingress.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_secondary_reconnect_rejects_primary_token_inside_dynamic_profile_scope(
+    monkeypatch, tmp_path
+):
+    import gateway.config as gateway_config
+    import hermes_cli.profiles as profiles
+
+    hermes_home = tmp_path / "hermes-home"
+    profile_home = hermes_home / "profiles" / "design"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    runner, roster = _runner()
+    del runner._active_profile_name
+    assert runner._active_profile_name() == "default"
+    assert runner._validate_and_install_telegram_team_runtime() is True
+    old_adapter = roster["design"]
+    old_gate = old_adapter._team_route_gate
+    replacement = _telegram_adapter(
+        "design",
+        roster["default"].config.token,
+        live_username="Virgil_Bot",
+    )
+    runner._running = True
+    runner._profile_failed_platforms = {}
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_home)
+    profile_config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token=roster["default"].config.token,
+            )
+        }
+    )
+    monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: profile_config)
+    scoped_profiles = []
+
+    def create_adapter(platform, config):
+        scoped_profiles.append(runner._active_profile_name())
+        return replacement
+
+    runner._create_adapter = create_adapter
+    _stub_profile_adapter_dependencies(runner)
+    runner._connect_adapter_with_timeout = AsyncMock(return_value=True)
+    runner._safe_adapter_disconnect = AsyncMock()
+
+    async def stop_after_refusal(_delay):
+        runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_refusal)
+
+    await runner._run_secondary_profile_reconnect("design", Platform.TELEGRAM)
+
+    assert scoped_profiles == ["design"]
+    runner._connect_adapter_with_timeout.assert_not_awaited()
+    assert runner._profile_adapters["design"][Platform.TELEGRAM] is old_adapter
+    assert runner._telegram_team_gate_adapters["design"] is old_adapter
+    assert old_adapter._team_route_gate is old_gate
+    assert replacement._team_route_gate is None
+    assert runner.telegram_team_routing_enabled is True
 
 
 @pytest.mark.asyncio
