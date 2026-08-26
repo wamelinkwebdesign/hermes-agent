@@ -16392,7 +16392,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         root_message_id: str,
         *,
         route_reason: str,
-        context_text: Optional[str] = None,
     ) -> MessageEvent:
         """Construct a fresh, internally authorized Telegram team target event."""
         from gateway.telegram_team_routing import (
@@ -16455,7 +16454,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise RuntimeError("original source provenance changed")
 
         metadata = dict(original.metadata or {})
-        metadata.pop("telegram_team_context_text", None)
         metadata.update(
             {
                 "telegram_team_routed": True,
@@ -16465,11 +16463,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "telegram_team_ingress_claimed": True,
             }
         )
-        if context_text is not None:
-            if not isinstance(context_text, str):
-                raise ValueError("context_text must be a string")
-            metadata["telegram_team_context_text"] = context_text[:4000]
-
         routed = dataclasses.replace(
             original,
             source=target_source,

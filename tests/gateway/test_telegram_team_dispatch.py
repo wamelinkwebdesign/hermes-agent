@@ -368,7 +368,6 @@ def test_build_target_event_uses_fresh_target_provenance_scope_and_safe_copies()
     original_metadata = dict(original.metadata)
     target_handle = AsyncMock()
     roster["engineering"].handle_message = target_handle
-    long_context = "c" * 5000
 
     routed = runner.build_target_event(
         original,
@@ -376,7 +375,6 @@ def test_build_target_event_uses_fresh_target_provenance_scope_and_safe_copies()
         "engineering",
         "350",
         route_reason="semantic_specialist",
-        context_text=long_context,
     )
 
     assert routed is not original
@@ -407,7 +405,6 @@ def test_build_target_event_uses_fresh_target_provenance_scope_and_safe_copies()
     assert routed.metadata["telegram_team_root_message_id"] == "350"
     assert routed.metadata["telegram_team_route_reason"] == "semantic_specialist"
     assert routed.metadata["telegram_team_ingress_claimed"] is True
-    assert routed.metadata["telegram_team_context_text"] == "c" * 4000
     assert original.metadata == original_metadata
     assert original.source.profile == original_profile
     assert original.source.session_scope_id is None
