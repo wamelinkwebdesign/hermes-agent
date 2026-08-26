@@ -1195,6 +1195,432 @@ async def test_overflow_pending_identity_cleanup_allows_key_reuse_after_flush_an
 
 
 @pytest.mark.asyncio
+async def test_submitted_overflow_team_command_replay_is_consumed_after_flush(
+    monkeypatch,
+):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    reserve = Mock(side_effect=AssertionError("commands must not reserve ingress"))
+    claim = Mock(side_effect=AssertionError("commands must not claim ingress"))
+    dispatcher.reserve_ingress_batch = reserve
+    dispatcher.claim_ingress = claim
+    base_events = []
+
+    async def _base(_self, event):
+        base_events.append(event)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+
+    for message_id in range(1, 66):
+        adapter._enqueue_text_event(
+            _event(
+                adapter,
+                message_id,
+                text=f"/status@Woz_Bot chunk-{message_id}",
+                message_type=MessageType.COMMAND,
+            )
+        )
+
+    await _cancel_batch_tasks(*list(adapter._pending_text_batch_tasks.values()))
+    adapter._pending_text_batch_tasks.clear()
+    for key in list(adapter._pending_text_batches):
+        await _flush_pending_batch(adapter, "command", key)
+
+    assert [event.message_id for event in base_events] == ["1", "65"]
+
+    adapter._text_batch_delay_seconds = 3600
+    adapter._TEXT_BATCH_FAST_DELAY_S = 3600
+    replay = _event(
+        adapter,
+        65,
+        text="/status@Woz_Bot replay-65",
+        message_type=MessageType.COMMAND,
+    )
+    adapter._enqueue_text_event(replay)
+    await _cancel_batch_tasks(*list(adapter._pending_text_batch_tasks.values()))
+    adapter._pending_text_batch_tasks.clear()
+    replay_key = next(iter(adapter._pending_text_batches))
+    await _flush_pending_batch(adapter, "command", replay_key)
+
+    assert [event.message_id for event in base_events] == ["1", "65"]
+    reserve.assert_not_called()
+    claim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_inflight_team_command_replay_reaches_base_once(monkeypatch):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    base_events = []
+
+    async def _blocking_base(_self, event):
+        base_events.append(event)
+        if len(base_events) == 1:
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _blocking_base)
+    original = _event(
+        adapter,
+        66,
+        text="/status@Woz_Bot original",
+        message_type=MessageType.COMMAND,
+    )
+    replay = _event(
+        adapter,
+        66,
+        text="/status@Woz_Bot replay",
+        message_type=MessageType.COMMAND,
+    )
+
+    original_task = asyncio.create_task(adapter.handle_message(original))
+    await entered.wait()
+    await adapter.handle_message(replay)
+
+    assert base_events == [original]
+    release.set()
+    await original_task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_team_command_retries_same_held_event_without_replay_piggyback(
+    monkeypatch,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    entered = asyncio.Event()
+    never_release = asyncio.Event()
+    base_events = []
+
+    async def _base(_self, event):
+        base_events.append(event)
+        if len(base_events) == 1:
+            entered.set()
+            await never_release.wait()
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+    original = _event(
+        adapter,
+        67,
+        text="/status@Woz_Bot original",
+        message_type=MessageType.COMMAND,
+    )
+    replay = _event(
+        adapter,
+        67,
+        text="/status@Woz_Bot replay",
+        message_type=MessageType.COMMAND,
+    )
+
+    original_task = asyncio.create_task(adapter.handle_message(original))
+    await entered.wait()
+    await adapter.handle_message(replay)
+
+    original_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await original_task
+    adapter._hold_inbound_event(original, where="test-cancel", schedule=False)
+    assert adapter._held_inbound_events == [original]
+
+    held_original = adapter._held_inbound_events.pop()
+    await adapter.handle_message(held_original)
+    await adapter.handle_message(replay)
+
+    assert base_events == [original, original]
+    original_token = getattr(original, "_telegram_team_command_submission_token")
+    replay_token = getattr(replay, "_telegram_team_command_submission_token")
+    assert original_token is not replay_token
+    assert "submission" not in repr(original.metadata).lower()
+    assert "submission" not in repr(replay.metadata).lower()
+    assert (
+        getattr(original, "_telegram_team_command_submission_token")
+        is original_token
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["ingress-consume", "ingress-error", "base-error"],
+)
+async def test_pre_acceptance_team_command_failure_releases_exact_token_for_retry(
+    monkeypatch,
+    failure_stage,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    original_handler = adapter._team_ingress_handler
+    assert original_handler is not None
+    base_attempts = []
+
+    if failure_stage.startswith("ingress"):
+        async def _failed_ingress(_adapter, _event):
+            if failure_stage == "ingress-error":
+                raise RuntimeError("ingress failed")
+            return True
+
+        adapter.set_team_ingress_handler(_failed_ingress)
+
+    async def _base(_self, event):
+        base_attempts.append(event)
+        if failure_stage == "base-error" and len(base_attempts) == 1:
+            raise RuntimeError("base rejected submission")
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+    original = _event(
+        adapter,
+        74,
+        text="/status@Woz_Bot retry",
+        message_type=MessageType.COMMAND,
+    )
+
+    if failure_stage == "base-error":
+        with pytest.raises(RuntimeError, match="base rejected"):
+            await adapter.handle_message(original)
+    else:
+        await adapter.handle_message(original)
+        adapter.set_team_ingress_handler(original_handler)
+
+    assert adapter._telegram_team_command_submitting == {}
+    token = getattr(original, "_telegram_team_command_submission_token")
+    await adapter.handle_message(original)
+    await adapter.handle_message(
+        _event(
+            adapter,
+            74,
+            text="/status@Woz_Bot distinct replay",
+            message_type=MessageType.COMMAND,
+        )
+    )
+
+    expected_attempts = [original, original] if failure_stage == "base-error" else [original]
+    assert base_attempts == expected_attempts
+    assert getattr(original, "_telegram_team_command_submission_token") is token
+
+
+@pytest.mark.asyncio
+async def test_multi_id_team_command_submission_commits_every_id_atomically(
+    monkeypatch,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    base_events = []
+
+    async def _base(_self, event):
+        base_events.append(event)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+    command = _event(
+        adapter,
+        68,
+        text="/status@Woz_Bot long command",
+        message_type=MessageType.COMMAND,
+    )
+    capability = adapter._telegram_batch_capability()
+    setattr(command, "_telegram_batch_message_ids", ("68", "69"))
+    setattr(command, "_telegram_batch_reply_to_message_ids", (None, None))
+    setattr(command, "_telegram_batch_identity_capability", capability)
+
+    await adapter.handle_message(command)
+    await adapter.handle_message(
+        _event(
+            adapter,
+            68,
+            text="/status@Woz_Bot replay first",
+            message_type=MessageType.COMMAND,
+        )
+    )
+    await adapter.handle_message(
+        _event(
+            adapter,
+            69,
+            text="/status@Woz_Bot replay second",
+            message_type=MessageType.COMMAND,
+        )
+    )
+
+    assert base_events == [command]
+    assert list(adapter._telegram_team_command_committed) == [
+        (_ALLOWED_CHAT, "68"),
+        (_ALLOWED_CHAT, "69"),
+    ]
+    assert adapter._telegram_team_command_submitting == {}
+
+
+@pytest.mark.asyncio
+async def test_team_command_committed_cache_is_bounded_and_evicts_oldest(
+    monkeypatch,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    assert adapter._TEAM_COMMAND_SUBMISSION_DEDUPE_MAX >= 2048
+    adapter._TEAM_COMMAND_SUBMISSION_DEDUPE_MAX = 2
+    base_events = []
+
+    async def _base(_self, event):
+        base_events.append(event)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+    commands = [
+        _event(
+            adapter,
+            message_id,
+            text=f"/status@Woz_Bot command-{message_id}",
+            message_type=MessageType.COMMAND,
+        )
+        for message_id in (75, 76, 77)
+    ]
+
+    for command in commands:
+        await adapter.handle_message(command)
+
+    assert list(adapter._telegram_team_command_committed) == [
+        (_ALLOWED_CHAT, "76"),
+        (_ALLOWED_CHAT, "77"),
+    ]
+    await adapter.handle_message(
+        _event(
+            adapter,
+            75,
+            text="/status@Woz_Bot oldest replay",
+            message_type=MessageType.COMMAND,
+        )
+    )
+    assert [event.message_id for event in base_events] == ["75", "76", "77", "75"]
+    assert list(adapter._telegram_team_command_committed) == [
+        (_ALLOWED_CHAT, "77"),
+        (_ALLOWED_CHAT, "75"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invalid_overflow_team_command_does_not_mutate_or_evict_dedupe(
+    monkeypatch,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    base_events = []
+
+    async def _base(_self, event):
+        base_events.append(event)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+    valid = _event(
+        adapter,
+        70,
+        text="/status@Woz_Bot valid",
+        message_type=MessageType.COMMAND,
+    )
+    await adapter.handle_message(valid)
+    committed_before = list(
+        getattr(adapter, "_telegram_team_command_committed", {})
+    )
+
+    overflow = _event(
+        adapter,
+        71,
+        text="/status@Woz_Bot overflow",
+        message_type=MessageType.COMMAND,
+    )
+    capability = adapter._telegram_batch_capability()
+    overflow_ids = tuple(str(message_id) for message_id in range(71, 136))
+    setattr(overflow, "_telegram_batch_message_ids", overflow_ids)
+    setattr(
+        overflow,
+        "_telegram_batch_reply_to_message_ids",
+        (None,) * len(overflow_ids),
+    )
+    setattr(overflow, "_telegram_batch_identity_capability", capability)
+
+    await adapter.handle_message(overflow)
+    await adapter.handle_message(overflow)
+    await adapter.handle_message(
+        _event(
+            adapter,
+            70,
+            text="/status@Woz_Bot committed replay",
+            message_type=MessageType.COMMAND,
+        )
+    )
+
+    assert base_events == [valid, overflow, overflow]
+    assert list(adapter._telegram_team_command_committed) == committed_before
+    assert adapter._telegram_team_command_submitting == {}
+
+
+@pytest.mark.asyncio
+async def test_non_team_command_replay_preserves_legacy_base_handling(monkeypatch):
+    _, roster = _runner()
+    adapter = roster["default"]
+    base_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
+    first = _event(
+        adapter,
+        72,
+        chat_id=-999,
+        text="/status",
+        message_type=MessageType.COMMAND,
+    )
+    replay = _event(
+        adapter,
+        72,
+        chat_id=-999,
+        text="/status",
+        message_type=MessageType.COMMAND,
+    )
+
+    await adapter.handle_message(first)
+    await adapter.handle_message(replay)
+
+    assert base_handle.await_args_list == [
+        ((first,), {}),
+        ((replay,), {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_team_handler_replacement_clears_only_submitting_command_tokens(
+    monkeypatch,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    handler = adapter._team_ingress_handler
+    assert handler is not None
+    entered = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def _blocking_base(_self, _event):
+        entered.set()
+        await never_release.wait()
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _blocking_base)
+    command = _event(
+        adapter,
+        73,
+        text="/status@Woz_Bot replace",
+        message_type=MessageType.COMMAND,
+    )
+    task = asyncio.create_task(adapter.handle_message(command))
+    await entered.wait()
+    try:
+        assert adapter._telegram_team_command_submitting
+
+        adapter.set_team_ingress_handler(handler)
+
+        assert adapter._telegram_team_command_submitting == {}
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event_kwargs",
     [

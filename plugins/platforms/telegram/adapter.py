@@ -17,6 +17,7 @@ import html as _html
 import re
 import threading
 import time
+from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from enum import Enum
@@ -469,6 +470,25 @@ class _TelegramBatchIdentityMerge(Enum):
     INVALID = "invalid"
 
 
+class _TelegramTeamCommandSubmissionToken:
+    """Opaque per-event identity for one adapter-local command submission."""
+
+    __slots__ = ("_adapter_identity", "_event", "_keys")
+
+    def __init__(
+        self,
+        adapter_identity: object,
+        event: MessageEvent,
+        keys: tuple[tuple[str, str], ...],
+    ) -> None:
+        self._adapter_identity = adapter_identity
+        self._event = event
+        self._keys = keys
+
+    def __repr__(self) -> str:
+        return "<TelegramTeamCommandSubmissionToken>"
+
+
 # ---------------------------------------------------------------------------
 # Rich-message newline normalization
 # ---------------------------------------------------------------------------
@@ -596,6 +616,14 @@ class TelegramAdapter(BasePlatformAdapter):
     - Media messages
     """
 
+    # Match the dispatcher's process-local claim scale using the existing
+    # maximum constituent batch size. The cache stores only Telegram IDs and
+    # deterministic insertion order, never command text or serialized tokens.
+    _TEAM_COMMAND_SUBMISSION_DEDUPE_MAX = max(
+        2048,
+        MAX_TELEGRAM_BATCH_MESSAGE_IDS * 64,
+    )
+
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
@@ -696,6 +724,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # Per-adapter identity authenticates internal-only constituent IDs on
         # batched MessageEvent objects. Neither value is part of event metadata.
         self._telegram_batch_identity_capability = object()
+        self._telegram_team_command_token_identity = object()
+        self._telegram_team_command_submitting: dict[
+            tuple[str, str], _TelegramTeamCommandSubmissionToken
+        ] = {}
+        self._telegram_team_command_committed: OrderedDict[
+            tuple[str, str], None
+        ] = OrderedDict()
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
@@ -5068,6 +5103,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
         getattr(self, "_pending_text_batch_id_index", {}).clear()
+        # Direct command submission can be awaiting Base acceptance outside the
+        # delayed-batch task maps. Teardown must not strand its adapter-local
+        # token as an in-process replay lock. Committed IDs remain for the
+        # adapter's lifetime.
+        getattr(self, "_telegram_team_command_submitting", {}).clear()
         if getattr(self, "_polling_error_task", None) is not current_task:
             self._polling_error_task = None
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
@@ -9061,7 +9101,214 @@ class TelegramAdapter(BasePlatformAdapter):
         ],
     ) -> None:
         """Register the runner-owned Telegram-only normalized ingress seam."""
+        # Callback replacement/teardown fences the old ingress generation. Any
+        # pre-acceptance command token owned by that generation must not leave a
+        # stale process-local lock. Successfully committed IDs intentionally
+        # survive for this adapter's lifetime.
+        submitting = self.__dict__.get("_telegram_team_command_submitting")
+        if isinstance(submitting, dict):
+            submitting.clear()
         self._team_ingress_handler = callback
+
+    def _telegram_team_command_submission_keys(
+        self,
+        event: MessageEvent,
+    ) -> tuple[tuple[str, str], ...] | None:
+        """Validate one configured team-group command and its constituent IDs."""
+        if getattr(self, "_team_ingress_handler", None) is None:
+            return None
+        if not (
+            event.message_type is MessageType.COMMAND
+            or event.is_command()
+        ):
+            return None
+
+        runner = getattr(self, "gateway_runner", None)
+        team_config = getattr(runner, "_telegram_team_config", None)
+        allowed_chats = getattr(team_config, "allowed_chats", None)
+        if not isinstance(allowed_chats, frozenset):
+            return None
+
+        source = getattr(event, "source", None)
+        raw_message = getattr(event, "raw_message", None)
+        raw_chat = getattr(raw_message, "chat", None)
+        source_chat_id = _normalize_group_chat_id(
+            getattr(source, "chat_id", None) if source is not None else None
+        )
+        raw_chat_id = _normalize_group_chat_id(
+            getattr(raw_chat, "id", None) if raw_chat is not None else None
+        )
+        if (
+            source_chat_id is None
+            or raw_chat_id is None
+            or source_chat_id != raw_chat_id
+            or raw_chat_id not in allowed_chats
+        ):
+            return None
+
+        current_id = self._telegram_event_message_id(event)
+        valid_parent, current_parent_id = self._telegram_event_reply_parent(event)
+        if current_id is None or not valid_parent:
+            return None
+
+        raw_ids = getattr(event, "_telegram_batch_message_ids", None)
+        raw_parent_ids = getattr(
+            event,
+            "_telegram_batch_reply_to_message_ids",
+            None,
+        )
+        raw_capability = getattr(
+            event,
+            "_telegram_batch_identity_capability",
+            None,
+        )
+        if raw_ids is None and raw_parent_ids is None and raw_capability is None:
+            constituent_ids = (current_id,)
+        else:
+            expected_capability = self.__dict__.get(
+                "_telegram_batch_identity_capability"
+            )
+            if (
+                expected_capability is None
+                or raw_capability is not expected_capability
+                or not isinstance(raw_ids, tuple)
+                or not isinstance(raw_parent_ids, tuple)
+                or not 1 <= len(raw_ids) <= MAX_TELEGRAM_BATCH_MESSAGE_IDS
+                or len(raw_parent_ids) != len(raw_ids)
+            ):
+                return None
+
+            normalized_ids: list[str] = []
+            for value in raw_ids:
+                normalized_id = _normalize_message_id(value)
+                if normalized_id is None or normalized_id in normalized_ids:
+                    return None
+                normalized_ids.append(normalized_id)
+            if normalized_ids[0] != current_id:
+                return None
+
+            normalized_parent_ids: list[str | None] = []
+            for value in raw_parent_ids:
+                if value is None:
+                    normalized_parent_ids.append(None)
+                    continue
+                normalized_parent_id = _normalize_message_id(value)
+                if normalized_parent_id is None:
+                    return None
+                normalized_parent_ids.append(normalized_parent_id)
+            if any(
+                parent_id != current_parent_id
+                for parent_id in normalized_parent_ids
+            ):
+                return None
+            constituent_ids = tuple(normalized_ids)
+
+        return tuple((raw_chat_id, message_id) for message_id in constituent_ids)
+
+    def _telegram_team_command_submission_state(
+        self,
+    ) -> tuple[
+        dict[tuple[str, str], _TelegramTeamCommandSubmissionToken],
+        OrderedDict[tuple[str, str], None],
+    ]:
+        """Return lazily initialized bounded adapter-local command state."""
+        submitting = self.__dict__.get("_telegram_team_command_submitting")
+        if not isinstance(submitting, dict):
+            submitting = {}
+            self._telegram_team_command_submitting = submitting
+        committed = self.__dict__.get("_telegram_team_command_committed")
+        if not isinstance(committed, OrderedDict):
+            committed = OrderedDict()
+            self._telegram_team_command_committed = committed
+        return submitting, committed
+
+    def _telegram_team_command_submission_token(
+        self,
+        event: MessageEvent,
+        keys: tuple[tuple[str, str], ...],
+    ) -> _TelegramTeamCommandSubmissionToken:
+        """Return one unforgeable-by-copy token bound to this exact event object."""
+        adapter_identity = self.__dict__.get(
+            "_telegram_team_command_token_identity"
+        )
+        if adapter_identity is None:
+            adapter_identity = object()
+            self._telegram_team_command_token_identity = adapter_identity
+        token = getattr(event, "_telegram_team_command_submission_token", None)
+        if (
+            not isinstance(token, _TelegramTeamCommandSubmissionToken)
+            or token._adapter_identity is not adapter_identity
+            or token._event is not event
+            or token._keys != keys
+        ):
+            token = _TelegramTeamCommandSubmissionToken(
+                adapter_identity,
+                event,
+                keys,
+            )
+            setattr(event, "_telegram_team_command_submission_token", token)
+        return token
+
+    def _reserve_telegram_team_command_submission(
+        self,
+        event: MessageEvent,
+    ) -> tuple[_TelegramTeamCommandSubmissionToken | None, bool]:
+        """Reserve all command IDs atomically; return ``consumed`` for replays."""
+        keys = self._telegram_team_command_submission_keys(event)
+        if keys is None:
+            return None, False
+        token = self._telegram_team_command_submission_token(event, keys)
+        submitting, committed = self._telegram_team_command_submission_state()
+        if any(key in committed or key in submitting for key in keys):
+            return token, True
+
+        limit = self._TEAM_COMMAND_SUBMISSION_DEDUPE_MAX
+        if len(submitting) + len(keys) > limit:
+            # Bounded fail-closed state: capacity pressure never evicts a
+            # committed ID or partially reserves a constituent batch.
+            return token, True
+        for key in keys:
+            submitting[key] = token
+        return token, False
+
+    def _release_telegram_team_command_submission(
+        self,
+        token: _TelegramTeamCommandSubmissionToken | None,
+    ) -> bool:
+        """Release only a complete reservation owned by the exact event token."""
+        if token is None:
+            return False
+        submitting = self.__dict__.get("_telegram_team_command_submitting")
+        if not isinstance(submitting, dict) or not token._keys:
+            return False
+        if any(submitting.get(key) is not token for key in token._keys):
+            return False
+        for key in token._keys:
+            submitting.pop(key, None)
+        return True
+
+    def _commit_telegram_team_command_submission(
+        self,
+        token: _TelegramTeamCommandSubmissionToken | None,
+    ) -> bool:
+        """Atomically move every submitted constituent ID to bounded committed state."""
+        if token is None:
+            return False
+        submitting, committed = self._telegram_team_command_submission_state()
+        if not token._keys or any(
+            submitting.get(key) is not token for key in token._keys
+        ):
+            return False
+
+        next_committed = committed.copy()
+        for key in token._keys:
+            next_committed[key] = None
+        while len(next_committed) > self._TEAM_COMMAND_SUBMISSION_DEDUPE_MAX:
+            next_committed.popitem(last=False)
+        for key in token._keys:
+            submitting.pop(key, None)
+        self._telegram_team_command_committed = next_committed
+        return True
 
     @staticmethod
     def _finalize_team_ingress_reservation(
@@ -9090,14 +9337,21 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def handle_message(self, event: MessageEvent) -> None:
         """Run every normalized Telegram event through central team ingress."""
+        submission_token, submission_consumed = (
+            self._reserve_telegram_team_command_submission(event)
+        )
+        if submission_consumed:
+            return
         handler = getattr(self, "_team_ingress_handler", None)
         if handler is not None:
             try:
                 consumed = await handler(self, event)
             except asyncio.CancelledError:
+                self._release_telegram_team_command_submission(submission_token)
                 self._finalize_team_ingress_reservation(event, commit=False)
                 raise
             except Exception:
+                self._release_telegram_team_command_submission(submission_token)
                 self._finalize_team_ingress_reservation(event, commit=False)
                 logger.warning(
                     "[%s] Telegram team ingress raised; consuming message",
@@ -9106,6 +9360,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return
             if not isinstance(consumed, bool):
+                self._release_telegram_team_command_submission(submission_token)
                 self._finalize_team_ingress_reservation(event, commit=False)
                 logger.warning(
                     "[%s] Telegram team ingress returned an invalid decision; "
@@ -9114,14 +9369,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return
             if consumed:
+                self._release_telegram_team_command_submission(submission_token)
                 self._finalize_team_ingress_reservation(event, commit=False)
                 return
         try:
             await super().handle_message(event)
         except BaseException:
+            self._release_telegram_team_command_submission(submission_token)
             self._finalize_team_ingress_reservation(event, commit=False)
             raise
         else:
+            if submission_token is not None:
+                if not self._commit_telegram_team_command_submission(
+                    submission_token
+                ):
+                    logger.error(
+                        "[%s] Telegram team command submission commit failed",
+                        self.name,
+                    )
             if getattr(event, "_telegram_team_ingress_reservation", None) is not None:
                 if not self._finalize_team_ingress_reservation(event, commit=True):
                     logger.error(
