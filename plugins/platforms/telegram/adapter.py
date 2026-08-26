@@ -739,8 +739,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._media_batch_delay_seconds = env_float("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", 0.8)
         self._pending_photo_batches: Dict[str, MessageEvent] = {}
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_photo_batch_id_index: Dict[str, Dict[str, str]] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_media_group_batch_id_index: Dict[str, Dict[str, str]] = {}
         # Buffer rapid text messages so Telegram client-side splits of long
         # messages are aggregated into a single MessageEvent.  Lower defaults
         # (0.3s / 1.0s instead of 0.6s / 2.0s) let short replies stream
@@ -762,6 +764,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_text_batch_id_index: Dict[str, Dict[str, str]] = {}
         self._drop_delayed_deliveries = False
         # Inbound events held across disconnect. PTB advances the polling offset
         # before our enqueue/flush drop-guard runs, so Telegram will not
@@ -5058,10 +5061,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._media_group_tasks.clear()
         self._media_group_events.clear()
+        getattr(self, "_pending_media_group_batch_id_index", {}).clear()
         self._pending_photo_batch_tasks.clear()
         self._pending_photo_batches.clear()
+        getattr(self, "_pending_photo_batch_id_index", {}).clear()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
+        getattr(self, "_pending_text_batch_id_index", {}).clear()
         if getattr(self, "_polling_error_task", None) is not current_task:
             self._polling_error_task = None
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
@@ -10232,19 +10238,183 @@ class TelegramAdapter(BasePlatformAdapter):
         setattr(target, "_telegram_batch_identity_capability", capability)
         return _TelegramBatchIdentityMerge.NEW
 
-    def _isolated_telegram_batch_key(
+    @staticmethod
+    def _trusted_telegram_batch_message_ids(
+        event: MessageEvent,
+        capability: object,
+    ) -> tuple[str, ...]:
+        """Return adapter-authenticated constituent IDs already validated in-place."""
+        if (
+            getattr(event, "_telegram_batch_identity_capability", None)
+            is not capability
+        ):
+            return ()
+        raw_ids = getattr(event, "_telegram_batch_message_ids", None)
+        if not isinstance(raw_ids, tuple):
+            return ()
+        return raw_ids
+
+    def _telegram_pending_batch_id_index(
         self,
+        attribute: str,
+    ) -> Dict[str, Dict[str, str]]:
+        """Return a lazy per-family index bounded to currently pending IDs."""
+        index = getattr(self, attribute, None)
+        if index is None:
+            index = {}
+            setattr(self, attribute, index)
+        return index
+
+    def _index_pending_telegram_batch(
+        self,
+        *,
+        base_key: str,
+        batch_key: str,
+        event: MessageEvent,
+        index_attribute: str,
+    ) -> None:
+        ids = self._trusted_telegram_batch_message_ids(
+            event,
+            self._telegram_batch_capability(),
+        )
+        if not ids:
+            return
+        bucket = self._telegram_pending_batch_id_index(index_attribute).setdefault(
+            base_key,
+            {},
+        )
+        for message_id in ids:
+            bucket[message_id] = batch_key
+        setattr(event, "_telegram_pending_batch_base_key", base_key)
+
+    def _unindex_pending_telegram_batch(
+        self,
+        *,
+        batch_key: str,
+        event: MessageEvent,
+        index_attribute: str,
+    ) -> None:
+        """Remove only the IDs owned by a batch that has left pending state."""
+        base_key = getattr(event, "_telegram_pending_batch_base_key", None)
+        if not isinstance(base_key, str):
+            base_key = batch_key.split(":isolated:", 1)[0]
+        index = self._telegram_pending_batch_id_index(index_attribute)
+        bucket = index.get(base_key)
+        if not bucket:
+            return
+        ids = self._trusted_telegram_batch_message_ids(
+            event,
+            self._telegram_batch_capability(),
+        )
+        for message_id in ids:
+            if bucket.get(message_id) == batch_key:
+                bucket.pop(message_id, None)
+        if not bucket:
+            index.pop(base_key, None)
+
+    def _prepare_pending_telegram_batch(
+        self,
+        *,
         base_key: str,
         event: MessageEvent,
-        existing_keys: Any,
-    ) -> str:
-        message_id = self._telegram_event_message_id(event) or str(id(event))
-        key = f"{base_key}:isolated:{message_id}"
-        suffix = 1
-        while key in existing_keys:
-            suffix += 1
-            key = f"{base_key}:isolated:{message_id}:{suffix}"
-        return key
+        pending_batches: Dict[str, MessageEvent],
+        index_attribute: str,
+    ) -> tuple[str, MessageEvent | None, _TelegramBatchIdentityMerge]:
+        """Resolve one event against the primary and all pending overflow siblings."""
+        identity_init = self._merge_telegram_batch_identity(event)
+        capability = self._telegram_batch_capability()
+        incoming_ids = (
+            self._trusted_telegram_batch_message_ids(event, capability)
+            if identity_init is _TelegramBatchIdentityMerge.NEW
+            else ()
+        )
+        index = self._telegram_pending_batch_id_index(index_attribute)
+        bucket = index.get(base_key, {})
+        overlap_keys: set[str] = set()
+        for message_id in incoming_ids:
+            indexed_key = bucket.get(message_id)
+            indexed_event = pending_batches.get(indexed_key) if indexed_key else None
+            indexed_ids = (
+                self._trusted_telegram_batch_message_ids(indexed_event, capability)
+                if indexed_event is not None
+                else ()
+            )
+            if indexed_key and message_id in indexed_ids:
+                overlap_keys.add(indexed_key)
+            elif indexed_key:
+                # Defensive self-heal: a stale entry must never suppress a later
+                # legitimate Telegram delivery after its pending batch is gone.
+                bucket.pop(message_id, None)
+        if base_key in index and not bucket:
+            index.pop(base_key, None)
+
+        if len(overlap_keys) > 1:
+            return (
+                base_key,
+                None,
+                _TelegramBatchIdentityMerge.PARTIAL_OVERLAP,
+            )
+        if overlap_keys:
+            batch_key = next(iter(overlap_keys))
+            existing = pending_batches[batch_key]
+            return (
+                batch_key,
+                existing,
+                self._merge_telegram_batch_identity(existing, event),
+            )
+
+        existing = pending_batches.get(base_key)
+        if existing is None:
+            pending_batches[base_key] = event
+            self._index_pending_telegram_batch(
+                base_key=base_key,
+                batch_key=base_key,
+                event=event,
+                index_attribute=index_attribute,
+            )
+            return base_key, None, _TelegramBatchIdentityMerge.NEW
+
+        identity_merge = self._merge_telegram_batch_identity(existing, event)
+        if identity_merge is _TelegramBatchIdentityMerge.NEW:
+            self._index_pending_telegram_batch(
+                base_key=base_key,
+                batch_key=base_key,
+                event=existing,
+                index_attribute=index_attribute,
+            )
+            return base_key, existing, identity_merge
+        if identity_merge is not _TelegramBatchIdentityMerge.OVERFLOW:
+            return base_key, existing, identity_merge
+
+        # Overflow keys are deterministic from the validated first constituent.
+        # Replays therefore resolve to the same pending sibling rather than an
+        # ever-growing counter suffix. The pending-ID index catches overlap in
+        # any constituent position before this collision check.
+        if not incoming_ids:
+            return base_key, existing, _TelegramBatchIdentityMerge.INVALID
+        isolated_key = f"{base_key}:isolated:{incoming_ids[0]}"
+        collision = pending_batches.get(isolated_key)
+        if collision is not None:
+            collision_ids = self._trusted_telegram_batch_message_ids(
+                collision,
+                capability,
+            )
+            if incoming_ids[0] not in collision_ids:
+                return isolated_key, collision, _TelegramBatchIdentityMerge.INVALID
+            return (
+                isolated_key,
+                collision,
+                self._merge_telegram_batch_identity(collision, event),
+            )
+
+        pending_batches[isolated_key] = event
+        self._index_pending_telegram_batch(
+            base_key=base_key,
+            batch_key=isolated_key,
+            event=event,
+            index_attribute=index_attribute,
+        )
+        return isolated_key, None, _TelegramBatchIdentityMerge.NEW
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -10259,35 +10429,30 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         key = self._text_batch_key(event)
-        self._merge_telegram_batch_identity(event)
-        existing = self._pending_text_batches.get(key)
+        key, existing, identity_merge = self._prepare_pending_telegram_batch(
+            base_key=key,
+            event=event,
+            pending_batches=self._pending_text_batches,
+            index_attribute="_pending_text_batch_id_index",
+        )
+        if identity_merge is not _TelegramBatchIdentityMerge.NEW:
+            return
         chunk_len = len(event.text or "")
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-            self._pending_text_batches[key] = event
         else:
-            identity_merge = self._merge_telegram_batch_identity(existing, event)
-            if identity_merge is _TelegramBatchIdentityMerge.DUPLICATE:
-                return
-            if identity_merge is _TelegramBatchIdentityMerge.OVERFLOW:
-                key = self._isolated_telegram_batch_key(
-                    key,
-                    event,
-                    self._pending_text_batches,
+            # Append text from the follow-up chunk
+            if event.text:
+                existing.text = (
+                    f"{existing.text}\n{event.text}"
+                    if existing.text
+                    else event.text
                 )
-                event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-                self._pending_text_batches[key] = event
-            elif identity_merge is not _TelegramBatchIdentityMerge.NEW:
-                return
-            else:
-                # Append text from the follow-up chunk
-                if event.text:
-                    existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-                existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-                # Merge any media that might be attached
-                if event.media_urls:
-                    existing.media_urls.extend(event.media_urls)
-                    existing.media_types.extend(event.media_types)
+            existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            # Merge any media that might be attached
+            if event.media_urls:
+                existing.media_urls.extend(event.media_urls)
+                existing.media_types.extend(event.media_types)
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
@@ -10333,6 +10498,11 @@ class TelegramAdapter(BasePlatformAdapter):
             event = self._pending_text_batches.pop(key, None)
             if not event:
                 return
+            self._unindex_pending_telegram_batch(
+                batch_key=key,
+                event=event,
+                index_attribute="_pending_text_batch_id_index",
+            )
             if self._should_drop_delayed_delivery():
                 self._hold_inbound_event(event, where="text-flush")
                 event = None
@@ -10379,6 +10549,11 @@ class TelegramAdapter(BasePlatformAdapter):
             event = self._pending_photo_batches.pop(batch_key, None)
             if not event:
                 return
+            self._unindex_pending_telegram_batch(
+                batch_key=batch_key,
+                event=event,
+                index_attribute="_pending_photo_batch_id_index",
+            )
             if self._should_drop_delayed_delivery():
                 self._hold_inbound_event(event, where="photo-flush")
                 event = None
@@ -10401,28 +10576,19 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         batch_key = self._team_compatible_telegram_batch_key(batch_key, event)
-        self._merge_telegram_batch_identity(event)
-        existing = self._pending_photo_batches.get(batch_key)
-        if existing is None:
-            self._pending_photo_batches[batch_key] = event
-        else:
-            identity_merge = self._merge_telegram_batch_identity(existing, event)
-            if identity_merge is _TelegramBatchIdentityMerge.DUPLICATE:
-                return
-            if identity_merge is _TelegramBatchIdentityMerge.OVERFLOW:
-                batch_key = self._isolated_telegram_batch_key(
-                    batch_key,
-                    event,
-                    self._pending_photo_batches,
-                )
-                self._pending_photo_batches[batch_key] = event
-            elif identity_merge is not _TelegramBatchIdentityMerge.NEW:
-                return
-            else:
-                existing.media_urls.extend(event.media_urls)
-                existing.media_types.extend(event.media_types)
-                if event.text:
-                    existing.text = self._merge_caption(existing.text, event.text)
+        batch_key, existing, identity_merge = self._prepare_pending_telegram_batch(
+            base_key=batch_key,
+            event=event,
+            pending_batches=self._pending_photo_batches,
+            index_attribute="_pending_photo_batch_id_index",
+        )
+        if identity_merge is not _TelegramBatchIdentityMerge.NEW:
+            return
+        if existing is not None:
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                existing.text = self._merge_caption(existing.text, event.text)
 
         prior_task = self._pending_photo_batch_tasks.get(batch_key)
         if prior_task and not prior_task.done():
@@ -10743,28 +10909,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         media_group_id = f"{self._text_batch_key(event)}:album:{media_group_id}"
-        self._merge_telegram_batch_identity(event)
-        existing = self._media_group_events.get(media_group_id)
-        if existing is None:
-            self._media_group_events[media_group_id] = event
-        else:
-            identity_merge = self._merge_telegram_batch_identity(existing, event)
-            if identity_merge is _TelegramBatchIdentityMerge.DUPLICATE:
-                return
-            if identity_merge is _TelegramBatchIdentityMerge.OVERFLOW:
-                media_group_id = self._isolated_telegram_batch_key(
-                    media_group_id,
-                    event,
-                    self._media_group_events,
-                )
-                self._media_group_events[media_group_id] = event
-            elif identity_merge is not _TelegramBatchIdentityMerge.NEW:
-                return
-            else:
-                existing.media_urls.extend(event.media_urls)
-                existing.media_types.extend(event.media_types)
-                if event.text:
-                    existing.text = self._merge_caption(existing.text, event.text)
+        media_group_id, existing, identity_merge = (
+            self._prepare_pending_telegram_batch(
+                base_key=media_group_id,
+                event=event,
+                pending_batches=self._media_group_events,
+                index_attribute="_pending_media_group_batch_id_index",
+            )
+        )
+        if identity_merge is not _TelegramBatchIdentityMerge.NEW:
+            return
+        if existing is not None:
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                existing.text = self._merge_caption(existing.text, event.text)
 
         prior_task = self._media_group_tasks.get(media_group_id)
         if prior_task:
@@ -10782,6 +10941,11 @@ class TelegramAdapter(BasePlatformAdapter):
             event = self._media_group_events.pop(media_group_id, None)
             if event is None:
                 return
+            self._unindex_pending_telegram_batch(
+                batch_key=media_group_id,
+                event=event,
+                index_attribute="_pending_media_group_batch_id_index",
+            )
             if self._should_drop_delayed_delivery():
                 self._hold_inbound_event(event, where="media-group-flush")
                 event = None

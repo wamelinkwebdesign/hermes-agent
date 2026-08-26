@@ -86,10 +86,13 @@ def _prepare_batching(adapter: TelegramAdapter) -> None:
     adapter._drop_delayed_deliveries = False
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
+    adapter._pending_text_batch_id_index = {}
     adapter._pending_photo_batches = {}
     adapter._pending_photo_batch_tasks = {}
+    adapter._pending_photo_batch_id_index = {}
     adapter._media_group_events = {}
     adapter._media_group_tasks = {}
+    adapter._pending_media_group_batch_id_index = {}
     adapter._held_inbound_events = []
     adapter._held_inbound_redispatch_task = None
     adapter.HELD_INBOUND_MAX = 64
@@ -106,6 +109,44 @@ async def _cancel_batch_tasks(*tasks) -> None:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _enqueue_batch_event(
+    adapter: TelegramAdapter,
+    batch_kind: str,
+    event: MessageEvent,
+) -> None:
+    if batch_kind in {"text", "command"}:
+        adapter._enqueue_text_event(event)
+    elif batch_kind == "photo":
+        adapter._enqueue_photo_event("overflow-photo", event)
+    else:
+        await adapter._queue_media_group_event("overflow-album", event)
+
+
+def _pending_batch_state(adapter: TelegramAdapter, batch_kind: str):
+    if batch_kind in {"text", "command"}:
+        return adapter._pending_text_batches, adapter._pending_text_batch_tasks
+    if batch_kind == "photo":
+        return adapter._pending_photo_batches, adapter._pending_photo_batch_tasks
+    return adapter._media_group_events, adapter._media_group_tasks
+
+
+async def _flush_pending_batch(
+    adapter: TelegramAdapter,
+    batch_kind: str,
+    batch_key: str,
+) -> None:
+    if batch_kind in {"text", "command"}:
+        adapter._text_batch_delay_seconds = 0
+        adapter._TEXT_BATCH_FAST_DELAY_S = 0
+        await adapter._flush_text_batch(batch_key)
+    elif batch_kind == "photo":
+        adapter._media_batch_delay_seconds = 0
+        await adapter._flush_photo_batch(batch_key)
+    else:
+        adapter.MEDIA_GROUP_WAIT_SECONDS = 0
+        await adapter._flush_media_group_event(batch_key)
 
 
 def _raw_message(
@@ -882,6 +923,275 @@ async def test_batch_identity_overflow_splits_without_discarding_message_ids():
         for message_id in getattr(batch, "_telegram_batch_message_ids")
     } == {str(message_id) for message_id in range(1, 66)}
     await _cancel_batch_tasks(*scheduled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_kind", ["text", "command", "photo", "media-group"])
+async def test_overflow_isolated_replay_reuses_pending_batch_without_payload_or_timer_duplication(
+    monkeypatch,
+    batch_kind,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    base_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
+    message_type = (
+        MessageType.COMMAND
+        if batch_kind == "command"
+        else MessageType.TEXT
+        if batch_kind == "text"
+        else MessageType.PHOTO
+    )
+    originals = []
+
+    try:
+        for message_id in range(1, 66):
+            text = (
+                f"/status@Woz_Bot original-{message_id}"
+                if batch_kind == "command"
+                else f"@Woz_Bot original payload {message_id}"
+            )
+            event = _event(
+                adapter,
+                message_id,
+                text=text,
+                message_type=message_type,
+            )
+            event.media_urls = [f"/tmp/original-{message_id}.png"]
+            event.media_types = ["image/png"]
+            originals.append(event)
+            await _enqueue_batch_event(adapter, batch_kind, event)
+
+        pending, tasks = _pending_batch_state(adapter, batch_kind)
+        isolated_key = next(
+            key
+            for key, batch in pending.items()
+            if getattr(batch, "_telegram_batch_message_ids") == ("65",)
+        )
+        isolated_task = tasks[isolated_key]
+        replay = _event(
+            adapter,
+            65,
+            text=(
+                "/status@Woz_Bot replay-payload"
+                if batch_kind == "command"
+                else "@Woz_Bot replay payload 65"
+            ),
+            message_type=message_type,
+        )
+        replay.media_urls = ["/tmp/replay-65.png"]
+        replay.media_types = ["image/png"]
+
+        await _enqueue_batch_event(adapter, batch_kind, replay)
+
+        assert len(pending) == 2
+        assert len(tasks) == 2
+        assert tasks[isolated_key] is isolated_task
+        assert isolated_key.endswith(":isolated:65")
+        isolated = pending[isolated_key]
+        assert isolated is originals[-1]
+        assert getattr(isolated, "_telegram_batch_message_ids") == ("65",)
+        assert "replay" not in (isolated.text or "")
+        assert isolated.media_urls == ["/tmp/original-65.png"]
+
+        await _cancel_batch_tasks(*list(tasks.values()))
+        tasks.clear()
+        for key in list(pending):
+            await _flush_pending_batch(adapter, batch_kind, key)
+
+        assert base_handle.await_count == 2
+        assert [
+            call.args[0].message_id for call in base_handle.await_args_list
+        ] == ["1", "65"]
+        if batch_kind == "command":
+            assert all(
+                call.args[0].message_type == MessageType.COMMAND
+                for call in base_handle.await_args_list
+            )
+    finally:
+        _pending, pending_tasks = _pending_batch_state(adapter, batch_kind)
+        await _cancel_batch_tasks(*list(pending_tasks.values()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_kind", ["text", "photo", "media-group"])
+async def test_overflow_sibling_overlap_is_rejected_and_disjoint_id_gets_one_stable_batch(
+    batch_kind,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    message_type = MessageType.TEXT if batch_kind == "text" else MessageType.PHOTO
+
+    try:
+        for message_id in range(1, 66):
+            event = _event(
+                adapter,
+                message_id,
+                text=f"original payload {message_id}",
+                message_type=message_type,
+            )
+            event.media_urls = [f"/tmp/original-{message_id}.png"]
+            event.media_types = ["image/png"]
+            await _enqueue_batch_event(adapter, batch_kind, event)
+
+        pending, tasks = _pending_batch_state(adapter, batch_kind)
+        isolated_key = next(
+            key
+            for key, batch in pending.items()
+            if getattr(batch, "_telegram_batch_message_ids") == ("65",)
+        )
+        isolated = pending[isolated_key]
+        tasks_before = dict(tasks)
+        pending_before = {
+            key: (
+                id(batch),
+                getattr(batch, "_telegram_batch_message_ids"),
+                batch.text,
+                tuple(batch.media_urls),
+                tuple(batch.media_types),
+            )
+            for key, batch in pending.items()
+        }
+        capability = adapter._telegram_batch_capability()
+        overlapping = _event(
+            adapter,
+            66,
+            text="partial overlap payload",
+            message_type=message_type,
+        )
+        overlapping.media_urls = ["/tmp/partial-overlap.png"]
+        overlapping.media_types = ["image/png"]
+        setattr(overlapping, "_telegram_batch_message_ids", ("66", "65"))
+        setattr(overlapping, "_telegram_batch_reply_to_message_ids", (None, None))
+        setattr(overlapping, "_telegram_batch_identity_capability", capability)
+
+        await _enqueue_batch_event(adapter, batch_kind, overlapping)
+
+        assert len(pending) == 2
+        assert tasks == tasks_before
+        assert {
+            key: (
+                id(batch),
+                getattr(batch, "_telegram_batch_message_ids"),
+                batch.text,
+                tuple(batch.media_urls),
+                tuple(batch.media_types),
+            )
+            for key, batch in pending.items()
+        } == pending_before
+        assert pending[isolated_key] is isolated
+        assert getattr(isolated, "_telegram_batch_message_ids") == ("65",)
+        assert isolated.text == "original payload 65"
+        assert isolated.media_urls == ["/tmp/original-65.png"]
+
+        disjoint = _event(
+            adapter,
+            66,
+            text="disjoint payload 66",
+            message_type=message_type,
+        )
+        disjoint.media_urls = ["/tmp/disjoint-66.png"]
+        disjoint.media_types = ["image/png"]
+        await _enqueue_batch_event(adapter, batch_kind, disjoint)
+
+        assert len(pending) == 3
+        assert len(tasks) == 3
+        disjoint_keys = [
+            key
+            for key, batch in pending.items()
+            if getattr(batch, "_telegram_batch_message_ids") == ("66",)
+        ]
+        assert len(disjoint_keys) == 1
+        assert disjoint_keys[0].endswith(":isolated:66")
+        assert pending[disjoint_keys[0]] is disjoint
+    finally:
+        _pending, pending_tasks = _pending_batch_state(adapter, batch_kind)
+        await _cancel_batch_tasks(*list(pending_tasks.values()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_kind", ["text", "photo", "media-group"])
+async def test_overflow_pending_identity_cleanup_allows_key_reuse_after_flush_and_cancel(
+    monkeypatch,
+    batch_kind,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", AsyncMock())
+    message_type = MessageType.TEXT if batch_kind == "text" else MessageType.PHOTO
+
+    try:
+        for message_id in range(1, 66):
+            await _enqueue_batch_event(
+                adapter,
+                batch_kind,
+                _event(
+                    adapter,
+                    message_id,
+                    text=f"payload {message_id}",
+                    message_type=message_type,
+                ),
+            )
+        pending, tasks = _pending_batch_state(adapter, batch_kind)
+        isolated_key = next(
+            key
+            for key, batch in pending.items()
+            if getattr(batch, "_telegram_batch_message_ids") == ("65",)
+        )
+        await _cancel_batch_tasks(*list(tasks.values()))
+        tasks.clear()
+
+        await _flush_pending_batch(adapter, batch_kind, isolated_key)
+        assert isolated_key not in pending
+        await _enqueue_batch_event(
+            adapter,
+            batch_kind,
+            _event(
+                adapter,
+                65,
+                text="legitimate replay after flush",
+                message_type=message_type,
+            ),
+        )
+        assert isolated_key in pending
+        assert getattr(
+            pending[isolated_key], "_telegram_batch_message_ids"
+        ) == ("65",)
+
+        adapter._drop_delayed_deliveries = True
+        await adapter._cancel_pending_delivery_tasks()
+        assert pending == {}
+        assert tasks == {}
+        adapter._held_inbound_events.clear()
+        adapter._drop_delayed_deliveries = False
+
+        later = _event(
+            adapter,
+            65,
+            text="legitimate delivery after cancellation",
+            message_type=message_type,
+        )
+        if batch_kind == "text":
+            base_key = adapter._text_batch_key(later)
+        elif batch_kind == "photo":
+            base_key = adapter._team_compatible_telegram_batch_key(
+                "overflow-photo",
+                later,
+            )
+        else:
+            base_key = (
+                f"{adapter._text_batch_key(later)}:album:overflow-album"
+            )
+        await _enqueue_batch_event(adapter, batch_kind, later)
+        assert list(pending) == [base_key]
+        assert pending[base_key] is later
+    finally:
+        adapter._drop_delayed_deliveries = False
+        _pending, pending_tasks = _pending_batch_state(adapter, batch_kind)
+        await _cancel_batch_tasks(*list(pending_tasks.values()))
 
 
 @pytest.mark.asyncio
