@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -265,3 +266,210 @@ def test_nested_team_routing_bridges_into_telegram_platform_extra(monkeypatch, t
         },
         "allowed_chats": [-1001234567890],
     }
+
+
+def _dispatcher(**kwargs):
+    return _routing_module().TelegramTeamDispatcher(**kwargs)
+
+
+def test_ingress_claim_is_process_local_and_reports_the_first_adapter():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+
+    first = dispatcher.claim_ingress(-1001234567890, 501, "engineering")
+    duplicate = dispatcher.claim_ingress("-1001234567890", "501", "design-team")
+
+    assert first == module.IngressClaim(
+        claimed=True,
+        duplicate=False,
+        adapter_profile="engineering",
+    )
+    assert duplicate == module.IngressClaim(
+        claimed=False,
+        duplicate=True,
+        adapter_profile="engineering",
+    )
+    with pytest.raises(FrozenInstanceError):
+        first.claimed = False
+
+
+def test_concurrent_adapter_copies_produce_exactly_one_ingress_claim():
+    dispatcher = _dispatcher()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        claims = list(
+            pool.map(
+                lambda profile: dispatcher.claim_ingress(-1001, 77, profile),
+                [f"adapter-{index}" for index in range(32)],
+            )
+        )
+
+    assert sum(claim.claimed for claim in claims) == 1
+    assert sum(claim.duplicate for claim in claims) == 31
+    assert {claim.adapter_profile for claim in claims} == {claims[0].adapter_profile}
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "message_id", "profile"),
+    [
+        (0, 1, "engineering"),
+        ("1001", 1, "engineering"),
+        (-1001, 0, "engineering"),
+        (-1001, "01", "engineering"),
+        (-1001, True, "engineering"),
+        (-1001, 1, "bad/profile"),
+        (-1001, 1, ""),
+    ],
+)
+def test_invalid_ingress_claims_fail_closed_without_consuming_capacity(
+    chat_id,
+    message_id,
+    profile,
+):
+    module = _routing_module()
+    dispatcher = _dispatcher(max_claims=1)
+
+    rejected = dispatcher.claim_ingress(chat_id, message_id, profile)
+    accepted = dispatcher.claim_ingress(-1001, 1, "engineering")
+
+    assert rejected == module.IngressClaim(
+        claimed=False,
+        duplicate=False,
+        adapter_profile=None,
+    )
+    assert accepted.claimed is True
+
+
+def test_ingress_claims_evict_the_oldest_entry_deterministically():
+    dispatcher = _dispatcher(max_claims=2)
+
+    assert dispatcher.claim_ingress(-1001, 1, "default").claimed is True
+    assert dispatcher.claim_ingress(-1001, 2, "default").claimed is True
+    assert dispatcher.claim_ingress(-1001, 3, "default").claimed is True
+
+    assert dispatcher.claim_ingress(-1001, 2, "engineering").duplicate is True
+    assert dispatcher.claim_ingress(-1001, 1, "engineering").claimed is True
+
+
+def test_root_and_arbitrarily_deep_human_aliases_keep_one_immutable_owner():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_inbound_alias(-1001, 101, 100) is True
+    assert dispatcher.record_inbound_alias(-1001, 102, 101) is True
+    assert dispatcher.record_inbound_alias(-1001, 103, 102) is True
+
+    ownership = module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+    assert dispatcher.resolve_reply_owner(-1001, 100) == ownership
+    assert dispatcher.resolve_reply_owner(-1001, 103) == ownership
+    with pytest.raises(FrozenInstanceError):
+        ownership.owner_profile = "design-team"
+
+
+def test_root_rebind_conflict_fails_without_mutating_the_original_owner():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 100, "design-team") is False
+
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+
+
+def test_inbound_alias_requires_a_resolved_parent_and_rejects_cross_root_rebind():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+
+    assert dispatcher.record_inbound_alias(-1001, 101, 999) is False
+    assert dispatcher.resolve_reply_owner(-1001, 101) is None
+    assert dispatcher.record_inbound_alias(-1001, 101, 100) is True
+    assert dispatcher.record_inbound_alias(-1001, 101, 200) is False
+
+    assert dispatcher.resolve_reply_owner(-1001, 101) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+
+
+def test_outbound_aliases_cover_preview_final_and_continuation_messages():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    assert dispatcher.record_outbound_alias(-1001, [301, "302", 303], 100) is True
+
+    expected = module.RootOwnership(root_message_id="100", owner_profile="engineering")
+    assert dispatcher.resolve_reply_owner(-1001, 301) == expected
+    assert dispatcher.resolve_reply_owner(-1001, 302) == expected
+    assert dispatcher.resolve_reply_owner(-1001, 303) == expected
+
+
+def test_outbound_alias_batch_is_atomic_on_invalid_id_or_conflict():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+    assert dispatcher.record_outbound_alias(-1001, [400], 200) is True
+
+    assert dispatcher.record_outbound_alias(-1001, [301, 0, 302], 100) is False
+    assert dispatcher.record_outbound_alias(-1001, [303, 400, 304], 100) is False
+
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 303) is None
+    assert dispatcher.resolve_reply_owner(-1001, 400) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+
+
+def test_aliases_are_chat_scoped_and_invalid_lookups_fail_closed():
+    dispatcher = _dispatcher()
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    assert dispatcher.resolve_reply_owner(-2002, 100) is None
+    assert dispatcher.resolve_reply_owner("not-a-group", 100) is None
+    assert dispatcher.resolve_reply_owner(-1001, 0) is None
+
+
+def test_alias_bound_evicts_whole_oldest_root_family_without_dangling_aliases():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=3)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_inbound_alias(-1001, 101, 100) is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+
+    assert dispatcher.record_outbound_alias(-1001, [201], 200) is True
+
+    assert dispatcher.resolve_reply_owner(-1001, 100) is None
+    assert dispatcher.resolve_reply_owner(-1001, 101) is None
+    assert dispatcher.resolve_reply_owner(-1001, 200) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+    assert dispatcher.resolve_reply_owner(-1001, 201) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+
+
+def test_alias_batch_larger_than_capacity_fails_without_evicting_existing_roots():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=2)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    assert dispatcher.record_outbound_alias(-1001, [301, 302], 100) is False
+
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
