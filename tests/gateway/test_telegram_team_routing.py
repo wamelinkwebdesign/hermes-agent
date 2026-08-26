@@ -149,6 +149,34 @@ def test_team_config_rejects_invalid_allowed_group_ids(allowed_chats):
     assert module.TelegramTeamConfig.from_raw(raw) is None
 
 
+def test_team_config_accepts_signed_64_bit_group_id_boundaries():
+    module = _routing_module()
+    raw = _valid_raw()
+    raw["allowed_chats"] = [-(2**63), "-1"]
+
+    config = module.TelegramTeamConfig.from_raw(raw)
+
+    assert config is not None
+    assert config.allowed_chats == frozenset({str(-(2**63)), "-1"})
+
+
+@pytest.mark.parametrize("chat_id", [-(2**63) - 1, str(-(2**63) - 1)])
+def test_team_config_rejects_group_ids_below_signed_64_bit_minimum(chat_id):
+    module = _routing_module()
+    raw = _valid_raw()
+    raw["allowed_chats"] = [-1001, chat_id]
+
+    assert module.TelegramTeamConfig.from_raw(raw) is None
+
+
+def test_team_config_rejects_overlong_group_id_atomically():
+    module = _routing_module()
+    raw = _valid_raw()
+    raw["allowed_chats"] = [-1001, "-" + "9" * 5000]
+
+    assert module.TelegramTeamConfig.from_raw(raw) is None
+
+
 def test_reply_to_team_bot_wins_over_mentions():
     module = _routing_module()
 
@@ -340,6 +368,70 @@ def test_invalid_ingress_claims_fail_closed_without_consuming_capacity(
     assert accepted.claimed is True
 
 
+def test_overlong_ingress_identifiers_fail_closed_without_exceptions():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+    rejected = module.IngressClaim(
+        claimed=False,
+        duplicate=False,
+        adapter_profile=None,
+    )
+
+    assert dispatcher.claim_ingress("-" + "9" * 5000, 1, "engineering") == rejected
+    assert dispatcher.claim_ingress(-1001, "9" * 10_000, "engineering") == rejected
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "message_id"),
+    [
+        (-(2**63), 1),
+        (str(-(2**63)), "1"),
+        (-1, 2**63 - 1),
+        ("-1", str(2**63 - 1)),
+    ],
+)
+def test_ingress_claim_accepts_signed_64_bit_identifier_boundaries(chat_id, message_id):
+    dispatcher_claim = _dispatcher().claim_ingress(
+        chat_id,
+        message_id,
+        "engineering",
+    )
+
+    assert dispatcher_claim.claimed is True
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "message_id"),
+    [
+        (-(2**63) - 1, 1),
+        (str(-(2**63) - 1), "1"),
+        (-1, 2**63),
+        ("-1", str(2**63)),
+    ],
+)
+def test_ingress_claim_rejects_identifiers_outside_signed_64_bit_range(
+    chat_id,
+    message_id,
+):
+    module = _routing_module()
+
+    assert _dispatcher().claim_ingress(chat_id, message_id, "engineering") == (
+        module.IngressClaim(claimed=False, duplicate=False, adapter_profile=None)
+    )
+
+
+def test_overlong_ingress_claim_does_not_consume_or_reorder_capacity():
+    dispatcher = _dispatcher(max_claims=2)
+    assert dispatcher.claim_ingress(-1001, 1, "default").claimed is True
+
+    assert dispatcher.claim_ingress(-1001, "9" * 10_000, "default").claimed is False
+    assert dispatcher.claim_ingress(-1001, 2, "default").claimed is True
+    assert dispatcher.claim_ingress(-1001, 1, "engineering").duplicate is True
+
+    assert dispatcher.claim_ingress(-1001, 3, "default").claimed is True
+    assert dispatcher.claim_ingress(-1001, 1, "engineering").claimed is True
+
+
 def test_ingress_claims_evict_the_oldest_entry_deterministically():
     dispatcher = _dispatcher(max_claims=2)
 
@@ -368,6 +460,29 @@ def test_root_and_arbitrarily_deep_human_aliases_keep_one_immutable_owner():
     assert dispatcher.resolve_reply_owner(-1001, 103) == ownership
     with pytest.raises(FrozenInstanceError):
         ownership.owner_profile = "design-team"
+
+
+def test_overlong_root_and_resolve_identifiers_fail_closed_without_eviction():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=2)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+
+    overlong_chat_id = "-" + "9" * 5000
+    overlong_message_id = "9" * 10_000
+    assert dispatcher.record_root(-1001, overlong_message_id, "default") is False
+    assert dispatcher.record_root(overlong_chat_id, 300, "default") is False
+    assert dispatcher.resolve_reply_owner(-1001, overlong_message_id) is None
+    assert dispatcher.resolve_reply_owner(overlong_chat_id, 100) is None
+
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+    assert dispatcher.resolve_reply_owner(-1001, 200) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
 
 
 def test_root_rebind_conflict_fails_without_mutating_the_original_owner():

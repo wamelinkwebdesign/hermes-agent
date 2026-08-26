@@ -15,6 +15,11 @@ _USERNAME_RE = re.compile(r"[A-Za-z0-9_]{5,32}\Z")
 _GROUP_CHAT_RE = re.compile(r"-[0-9]+\Z")
 _MESSAGE_ID_RE = re.compile(r"[1-9][0-9]*\Z")
 
+_MIN_GROUP_CHAT_ID = -(2**63)
+_MAX_MESSAGE_ID = 2**63 - 1
+_MAX_GROUP_CHAT_ID_LENGTH = len(str(_MIN_GROUP_CHAT_ID))
+_MAX_MESSAGE_ID_LENGTH = len(str(_MAX_MESSAGE_ID))
+
 _DEFAULT_MAX_CLAIMS = 4096
 _DEFAULT_MAX_ALIASES = 8192
 
@@ -32,21 +37,29 @@ def _normalize_group_chat_id(value: object) -> str | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return str(value) if value < 0 else None
-    if not isinstance(value, str) or not _GROUP_CHAT_RE.fullmatch(value):
+        return str(value) if _MIN_GROUP_CHAT_ID <= value < 0 else None
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_GROUP_CHAT_ID_LENGTH
+        or not _GROUP_CHAT_RE.fullmatch(value)
+    ):
         return None
     parsed = int(value)
-    return str(parsed) if parsed < 0 else None
+    return str(parsed) if _MIN_GROUP_CHAT_ID <= parsed < 0 else None
 
 
 def _normalize_message_id(value: object) -> str | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return str(value) if value > 0 else None
-    if not isinstance(value, str) or not _MESSAGE_ID_RE.fullmatch(value):
+        return str(value) if 0 < value <= _MAX_MESSAGE_ID else None
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_MESSAGE_ID_LENGTH
+        or not _MESSAGE_ID_RE.fullmatch(value)
+    ):
         return None
-    return value
+    return value if int(value) <= _MAX_MESSAGE_ID else None
 
 
 def _normalize_profile(value: object) -> str | None:
