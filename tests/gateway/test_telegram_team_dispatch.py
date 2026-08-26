@@ -529,6 +529,224 @@ async def test_known_parent_batch_maps_every_constituent_to_parent_root(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("batch_kind", ["text", "photo", "media-group"])
+async def test_team_batch_paths_keep_different_immediate_parents_in_separate_roots(
+    monkeypatch,
+    batch_kind,
+):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, 850, "engineering") is True
+    assert dispatcher.record_root(_ALLOWED_CHAT, 999, "engineering") is True
+    _prepare_batching(adapter)
+    base_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
+    message_type = MessageType.TEXT if batch_kind == "text" else MessageType.PHOTO
+    events = [
+        _event(
+            adapter,
+            900,
+            text="first for 850",
+            reply_to_message_id=850,
+            message_type=message_type,
+        ),
+        _event(
+            adapter,
+            901,
+            text="only for 999",
+            reply_to_message_id=999,
+            message_type=message_type,
+        ),
+        _event(
+            adapter,
+            902,
+            text="second for 850",
+            reply_to_message_id=850,
+            message_type=message_type,
+        ),
+    ]
+    events[0].media_urls = ["/tmp/900.png"]
+    events[1].media_urls = ["/tmp/901.png"]
+    events[2].media_urls = ["/tmp/902.png"]
+
+    if batch_kind == "text":
+        for event in events:
+            adapter._enqueue_text_event(event)
+        pending = adapter._pending_text_batches
+        tasks = adapter._pending_text_batch_tasks
+    elif batch_kind == "photo":
+        for event in events:
+            adapter._enqueue_photo_event("photo-burst", event)
+        pending = adapter._pending_photo_batches
+        tasks = adapter._pending_photo_batch_tasks
+    else:
+        for event in events:
+            await adapter._queue_media_group_event("same-album", event)
+        pending = adapter._media_group_events
+        tasks = adapter._media_group_tasks
+
+    await _cancel_batch_tasks(*list(tasks.values()))
+    tasks.clear()
+    assert len(pending) == 2
+    batches_by_first_id = {
+        getattr(event, "_telegram_batch_message_ids")[0]: event
+        for event in pending.values()
+    }
+    assert getattr(
+        batches_by_first_id["900"], "_telegram_batch_message_ids"
+    ) == ("900", "902")
+    assert getattr(
+        batches_by_first_id["901"], "_telegram_batch_message_ids"
+    ) == ("901",)
+
+    if batch_kind == "text":
+        adapter._text_batch_delay_seconds = 0
+        adapter._TEXT_BATCH_FAST_DELAY_S = 0
+        for key in list(pending):
+            await adapter._flush_text_batch(key)
+    elif batch_kind == "photo":
+        adapter._media_batch_delay_seconds = 0
+        for key in list(pending):
+            await adapter._flush_photo_batch(key)
+    else:
+        adapter.MEDIA_GROUP_WAIT_SECONDS = 0
+        for key in list(pending):
+            await adapter._flush_media_group_event(key)
+
+    assert base_handle.await_count == 2
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 900) == RootOwnership(
+        "850", "engineering"
+    )
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 902) == RootOwnership(
+        "850", "engineering"
+    )
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 901) == RootOwnership(
+        "999", "engineering"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_kind", ["text", "photo", "media-group"])
+async def test_buffered_duplicate_replay_does_not_duplicate_payload_or_dispatch(
+    monkeypatch,
+    batch_kind,
+):
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    base_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
+    message_type = MessageType.TEXT if batch_kind == "text" else MessageType.PHOTO
+    first = _event(adapter, 950, text="@Woz_Bot first payload", message_type=message_type)
+    replay = _event(adapter, 950, text="@Woz_Bot replay payload", message_type=message_type)
+    second = _event(adapter, 951, text="@Woz_Bot second payload", message_type=message_type)
+    first.media_urls = ["/tmp/first.png"]
+    replay.media_urls = ["/tmp/replay.png"]
+    second.media_urls = ["/tmp/second.png"]
+
+    if batch_kind == "text":
+        adapter._enqueue_text_event(first)
+        first_task = next(iter(adapter._pending_text_batch_tasks.values()))
+        adapter._enqueue_text_event(replay)
+        replay_task = next(iter(adapter._pending_text_batch_tasks.values()))
+        adapter._enqueue_text_event(second)
+        pending = adapter._pending_text_batches
+        tasks = adapter._pending_text_batch_tasks
+    elif batch_kind == "photo":
+        adapter._enqueue_photo_event("photo-burst", first)
+        first_task = next(iter(adapter._pending_photo_batch_tasks.values()))
+        adapter._enqueue_photo_event("photo-burst", replay)
+        replay_task = next(iter(adapter._pending_photo_batch_tasks.values()))
+        adapter._enqueue_photo_event("photo-burst", second)
+        pending = adapter._pending_photo_batches
+        tasks = adapter._pending_photo_batch_tasks
+    else:
+        await adapter._queue_media_group_event("album-replay", first)
+        first_task = next(iter(adapter._media_group_tasks.values()))
+        await adapter._queue_media_group_event("album-replay", replay)
+        replay_task = next(iter(adapter._media_group_tasks.values()))
+        await adapter._queue_media_group_event("album-replay", second)
+        pending = adapter._media_group_events
+        tasks = adapter._media_group_tasks
+
+    duplicate_kept_original_timer = replay_task is first_task
+    await _cancel_batch_tasks(*list(tasks.values()))
+    tasks.clear()
+    assert duplicate_kept_original_timer is True
+    assert len(pending) == 1
+    buffered = next(iter(pending.values()))
+    assert getattr(buffered, "_telegram_batch_message_ids") == ("950", "951")
+    assert "replay payload" not in (buffered.text or "")
+    assert "first payload" in (buffered.text or "")
+    assert "second payload" in (buffered.text or "")
+    assert buffered.media_urls == ["/tmp/first.png", "/tmp/second.png"]
+
+    key = next(iter(pending))
+    if batch_kind == "text":
+        adapter._text_batch_delay_seconds = 0
+        adapter._TEXT_BATCH_FAST_DELAY_S = 0
+        await adapter._flush_text_batch(key)
+    elif batch_kind == "photo":
+        adapter._media_batch_delay_seconds = 0
+        await adapter._flush_photo_batch(key)
+    else:
+        adapter.MEDIA_GROUP_WAIT_SECONDS = 0
+        await adapter._flush_media_group_event(key)
+
+    base_handle.assert_awaited_once_with(first)
+
+
+@pytest.mark.asyncio
+async def test_partial_overlap_batch_is_rejected_without_corrupting_pending_payload():
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    first = _event(adapter, 960, text="original payload")
+    first.media_urls = ["/tmp/original.png"]
+    adapter._enqueue_text_event(first)
+    first_task = next(iter(adapter._pending_text_batch_tasks.values()))
+    capability = adapter._telegram_batch_capability()
+    overlapping = _event(adapter, 960, text="overlapping payload")
+    overlapping.media_urls = ["/tmp/overlap.png"]
+    setattr(overlapping, "_telegram_batch_message_ids", ("960", "961"))
+    setattr(overlapping, "_telegram_batch_reply_to_message_ids", (None, None))
+    setattr(overlapping, "_telegram_batch_identity_capability", capability)
+
+    adapter._enqueue_text_event(overlapping)
+
+    assert len(adapter._pending_text_batch_tasks) == 1
+    assert next(iter(adapter._pending_text_batch_tasks.values())) is first_task
+    await _cancel_batch_tasks(*list(adapter._pending_text_batch_tasks.values()))
+    assert len(adapter._pending_text_batches) == 1
+    assert getattr(first, "_telegram_batch_message_ids") == ("960",)
+    assert first.text == "original payload"
+    assert first.media_urls == ["/tmp/original.png"]
+
+
+@pytest.mark.asyncio
+async def test_incompatible_internal_constituent_parents_fail_closed_before_reservation():
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, 700, "engineering") is True
+    reserve = Mock(side_effect=AssertionError("invalid provenance must not reserve"))
+    dispatcher.reserve_ingress_batch = reserve
+    event = _event(adapter, 740, reply_to_message_id=700)
+    capability = adapter._telegram_batch_capability()
+    setattr(event, "_telegram_batch_message_ids", ("740", "741"))
+    setattr(event, "_telegram_batch_reply_to_message_ids", ("700", "999"))
+    setattr(event, "_telegram_batch_identity_capability", capability)
+
+    handler = adapter._team_ingress_handler
+    assert handler is not None
+    assert await handler(adapter, event) is True
+    reserve.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_unaddressed_batch_carries_validated_ids_only_in_runner_capability(
     monkeypatch,
 ):
@@ -826,6 +1044,8 @@ async def test_every_post_reservation_ingress_failure_releases_atomically(
     dispatcher = runner._telegram_team_dispatcher
     assert dispatcher is not None
     event = _event(adapter, 730, text="@Woz_Bot investigate")
+    single_api_mock = None
+    batch_api_mock = None
 
     if failure_branch == "resolve-owner-raises":
         dispatcher.resolve_reply_owner = Mock(side_effect=RuntimeError("resolve failed"))
@@ -837,7 +1057,12 @@ async def test_every_post_reservation_ingress_failure_releases_atomically(
     elif failure_branch == "record-alias-fails":
         assert dispatcher.record_root(_ALLOWED_CHAT, 700, "engineering") is True
         event = _event(adapter, 730, reply_to_message_id=700)
-        dispatcher.record_inbound_alias = Mock(return_value=False)
+        single_api_mock = Mock(
+            side_effect=AssertionError("runner must use the atomic batch API")
+        )
+        batch_api_mock = Mock(return_value=False)
+        dispatcher.record_inbound_alias = single_api_mock
+        dispatcher.record_inbound_alias_batch = batch_api_mock
     elif failure_branch == "resolve-addressed-raises":
         monkeypatch.setattr(
             routing,
@@ -847,7 +1072,12 @@ async def test_every_post_reservation_ingress_failure_releases_atomically(
     elif failure_branch == "decision-owner-mismatch":
         event = _event(adapter, 730, text="unaddressed")
     elif failure_branch == "record-root-fails":
-        dispatcher.record_root = Mock(return_value=False)
+        single_api_mock = Mock(
+            side_effect=AssertionError("runner must use the atomic batch API")
+        )
+        batch_api_mock = Mock(return_value=False)
+        dispatcher.record_root = single_api_mock
+        dispatcher.record_root_batch = batch_api_mock
     else:
         assert event.source is not None
         source_type = type(event.source)
@@ -868,6 +1098,25 @@ async def test_every_post_reservation_ingress_failure_releases_atomically(
     consumed = await handler(adapter, event)
 
     assert consumed is True
+    if failure_branch == "record-alias-fails":
+        assert single_api_mock is not None
+        assert batch_api_mock is not None
+        single_api_mock.assert_not_called()
+        batch_api_mock.assert_called_once_with(
+            _ALLOWED_CHAT,
+            ("730",),
+            "700",
+        )
+    elif failure_branch == "record-root-fails":
+        assert single_api_mock is not None
+        assert batch_api_mock is not None
+        single_api_mock.assert_not_called()
+        batch_api_mock.assert_called_once_with(
+            _ALLOWED_CHAT,
+            "730",
+            "engineering",
+            ("730",),
+        )
     retry = dispatcher.reserve_ingress_batch(_ALLOWED_CHAT, [730], "engineering")
     assert retry.reserved is True
     assert retry.reservation is not None

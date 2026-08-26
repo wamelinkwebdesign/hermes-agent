@@ -16333,8 +16333,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         forbidden_batch_metadata = (
             "_telegram_batch_message_ids",
+            "_telegram_batch_reply_to_message_ids",
             "_telegram_batch_identity_capability",
             "telegram_batch_message_ids",
+            "telegram_batch_reply_to_message_ids",
             "telegram_constituent_message_ids",
             "telegram_team_constituent_message_ids",
             "_telegram_team_constituent_message_ids",
@@ -16359,6 +16361,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             expected_constituent_capability = self.__dict__.get(
                 "_telegram_team_constituent_ids_capability"
             )
+            raw_constituent_parent_ids = None
         else:
             raw_constituent_ids = getattr(
                 event,
@@ -16375,8 +16378,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "_telegram_batch_identity_capability",
                 None,
             )
+            raw_constituent_parent_ids = getattr(
+                event,
+                "_telegram_batch_reply_to_message_ids",
+                None,
+            )
 
         if raw_constituent_ids is None and constituent_capability is None:
+            if raw_constituent_parent_ids is not None:
+                return True
             constituent_ids = (context.message_id,)
         else:
             if (
@@ -16400,6 +16410,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 return True
             constituent_ids = cast(Tuple[str, ...], normalized_constituent_ids)
+            if not routed_marker_present:
+                if (
+                    not isinstance(raw_constituent_parent_ids, (tuple, list))
+                    or len(raw_constituent_parent_ids) != len(constituent_ids)
+                ):
+                    return True
+                normalized_constituent_parent_ids: list[str | None] = []
+                for parent_id in raw_constituent_parent_ids:
+                    if parent_id is None:
+                        normalized_constituent_parent_ids.append(None)
+                        continue
+                    normalized_parent_id = _normalize_message_id(parent_id)
+                    if normalized_parent_id is None:
+                        return True
+                    normalized_constituent_parent_ids.append(normalized_parent_id)
+                if any(
+                    parent_id != context.reply_to_message_id
+                    for parent_id in normalized_constituent_parent_ids
+                ):
+                    return True
 
         if routed_marker_present:
             capability = self.__dict__.get("_telegram_team_route_capability")
@@ -16458,13 +16488,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or context.reply_to_message_id is None
                 ):
                     return True
-                for constituent_id in constituent_ids:
-                    if not dispatcher.record_inbound_alias(
-                        raw_chat_id,
-                        constituent_id,
-                        context.reply_to_message_id,
-                    ):
-                        return True
+                if not dispatcher.record_inbound_alias_batch(
+                    raw_chat_id,
+                    constituent_ids,
+                    context.reply_to_message_id,
+                ):
+                    return True
                 root_message_id = ownership.root_message_id
                 owner_profile = ownership.owner_profile
                 route_reason = "reply_to_root_chain"
@@ -16483,19 +16512,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if route_reason == "unaddressed_ingress":
                     deferred_root_binding = True
                 else:
-                    if not dispatcher.record_root(
+                    if not dispatcher.record_root_batch(
                         raw_chat_id,
                         root_message_id,
                         owner_profile,
+                        constituent_ids,
                     ):
                         return True
-                    for constituent_id in constituent_ids[1:]:
-                        if not dispatcher.record_inbound_alias(
-                            raw_chat_id,
-                            constituent_id,
-                            root_message_id,
-                        ):
-                            return True
 
             source.profile = owner_profile
             source.session_scope_id = (

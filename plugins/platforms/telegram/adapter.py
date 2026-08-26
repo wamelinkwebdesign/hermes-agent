@@ -19,6 +19,7 @@ import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -455,8 +456,17 @@ from gateway.platforms.helpers import (
 from gateway.telegram_team_routing import (
     MAX_TELEGRAM_BATCH_MESSAGE_IDS,
     TelegramTeamRouteContext,
+    _normalize_group_chat_id,
     _normalize_message_id,
 )
+
+
+class _TelegramBatchIdentityMerge(Enum):
+    NEW = "new"
+    DUPLICATE = "duplicate"
+    OVERFLOW = "overflow"
+    PARTIAL_OVERLAP = "partial-overlap"
+    INVALID = "invalid"
 
 
 # ---------------------------------------------------------------------------
@@ -10004,12 +10014,13 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         from gateway.session import build_session_key
         self._apply_topic_recovery(event)
-        return build_session_key(
+        base_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        return self._team_compatible_telegram_batch_key(base_key, event)
 
     def _telegram_batch_capability(self) -> object:
         capability = self.__dict__.get("_telegram_batch_identity_capability")
@@ -10035,27 +10046,103 @@ class TelegramAdapter(BasePlatformAdapter):
         first = normalized[0]
         return first if all(value == first for value in normalized) else None
 
+    @staticmethod
+    def _telegram_event_reply_parent(
+        event: MessageEvent,
+    ) -> tuple[bool, str | None]:
+        """Return one normalized immediate parent from event and raw provenance."""
+        raw_message = getattr(event, "raw_message", None)
+        raw_values = [getattr(event, "reply_to_message_id", None)]
+        if raw_message is not None:
+            raw_reply = getattr(raw_message, "reply_to_message", None)
+            raw_values.append(
+                getattr(raw_reply, "message_id", None) if raw_reply is not None else None
+            )
+
+        normalized_values: list[str | None] = []
+        for value in raw_values:
+            if value is None:
+                normalized_values.append(None)
+                continue
+            normalized = _normalize_message_id(value)
+            if normalized is None:
+                return False, None
+            normalized_values.append(normalized)
+        first = normalized_values[0]
+        return (
+            (True, first)
+            if all(value == first for value in normalized_values)
+            else (False, None)
+        )
+
+    def _team_compatible_telegram_batch_key(
+        self,
+        base_key: str,
+        event: MessageEvent,
+    ) -> str:
+        """Scope team-group batches to one normalized immediate reply parent."""
+        if getattr(self, "_team_ingress_handler", None) is None:
+            return base_key
+        source = getattr(event, "source", None)
+        raw_message = getattr(event, "raw_message", None)
+        source_chat_id = getattr(source, "chat_id", None) if source is not None else None
+        raw_chat = getattr(raw_message, "chat", None)
+        raw_chat_id = getattr(raw_chat, "id", None) if raw_chat is not None else None
+
+        if (
+            _normalize_group_chat_id(source_chat_id) is None
+            and _normalize_group_chat_id(raw_chat_id) is None
+        ):
+            return base_key
+
+        valid, parent_id = self._telegram_event_reply_parent(event)
+        if valid:
+            fingerprint = parent_id if parent_id is not None else "none"
+        else:
+            fingerprint = f"invalid-{self._telegram_event_message_id(event) or 'unknown'}"
+        return f"{base_key}:team-parent:{fingerprint}"
+
     def _merge_telegram_batch_identity(
         self,
         target: MessageEvent,
         incoming: MessageEvent | None = None,
-    ) -> bool:
-        """Atomically initialize or merge bounded internal constituent IDs."""
+    ) -> _TelegramBatchIdentityMerge:
+        """Atomically classify and merge bounded internal constituent identity."""
         capability = self._telegram_batch_capability()
 
-        def _validated_ids(event: MessageEvent) -> tuple[str, ...] | None:
+        def _validated_identity(
+            event: MessageEvent,
+        ) -> tuple[tuple[str, ...], tuple[str | None, ...]] | None:
             current_id = self._telegram_event_message_id(event)
             raw_ids = getattr(event, "_telegram_batch_message_ids", None)
+            raw_parent_ids = getattr(
+                event,
+                "_telegram_batch_reply_to_message_ids",
+                None,
+            )
             raw_capability = getattr(
                 event,
                 "_telegram_batch_identity_capability",
                 None,
             )
-            if raw_ids is None and raw_capability is None:
-                return (current_id,) if current_id is not None else None
-            if raw_capability is not capability or not isinstance(raw_ids, (tuple, list)):
+            valid_parent, current_parent_id = self._telegram_event_reply_parent(event)
+            if not valid_parent:
+                return None
+            if raw_ids is None and raw_capability is None and raw_parent_ids is None:
+                return (
+                    ((current_id,), (current_parent_id,))
+                    if current_id is not None
+                    else None
+                )
+            if (
+                raw_capability is not capability
+                or not isinstance(raw_ids, (tuple, list))
+                or not isinstance(raw_parent_ids, (tuple, list))
+            ):
                 return None
             if not raw_ids or len(raw_ids) > MAX_TELEGRAM_BATCH_MESSAGE_IDS:
+                return None
+            if len(raw_parent_ids) != len(raw_ids):
                 return None
             normalized_ids: list[str] = []
             for value in raw_ids:
@@ -10065,35 +10152,85 @@ class TelegramAdapter(BasePlatformAdapter):
                 normalized_ids.append(normalized_id)
             if current_id is None or normalized_ids[0] != current_id:
                 return None
-            return tuple(normalized_ids)
+            normalized_parent_ids: list[str | None] = []
+            for value in raw_parent_ids:
+                if value is None:
+                    normalized_parent_ids.append(None)
+                    continue
+                normalized_parent_id = _normalize_message_id(value)
+                if normalized_parent_id is None:
+                    return None
+                normalized_parent_ids.append(normalized_parent_id)
+            if (
+                normalized_parent_ids[0] != current_parent_id
+                or any(
+                    parent_id != current_parent_id
+                    for parent_id in normalized_parent_ids
+                )
+            ):
+                return None
+            return tuple(normalized_ids), tuple(normalized_parent_ids)
 
-        target_ids = _validated_ids(target)
-        incoming_ids = _validated_ids(incoming) if incoming is not None else ()
-        if target_ids is None or incoming_ids is None:
+        target_identity = _validated_identity(target)
+        incoming_identity = (
+            _validated_identity(incoming) if incoming is not None else None
+        )
+        if target_identity is None or (incoming is not None and incoming_identity is None):
             # Synthetic legacy events without Telegram IDs remain batchable
             # outside team mode. Real PTB updates always carry a message ID.
-            return (
-                target_ids is None
+            legacy_batchable = (
+                target_identity is None
                 and self._telegram_event_message_id(target) is None
                 and (
                     incoming is None
                     or (
-                        incoming_ids is None
+                        incoming_identity is None
                         and self._telegram_event_message_id(incoming) is None
                     )
                 )
                 and getattr(self, "_team_ingress_handler", None) is None
             )
+            return (
+                _TelegramBatchIdentityMerge.NEW
+                if legacy_batchable
+                else _TelegramBatchIdentityMerge.INVALID
+            )
 
-        merged_ids = list(target_ids)
-        for message_id in incoming_ids:
-            if message_id not in merged_ids:
-                merged_ids.append(message_id)
+        target_ids, target_parent_ids = target_identity
+        if incoming is None:
+            setattr(target, "_telegram_batch_message_ids", target_ids)
+            setattr(
+                target,
+                "_telegram_batch_reply_to_message_ids",
+                target_parent_ids,
+            )
+            setattr(target, "_telegram_batch_identity_capability", capability)
+            return _TelegramBatchIdentityMerge.NEW
+
+        assert incoming_identity is not None
+        incoming_ids, incoming_parent_ids = incoming_identity
+        if incoming_parent_ids[0] != target_parent_ids[0]:
+            return _TelegramBatchIdentityMerge.INVALID
+
+        overlap = set(target_ids).intersection(incoming_ids)
+        if overlap:
+            return (
+                _TelegramBatchIdentityMerge.DUPLICATE
+                if overlap == set(incoming_ids)
+                else _TelegramBatchIdentityMerge.PARTIAL_OVERLAP
+            )
+
+        merged_ids = [*target_ids, *incoming_ids]
         if len(merged_ids) > MAX_TELEGRAM_BATCH_MESSAGE_IDS:
-            return False
+            return _TelegramBatchIdentityMerge.OVERFLOW
         setattr(target, "_telegram_batch_message_ids", tuple(merged_ids))
+        setattr(
+            target,
+            "_telegram_batch_reply_to_message_ids",
+            (*target_parent_ids, *incoming_parent_ids),
+        )
         setattr(target, "_telegram_batch_identity_capability", capability)
-        return True
+        return _TelegramBatchIdentityMerge.NEW
 
     def _isolated_telegram_batch_key(
         self,
@@ -10128,23 +10265,29 @@ class TelegramAdapter(BasePlatformAdapter):
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
-        elif not self._merge_telegram_batch_identity(existing, event):
-            key = self._isolated_telegram_batch_key(
-                key,
-                event,
-                self._pending_text_batches,
-            )
-            event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-            self._pending_text_batches[key] = event
         else:
-            # Append text from the follow-up chunk
-            if event.text:
-                existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-            # Merge any media that might be attached
-            if event.media_urls:
-                existing.media_urls.extend(event.media_urls)
-                existing.media_types.extend(event.media_types)
+            identity_merge = self._merge_telegram_batch_identity(existing, event)
+            if identity_merge is _TelegramBatchIdentityMerge.DUPLICATE:
+                return
+            if identity_merge is _TelegramBatchIdentityMerge.OVERFLOW:
+                key = self._isolated_telegram_batch_key(
+                    key,
+                    event,
+                    self._pending_text_batches,
+                )
+                event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+                self._pending_text_batches[key] = event
+            elif identity_merge is not _TelegramBatchIdentityMerge.NEW:
+                return
+            else:
+                # Append text from the follow-up chunk
+                if event.text:
+                    existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+                existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+                # Merge any media that might be attached
+                if event.media_urls:
+                    existing.media_urls.extend(event.media_urls)
+                    existing.media_types.extend(event.media_types)
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
@@ -10257,22 +10400,29 @@ class TelegramAdapter(BasePlatformAdapter):
             self._hold_inbound_event(event, where="photo-enqueue")
             return
 
+        batch_key = self._team_compatible_telegram_batch_key(batch_key, event)
         self._merge_telegram_batch_identity(event)
         existing = self._pending_photo_batches.get(batch_key)
         if existing is None:
             self._pending_photo_batches[batch_key] = event
-        elif not self._merge_telegram_batch_identity(existing, event):
-            batch_key = self._isolated_telegram_batch_key(
-                batch_key,
-                event,
-                self._pending_photo_batches,
-            )
-            self._pending_photo_batches[batch_key] = event
         else:
-            existing.media_urls.extend(event.media_urls)
-            existing.media_types.extend(event.media_types)
-            if event.text:
-                existing.text = self._merge_caption(existing.text, event.text)
+            identity_merge = self._merge_telegram_batch_identity(existing, event)
+            if identity_merge is _TelegramBatchIdentityMerge.DUPLICATE:
+                return
+            if identity_merge is _TelegramBatchIdentityMerge.OVERFLOW:
+                batch_key = self._isolated_telegram_batch_key(
+                    batch_key,
+                    event,
+                    self._pending_photo_batches,
+                )
+                self._pending_photo_batches[batch_key] = event
+            elif identity_merge is not _TelegramBatchIdentityMerge.NEW:
+                return
+            else:
+                existing.media_urls.extend(event.media_urls)
+                existing.media_types.extend(event.media_types)
+                if event.text:
+                    existing.text = self._merge_caption(existing.text, event.text)
 
         prior_task = self._pending_photo_batch_tasks.get(batch_key)
         if prior_task and not prior_task.done():
@@ -10597,18 +10747,24 @@ class TelegramAdapter(BasePlatformAdapter):
         existing = self._media_group_events.get(media_group_id)
         if existing is None:
             self._media_group_events[media_group_id] = event
-        elif not self._merge_telegram_batch_identity(existing, event):
-            media_group_id = self._isolated_telegram_batch_key(
-                media_group_id,
-                event,
-                self._media_group_events,
-            )
-            self._media_group_events[media_group_id] = event
         else:
-            existing.media_urls.extend(event.media_urls)
-            existing.media_types.extend(event.media_types)
-            if event.text:
-                existing.text = self._merge_caption(existing.text, event.text)
+            identity_merge = self._merge_telegram_batch_identity(existing, event)
+            if identity_merge is _TelegramBatchIdentityMerge.DUPLICATE:
+                return
+            if identity_merge is _TelegramBatchIdentityMerge.OVERFLOW:
+                media_group_id = self._isolated_telegram_batch_key(
+                    media_group_id,
+                    event,
+                    self._media_group_events,
+                )
+                self._media_group_events[media_group_id] = event
+            elif identity_merge is not _TelegramBatchIdentityMerge.NEW:
+                return
+            else:
+                existing.media_urls.extend(event.media_urls)
+                existing.media_types.extend(event.media_types)
+                if event.text:
+                    existing.text = self._merge_caption(existing.text, event.text)
 
         prior_task = self._media_group_tasks.get(media_group_id)
         if prior_task:

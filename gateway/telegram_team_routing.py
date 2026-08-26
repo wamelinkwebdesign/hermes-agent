@@ -407,29 +407,100 @@ class TelegramTeamDispatcher:
         owner_profile: object,
     ) -> bool:
         """Bind a root message to itself and one immutable owner profile."""
+        return self.record_root_batch(
+            chat_id,
+            root_message_id,
+            owner_profile,
+            [root_message_id],
+        )
+
+    def _normalize_alias_batch(self, message_ids: object) -> tuple[str, ...] | None:
+        """Materialize one hostile iterable within a total-attempt bound."""
+        if isinstance(message_ids, (str, bytes, bytearray, Mapping)):
+            return None
+        try:
+            iterator = iter(cast(Iterable[object], message_ids))
+        except Exception:
+            return None
+
+        normalized_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for attempt in range(self._max_aliases + 1):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                break
+            except Exception:
+                return None
+            if attempt == self._max_aliases:
+                return None
+            try:
+                normalized_id = _normalize_message_id(value)
+            except Exception:
+                return None
+            if normalized_id is None:
+                return None
+            if normalized_id not in seen_ids:
+                normalized_ids.append(normalized_id)
+                seen_ids.add(normalized_id)
+        return tuple(normalized_ids) if normalized_ids else None
+
+    def record_root_batch(
+        self,
+        chat_id: object,
+        root_message_id: object,
+        owner_profile: object,
+        alias_ids: object,
+    ) -> bool:
+        """Atomically bind one root and every constituent alias in its family."""
         normalized_chat_id = _normalize_group_chat_id(chat_id)
         normalized_root_id = _normalize_message_id(root_message_id)
         normalized_profile = _normalize_profile(owner_profile)
+        normalized_alias_ids = self._normalize_alias_batch(alias_ids)
         if (
             normalized_chat_id is None
             or normalized_root_id is None
             or normalized_profile is None
+            or normalized_alias_ids is None
         ):
+            return False
+
+        if normalized_root_id not in normalized_alias_ids:
+            normalized_alias_ids = (normalized_root_id, *normalized_alias_ids)
+        if len(normalized_alias_ids) > self._max_aliases:
             return False
 
         root_key = (normalized_chat_id, normalized_root_id)
         ownership = RootOwnership(normalized_root_id, normalized_profile)
+        message_keys = [
+            (normalized_chat_id, message_id) for message_id in normalized_alias_ids
+        ]
         with self._lock:
             existing = self._aliases.get(root_key)
             if existing is not None:
-                return existing == ownership and existing.root_message_id == normalized_root_id
+                family = self._families.get(root_key)
+                if (
+                    existing != ownership
+                    or existing.root_message_id != normalized_root_id
+                    or family is None
+                    or family.ownership != ownership
+                ):
+                    return False
+                return self._record_aliases_locked(root_key, ownership, message_keys)
 
-            evictions = self._plan_family_evictions(added_aliases=1, keep_family=None)
+            if any(message_key in self._aliases for message_key in message_keys):
+                return False
+
+            evictions = self._plan_family_evictions(
+                added_aliases=len(message_keys),
+                keep_family=None,
+            )
             if evictions is None:
                 return False
             self._evict_families(evictions)
-            self._aliases[root_key] = ownership
-            self._families[root_key] = _RootFamily(ownership, {root_key})
+            for message_key in message_keys:
+                self._aliases[message_key] = ownership
+            self._families[root_key] = _RootFamily(ownership, set(message_keys))
             return True
 
     def record_inbound_alias(
@@ -439,28 +510,44 @@ class TelegramTeamDispatcher:
         parent_message_id: object,
     ) -> bool:
         """Map a human reply to the already-resolved root of its parent."""
+        return self.record_inbound_alias_batch(
+            chat_id,
+            [message_id],
+            parent_message_id,
+        )
+
+    def record_inbound_alias_batch(
+        self,
+        chat_id: object,
+        message_ids: object,
+        parent_message_id: object,
+    ) -> bool:
+        """Atomically map all human constituents to one resolved parent root."""
         normalized_chat_id = _normalize_group_chat_id(chat_id)
-        normalized_message_id = _normalize_message_id(message_id)
         normalized_parent_id = _normalize_message_id(parent_message_id)
+        normalized_message_ids = self._normalize_alias_batch(message_ids)
         if (
             normalized_chat_id is None
-            or normalized_message_id is None
             or normalized_parent_id is None
+            or normalized_message_ids is None
         ):
             return False
 
-        message_key = (normalized_chat_id, normalized_message_id)
         parent_key = (normalized_chat_id, normalized_parent_id)
+        message_keys = [
+            (normalized_chat_id, message_id) for message_id in normalized_message_ids
+        ]
         with self._lock:
             ownership = self._aliases.get(parent_key)
             if ownership is None:
                 return False
-            existing = self._aliases.get(message_key)
-            if existing is not None:
-                return existing == ownership
-
             root_key = (normalized_chat_id, ownership.root_message_id)
-            return self._record_aliases_locked(root_key, ownership, [message_key])
+            if (
+                self._aliases.get(root_key) != ownership
+                or self._families.get(root_key) is None
+            ):
+                return False
+            return self._record_aliases_locked(root_key, ownership, message_keys)
 
     def record_outbound_alias(
         self,

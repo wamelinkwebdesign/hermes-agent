@@ -39,9 +39,9 @@ def _make_adapter():
     return adapter
 
 
-def _make_message(text, *, chat_id=12345):
+def _make_message(text, *, chat_id=12345, message_id=42):
     return SimpleNamespace(
-        message_id=42,
+        message_id=message_id,
         text=text,
         caption=None,
         entities=[],
@@ -63,8 +63,12 @@ def _make_message(text, *, chat_id=12345):
     )
 
 
-def _make_update(text):
-    return SimpleNamespace(update_id=1, message=_make_message(text), effective_message=None)
+def _make_update(text, *, message_id=42, update_id=1):
+    return SimpleNamespace(
+        update_id=update_id,
+        message=_make_message(text, message_id=message_id),
+        effective_message=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -99,7 +103,10 @@ async def test_split_queue_command_merges_with_continuation():
     adapter.handle_message.assert_not_awaited()
 
     # Continuation arrives as a plain text update moments later.
-    await adapter._handle_text_message(_make_update(continuation), SimpleNamespace())
+    await adapter._handle_text_message(
+        _make_update(continuation, message_id=43, update_id=2),
+        SimpleNamespace(),
+    )
 
     # Wait past the split-delay flush window.
     await asyncio.sleep(0.3)

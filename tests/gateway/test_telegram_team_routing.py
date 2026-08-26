@@ -622,6 +622,196 @@ def test_inbound_alias_requires_a_resolved_parent_and_rejects_cross_root_rebind(
     )
 
 
+def test_inbound_alias_batch_late_conflict_is_atomic_and_valid_retry_succeeds():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=6)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+    assert dispatcher.record_inbound_alias(-1001, 400, 200) is True
+
+    assert (
+        dispatcher.record_inbound_alias_batch(-1001, [301, 400, 302], 100)
+        is False
+    )
+
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 302) is None
+    assert dispatcher.resolve_reply_owner(-1001, 400) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+    assert dispatcher.record_inbound_alias_batch(-1001, [301, 302], 100) is True
+    assert dispatcher.resolve_reply_owner(-1001, 301) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+
+
+def test_rejected_inbound_alias_batch_preserves_family_order_and_capacity():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=2)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+
+    assert dispatcher.record_inbound_alias_batch(-1001, [301, 302], 100) is False
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.record_root(-1001, 300, "default") is True
+
+    assert dispatcher.resolve_reply_owner(-1001, 100) is None
+    assert dispatcher.resolve_reply_owner(-1001, 200) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+    assert dispatcher.resolve_reply_owner(-1001, 300) == module.RootOwnership(
+        root_message_id="300",
+        owner_profile="default",
+    )
+
+
+def test_inbound_alias_batch_iterator_failure_is_atomic_and_retryable():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=4)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    class RaisingIterator:
+        def __init__(self):
+            self.next_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self.next_calls == 1:
+                return 301
+            raise RuntimeError("iteration failed")
+
+    message_ids = RaisingIterator()
+    assert dispatcher.record_inbound_alias_batch(-1001, message_ids, 100) is False
+    assert message_ids.next_calls == 2
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+    assert dispatcher.record_inbound_alias_batch(-1001, [301], 100) is True
+
+
+@pytest.mark.parametrize("batch_api", ["inbound", "root"])
+def test_atomic_alias_batch_overflow_is_bounded_and_preserves_family_order(batch_api):
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=2)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+
+    class GuardedInfiniteDuplicates:
+        def __init__(self):
+            self.next_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self.next_calls > 3:
+                raise AssertionError("alias iterator was over-consumed")
+            return 301
+
+    message_ids = GuardedInfiniteDuplicates()
+    if batch_api == "inbound":
+        result = dispatcher.record_inbound_alias_batch(-1001, message_ids, 100)
+    else:
+        result = dispatcher.record_root_batch(
+            -1001,
+            400,
+            "default",
+            message_ids,
+        )
+
+    assert result is False
+    assert message_ids.next_calls == 3
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 400) is None
+    assert dispatcher.record_root(-1001, 300, "default") is True
+    assert dispatcher.resolve_reply_owner(-1001, 100) is None
+    assert dispatcher.resolve_reply_owner(-1001, 200) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+
+
+@pytest.mark.parametrize("batch_api", ["inbound", "root"])
+@pytest.mark.parametrize("message_ids", [[], [301, 0, 302], "301", {301: True}])
+def test_atomic_alias_batch_invalid_input_does_not_mutate_or_reorder(
+    batch_api,
+    message_ids,
+):
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=2)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+
+    if batch_api == "inbound":
+        result = dispatcher.record_inbound_alias_batch(-1001, message_ids, 100)
+    else:
+        result = dispatcher.record_root_batch(
+            -1001,
+            400,
+            "default",
+            message_ids,
+        )
+
+    assert result is False
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 400) is None
+    assert dispatcher.record_root(-1001, 300, "default") is True
+    assert dispatcher.resolve_reply_owner(-1001, 100) is None
+    assert dispatcher.resolve_reply_owner(-1001, 200) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+
+
+def test_root_batch_late_conflict_does_not_evict_or_partially_bind():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=4)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+    assert dispatcher.record_inbound_alias(-1001, 400, 200) is True
+
+    assert (
+        dispatcher.record_root_batch(
+            -1001,
+            300,
+            "default",
+            [300, 301, 400],
+        )
+        is False
+    )
+
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+    assert dispatcher.resolve_reply_owner(-1001, 300) is None
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 400) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+
+    assert dispatcher.record_root_batch(-1001, 300, "default", [300, 301]) is True
+    assert dispatcher.resolve_reply_owner(-1001, 100) is None
+    assert dispatcher.resolve_reply_owner(-1001, 300) == module.RootOwnership(
+        root_message_id="300",
+        owner_profile="default",
+    )
+    assert dispatcher.resolve_reply_owner(-1001, 301) == module.RootOwnership(
+        root_message_id="300",
+        owner_profile="default",
+    )
+
+
 def test_outbound_aliases_cover_preview_final_and_continuation_messages():
     module = _routing_module()
     dispatcher = _dispatcher()

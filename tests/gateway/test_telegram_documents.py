@@ -58,10 +58,16 @@ def _make_document(
     return doc
 
 
-def _make_message(document=None, caption=None, media_group_id=None, photo=None):
+def _make_message(
+    document=None,
+    caption=None,
+    media_group_id=None,
+    photo=None,
+    message_id=42,
+):
     """Build a mock Telegram Message with the given document/photo."""
     msg = MagicMock()
-    msg.message_id = 42
+    msg.message_id = message_id
     msg.text = caption or ""
     msg.caption = caption
     msg.date = None
@@ -83,6 +89,7 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     msg.from_user.id = 1
     msg.from_user.full_name = "Test User"
     msg.message_thread_id = None
+    msg.reply_to_message = None
     msg.reply_text = AsyncMock()
     return msg
 
@@ -306,7 +313,7 @@ class TestMediaGroups:
         second_photo = _make_photo(_make_file_obj(b"second"))
 
         msg1 = _make_message(caption="two images", photo=[first_photo])
-        msg2 = _make_message(photo=[second_photo])
+        msg2 = _make_message(photo=[second_photo], message_id=43)
 
         with patch("plugins.platforms.telegram.adapter.cache_image_from_bytes", side_effect=["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]):
             await adapter._handle_media_message(_make_update(msg1), MagicMock())
