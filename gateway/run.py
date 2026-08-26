@@ -45,7 +45,18 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import (
+    Awaitable,
+    Callable,
+    Dict,
+    NoReturn,
+    Optional,
+    Any,
+    List,
+    Tuple,
+    Union,
+    cast,
+)
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -15971,7 +15982,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self.__dict__.get("_telegram_team_prepared") is True:
             return self.__dict__.get("_telegram_team_config") is not None
 
-        self._telegram_team_prepared = True
         self._telegram_team_routing_enabled = False
         self._telegram_team_profiles = ()
         self._telegram_team_gate_adapters = {}
@@ -15983,13 +15993,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         extra = getattr(platform_config, "extra", None)
         if not isinstance(extra, dict) or "team_routing" not in extra:
+            self._telegram_team_prepared = True
             self._telegram_team_config = None
             return False
 
-        def _reject(reason: str) -> bool:
+        def _reject(reason: str) -> NoReturn:
             self._telegram_team_config = None
-            logger.warning("Telegram team routing disabled: %s", reason)
-            return False
+            raise MultiplexConfigError(
+                f"Telegram team routing configuration invalid: {reason}"
+            )
 
         if not getattr(platform_config, "enabled", False):
             return _reject("the active profile's Telegram platform is not enabled")
@@ -16049,6 +16061,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 current_config = self.__dict__.get("_telegram_team_config")
                 if current_config is None:
                     return False
+                if not self._telegram_team_live_usernames_match():
+                    self._disable_telegram_team_runtime(
+                        "a configured live bot username no longer matches",
+                        log=False,
+                    )
+                    return False
                 try:
                     decision = resolve_addressed_owner(
                         mentions=set(context.mentions),
@@ -16069,6 +16087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             callback = _team_gate
             self._telegram_team_route_gate_callback = callback
+        self._telegram_team_prepared = True
         return True
 
     @staticmethod
@@ -16086,18 +16105,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-    def _disable_telegram_team_runtime(self, reason: str) -> None:
-        """Remove only runner-installed team gates and preserve legacy adapters."""
+    def _disable_telegram_team_runtime(
+        self, reason: str, *, log: bool = True
+    ) -> None:
+        """Suspend runner-installed team gates without clearing reachable adapters."""
         self._telegram_team_routing_enabled = False
         self._telegram_team_profiles = ()
-        installed = self.__dict__.get("_telegram_team_gate_adapters", {})
-        if isinstance(installed, dict):
-            for adapter in tuple(installed.values()):
-                self._clear_telegram_team_gate(adapter)
-            installed.clear()
-        # Keep the already-parsed, token-free routing config so a transiently
-        # incomplete roster can be revalidated when its adapter reconnects.
-        logger.warning("Telegram team routing disabled: %s", reason)
+        # A present team-routing mode must never fall back to an adapter's legacy
+        # ``None`` gate. Keep the one shared callback on every surviving adapter;
+        # the disabled flag makes it reject until a complete healthy roster is
+        # revalidated. A stale adapter is cleared separately before disposal.
+        if log:
+            logger.warning("Telegram team routing suspended: %s", reason)
 
     @staticmethod
     def _telegram_team_adapter_owner(adapter: Any, profile: str) -> Optional[str]:
@@ -16117,6 +16136,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return token.strip()
 
+    def _telegram_team_live_usernames_match(
+        self,
+        adapters: Optional[Dict[str, BasePlatformAdapter]] = None,
+    ) -> bool:
+        """Compare cached live identities with the configured roster, without I/O."""
+        team_config = self.__dict__.get("_telegram_team_config")
+        if team_config is None:
+            return False
+        roster = (
+            adapters
+            if isinstance(adapters, dict)
+            else self.__dict__.get("_telegram_team_gate_adapters", {})
+        )
+        if not isinstance(roster, dict):
+            return False
+        for profile, expected in team_config.members.items():
+            adapter = roster.get(profile)
+            getter = getattr(adapter, "_current_bot_username", None)
+            observed = ""
+            if callable(getter):
+                try:
+                    raw_observed = getter()
+                except Exception:
+                    raw_observed = None
+                if isinstance(raw_observed, str):
+                    observed = raw_observed.lstrip("@").lower()
+            if observed == expected:
+                continue
+            logger.warning(
+                "Telegram team live username mismatch for profile '%s': "
+                "expected username '%s', observed username '%s'",
+                profile,
+                expected,
+                observed or "missing",
+            )
+            return False
+        return True
+
     def _telegram_team_adapter_for_profile(
         self, profile: str, active_profile: str
     ) -> Optional[BasePlatformAdapter]:
@@ -16130,6 +16187,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else None
             )
         return adapters.get(Platform.TELEGRAM) if isinstance(adapters, dict) else None
+
+    def _set_pending_telegram_team_gate(
+        self, profile: str, adapter: BasePlatformAdapter
+    ) -> bool:
+        """Set the shared rejecting-capable callback without validating credentials."""
+        installed = self.__dict__.get("_telegram_team_gate_adapters")
+        if not isinstance(installed, dict):
+            installed = {}
+            self._telegram_team_gate_adapters = installed
+        previous = installed.get(profile)
+        callback = self.__dict__.get("_telegram_team_route_gate_callback")
+        if previous is adapter and getattr(adapter, "_team_route_gate", None) is callback:
+            return True
+        if previous is not None and previous is not adapter:
+            if self.telegram_team_routing_enabled:
+                self._disable_telegram_team_runtime(
+                    f"replacement pending for profile '{profile}'"
+                )
+            self._clear_telegram_team_gate(previous)
+            installed.pop(profile, None)
+
+        setter = getattr(adapter, "set_team_route_gate", None)
+        if not callable(setter) or not callable(callback):
+            return False
+        try:
+            setter(callback)
+        except Exception:
+            # Adapter exceptions are intentionally not interpolated: a custom
+            # adapter could include its token in exception text.
+            logger.warning(
+                "Telegram team gate installation failed for profile '%s'",
+                profile,
+            )
+            return False
+        installed[profile] = adapter
+        return True
 
     def _install_telegram_team_gate(
         self, profile: str, adapter: BasePlatformAdapter
@@ -16186,33 +16279,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return False
 
-        installed = self.__dict__.get("_telegram_team_gate_adapters")
-        if not isinstance(installed, dict):
-            installed = {}
-            self._telegram_team_gate_adapters = installed
-        previous = installed.get(profile)
-        callback = self.__dict__.get("_telegram_team_route_gate_callback")
-        if previous is adapter and getattr(adapter, "_team_route_gate", None) is callback:
-            return True
-        if previous is not None and previous is not adapter:
-            self._clear_telegram_team_gate(previous)
-            installed.pop(profile, None)
-
-        setter = getattr(adapter, "set_team_route_gate", None)
-        if not callable(setter) or not callable(callback):
-            return False
-        try:
-            setter(callback)
-        except Exception:
-            # Adapter exceptions are intentionally not interpolated: a custom
-            # adapter could include its token in exception text.
-            logger.warning(
-                "Telegram team gate installation failed for profile '%s'",
-                profile,
-            )
-            return False
-        installed[profile] = adapter
-        return True
+        return self._set_pending_telegram_team_gate(profile, adapter)
 
     def _remove_telegram_team_gate(self, adapter: Any) -> None:
         """Disable a tracked gate before a failed/stale adapter is discarded."""
@@ -16254,13 +16321,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
     def _validate_and_install_telegram_team_runtime(self) -> bool:
-        """Atomically validate the live multiplex roster and activate its gates."""
+        """Validate the live roster, keeping every reachable team gate fail closed."""
         if not self._prepare_telegram_team_runtime():
             return False
         team_config = self.__dict__.get("_telegram_team_config")
         if team_config is None:
             return False
 
+        # Revalidation itself is a suspended state. Existing callbacks remain
+        # installed and reject until the whole connected roster proves healthy.
+        self._disable_telegram_team_runtime("live roster validation pending", log=False)
         try:
             from plugins.platforms.telegram.adapter import TelegramAdapter
         except Exception:
@@ -16270,50 +16340,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active_profile = self._active_profile_name()
         candidates: Dict[str, BasePlatformAdapter] = {}
         token_owners: Dict[str, str] = {}
+        failure_reason: Optional[str] = None
         for profile in team_config.members:
             adapter = self._telegram_team_adapter_for_profile(profile, active_profile)
             if adapter is None:
-                self._disable_telegram_team_runtime(
+                failure_reason = failure_reason or (
                     f"team profile '{profile}' is not served in this process"
                 )
-                return False
+                continue
             if not isinstance(adapter, TelegramAdapter):
-                self._disable_telegram_team_runtime(
+                failure_reason = failure_reason or (
                     f"team profile '{profile}' does not resolve to a TelegramAdapter"
                 )
-                return False
+                continue
+            if not self._set_pending_telegram_team_gate(profile, adapter):
+                failure_reason = failure_reason or (
+                    f"could not install the shared gate for profile '{profile}'"
+                )
+                continue
             owner = self._telegram_team_adapter_owner(adapter, profile)
             if owner != profile:
-                self._disable_telegram_team_runtime(
+                failure_reason = failure_reason or (
                     f"Telegram adapter for profile '{profile}' is owned by "
                     f"'{owner or 'no profile'}'"
                 )
-                return False
+                continue
             token = self._telegram_team_adapter_token(adapter)
             if token is None:
-                self._disable_telegram_team_runtime(
+                failure_reason = failure_reason or (
                     f"Telegram adapter for profile '{profile}' has no bot token"
                 )
-                return False
+                continue
             duplicate_owner = token_owners.get(token)
             if duplicate_owner is not None:
-                self._disable_telegram_team_runtime(
+                failure_reason = failure_reason or (
                     f"Telegram profiles '{duplicate_owner}' and '{profile}' use "
                     "the same bot token"
                 )
-                return False
+                continue
             token_owners[token] = profile
             candidates[profile] = adapter
 
-        for profile, adapter in candidates.items():
-            if self._install_telegram_team_gate(profile, adapter):
-                continue
-            # Roll back every configured member, including the adapter whose
-            # setter may have mutated state before raising.
-            for candidate in candidates.values():
-                self._clear_telegram_team_gate(candidate)
+        if failure_reason is not None:
+            self._disable_telegram_team_runtime(failure_reason)
+            return False
+        if not self._telegram_team_live_usernames_match(candidates):
             self._disable_telegram_team_runtime(
-                f"could not install the shared gate for profile '{profile}'"
+                "one or more connected bot usernames do not match the configured roster",
+                log=False,
             )
             return False
 
