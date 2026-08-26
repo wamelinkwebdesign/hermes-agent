@@ -7070,6 +7070,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        # Telegram team routing is prepared before any adapter connects. A
+        # statically valid team gets one shared dispatcher and one pending
+        # fail-closed callback; activation waits until the complete multiplex
+        # roster has been validated after secondary startup.
+        self._telegram_team_prepared = False
+        self._telegram_team_config = None
+        self._telegram_team_dispatcher = None
+        self._telegram_team_route_gate_callback = None
+        self._telegram_team_gate_adapters: Dict[str, BasePlatformAdapter] = {}
+        self._telegram_team_routing_enabled = False
+        self._telegram_team_profiles: tuple[str, ...] = ()
+        self._prepare_telegram_team_runtime()
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -7806,6 +7818,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Must tolerate partial-init state and never raise, since callers
         use it inside error-handling blocks.
         """
+        self._remove_telegram_team_gate(adapter)
         timeout = self._adapter_disconnect_timeout_secs()
         try:
             completed = await self._await_adapter_cleanup_with_timeout(
@@ -7842,6 +7855,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the loop never hangs even if an adapter swallows cancellation. Never
         raises.
         """
+        self._remove_telegram_team_gate(adapter)
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
@@ -13312,6 +13326,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter.set_platform_event_handler(self._primary_platform_event_handler())
             adapter._busy_text_mode = self._busy_text_mode
+            self._configure_primary_telegram_team_adapter(adapter)
             _pending_connects.append((platform, platform_config, adapter))
 
         if await self._abort_startup_if_shutdown_requested():
@@ -15116,6 +15131,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter.set_platform_event_handler(self._primary_platform_event_handler())
                     adapter._busy_text_mode = self._busy_text_mode
+                    self._configure_primary_telegram_team_adapter(adapter)
 
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
@@ -15125,6 +15141,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if success:
                         self.adapters[platform] = adapter
+                        if platform is Platform.TELEGRAM:
+                            self._validate_and_install_telegram_team_runtime()
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
@@ -15197,6 +15215,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # APIServerAdapter, etc.) leak 2 fds each. The
                         # gateway hits the 2560-fd limit after ~12h of
                         # failed reconnects at the 300s backoff cap (#37011).
+                        self._remove_telegram_team_gate(adapter)
                         await _dispose_unused_adapter(adapter)
                         del self._failed_platforms[platform]
                     else:
@@ -15220,6 +15239,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # the next GC pass — and aiohttp/SQLite handles
                         # don't get GC'd promptly, so 2 fds/retry leak at
                         # 300s backoff cap = ~12 fds/hour (#37011).
+                        self._remove_telegram_team_gate(adapter)
                         await _dispose_unused_adapter(adapter)
                         # Retryable failures (network/DNS blips) keep retrying
                         # at the backoff cap indefinitely — they self-heal once
@@ -15237,6 +15257,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # the two branches above. Dispose so __init__
                         # resources don't accumulate while the watcher
                         # keeps retrying.
+                        self._remove_telegram_team_gate(adapter)
                         await _dispose_unused_adapter(adapter)
                     self._update_platform_runtime_status(
                         platform.value,
@@ -15928,6 +15949,382 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
 
+    @property
+    def telegram_team_routing_enabled(self) -> bool:
+        """Safe runtime inspection: whether the shared Telegram team gate is active."""
+        return self.__dict__.get("_telegram_team_routing_enabled") is True
+
+    @property
+    def telegram_team_profiles(self) -> tuple[str, ...]:
+        """Safe runtime inspection: configured team profiles, never credentials."""
+        profiles = self.__dict__.get("_telegram_team_profiles", ())
+        return profiles if isinstance(profiles, tuple) else ()
+
+    def _prepare_telegram_team_runtime(self) -> bool:
+        """Prepare one pending shared dispatcher/callback from static config.
+
+        This runs before adapters connect so a statically valid team adapter can
+        receive a fail-closed pending callback before polling starts. Complete
+        roster/type/owner/token validation remains atomic in
+        ``_validate_and_install_telegram_team_runtime``.
+        """
+        if self.__dict__.get("_telegram_team_prepared") is True:
+            return self.__dict__.get("_telegram_team_config") is not None
+
+        self._telegram_team_prepared = True
+        self._telegram_team_routing_enabled = False
+        self._telegram_team_profiles = ()
+        self._telegram_team_gate_adapters = {}
+
+        telegram_config = getattr(self, "config", None)
+        platforms = getattr(telegram_config, "platforms", None)
+        platform_config = (
+            platforms.get(Platform.TELEGRAM) if isinstance(platforms, dict) else None
+        )
+        extra = getattr(platform_config, "extra", None)
+        if not isinstance(extra, dict) or "team_routing" not in extra:
+            self._telegram_team_config = None
+            return False
+
+        def _reject(reason: str) -> bool:
+            self._telegram_team_config = None
+            logger.warning("Telegram team routing disabled: %s", reason)
+            return False
+
+        if not getattr(platform_config, "enabled", False):
+            return _reject("the active profile's Telegram platform is not enabled")
+        if not getattr(telegram_config, "multiplex_profiles", False):
+            return _reject("gateway.multiplex_profiles is not enabled")
+
+        from gateway.telegram_team_routing import (
+            TelegramTeamConfig,
+            TelegramTeamDispatcher,
+            resolve_addressed_owner,
+        )
+
+        team_config = TelegramTeamConfig.from_raw(extra.get("team_routing"))
+        if team_config is None:
+            return _reject("active Telegram extra.team_routing is invalid")
+
+        active_profile = self._active_profile_name()
+        if team_config.coordinator_profile != active_profile:
+            return _reject(
+                "coordinator profile "
+                f"'{team_config.coordinator_profile}' is not the active profile "
+                f"'{active_profile}'"
+            )
+
+        allowlist = getattr(telegram_config, "multiplex_profile_allowlist", None)
+        required_secondaries = set(team_config.members) - {team_config.coordinator_profile}
+        if not isinstance(allowlist, list):
+            return _reject(
+                "every non-coordinator team profile must be explicitly listed in "
+                "gateway.multiplex_profile_allowlist"
+            )
+        missing_from_allowlist = sorted(required_secondaries - set(allowlist))
+        if missing_from_allowlist:
+            return _reject(
+                "team profile(s) missing from gateway.multiplex_profile_allowlist: "
+                + ", ".join(missing_from_allowlist)
+            )
+
+        self._telegram_team_config = team_config
+        dispatcher = self.__dict__.get("_telegram_team_dispatcher")
+        if dispatcher is None:
+            dispatcher = TelegramTeamDispatcher()
+            self._telegram_team_dispatcher = dispatcher
+
+        callback = self.__dict__.get("_telegram_team_route_gate_callback")
+        if callback is None:
+            # Capture the one runner-owned dispatcher identity even though the
+            # current-message gate deliberately does not claim ingress. Task 3
+            # will consume dispatcher state at central intake, not here.
+            shared_dispatcher = dispatcher
+
+            def _team_gate(context):
+                if self.__dict__.get("_telegram_team_routing_enabled") is not True:
+                    return False
+                if self.__dict__.get("_telegram_team_dispatcher") is not shared_dispatcher:
+                    return False
+                current_config = self.__dict__.get("_telegram_team_config")
+                if current_config is None:
+                    return False
+                try:
+                    decision = resolve_addressed_owner(
+                        mentions=set(context.mentions),
+                        reply_author_username=context.reply_author_username,
+                        config=current_config,
+                        chat_id=context.chat_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Telegram team route resolution failed; rejecting message",
+                        exc_info=True,
+                    )
+                    return False
+                return bool(
+                    decision.accepted
+                    and decision.owner_profile == context.owner_profile
+                )
+
+            callback = _team_gate
+            self._telegram_team_route_gate_callback = callback
+        return True
+
+    @staticmethod
+    def _clear_telegram_team_gate(adapter: Any) -> None:
+        """Best-effort clear with a direct fallback for a broken setter."""
+        setter = getattr(adapter, "set_team_route_gate", None)
+        try:
+            if callable(setter):
+                setter(None)
+                return
+        except Exception:
+            pass
+        try:
+            adapter._team_route_gate = None
+        except Exception:
+            pass
+
+    def _disable_telegram_team_runtime(self, reason: str) -> None:
+        """Remove only runner-installed team gates and preserve legacy adapters."""
+        self._telegram_team_routing_enabled = False
+        self._telegram_team_profiles = ()
+        installed = self.__dict__.get("_telegram_team_gate_adapters", {})
+        if isinstance(installed, dict):
+            for adapter in tuple(installed.values()):
+                self._clear_telegram_team_gate(adapter)
+            installed.clear()
+        # Keep the already-parsed, token-free routing config so a transiently
+        # incomplete roster can be revalidated when its adapter reconnects.
+        logger.warning("Telegram team routing disabled: %s", reason)
+
+    @staticmethod
+    def _telegram_team_adapter_owner(adapter: Any, profile: str) -> Optional[str]:
+        """Resolve declared adapter ownership using the default-profile sentinel."""
+        owner = getattr(adapter, "_owner_profile", None)
+        if isinstance(owner, str) and owner.strip():
+            return owner.strip()
+        if owner is None and profile == "default":
+            return "default"
+        return None
+
+    @staticmethod
+    def _telegram_team_adapter_token(adapter: Any) -> Optional[str]:
+        """Read a Telegram token for equality checks without formatting/logging it."""
+        token = getattr(getattr(adapter, "config", None), "token", None)
+        if not isinstance(token, str) or not token.strip():
+            return None
+        return token.strip()
+
+    def _telegram_team_adapter_for_profile(
+        self, profile: str, active_profile: str
+    ) -> Optional[BasePlatformAdapter]:
+        if profile == active_profile:
+            adapters = getattr(self, "adapters", None)
+        else:
+            profile_adapters = getattr(self, "_profile_adapters", None)
+            adapters = (
+                profile_adapters.get(profile)
+                if isinstance(profile_adapters, dict)
+                else None
+            )
+        return adapters.get(Platform.TELEGRAM) if isinstance(adapters, dict) else None
+
+    def _install_telegram_team_gate(
+        self, profile: str, adapter: BasePlatformAdapter
+    ) -> bool:
+        """Install the one shared callback, replacing any stale profile adapter.
+
+        Called by startup and reconnect configuration before ``connect()`` so a
+        replacement can never handle a message through the legacy gate first.
+        """
+        if not self._prepare_telegram_team_runtime():
+            return False
+        team_config = self.__dict__.get("_telegram_team_config")
+        if team_config is None or profile not in team_config.members:
+            return False
+
+        try:
+            from plugins.platforms.telegram.adapter import TelegramAdapter
+        except Exception:
+            logger.warning(
+                "Telegram team routing could not verify adapter type for profile '%s'",
+                profile,
+            )
+            return False
+        if not isinstance(adapter, TelegramAdapter):
+            return False
+
+        owner_setter = getattr(adapter, "set_owner_profile", None)
+        if callable(owner_setter):
+            owner_setter(profile)
+
+        token = self._telegram_team_adapter_token(adapter)
+        if token is None:
+            logger.warning(
+                "Telegram team gate validation failed for profile '%s': missing bot token",
+                profile,
+            )
+            return False
+        active_profile = self._active_profile_name()
+        for other_profile in team_config.members:
+            if other_profile == profile:
+                continue
+            other_adapter = self._telegram_team_adapter_for_profile(
+                other_profile, active_profile
+            )
+            if (
+                other_adapter is not None
+                and self._telegram_team_adapter_token(other_adapter) == token
+            ):
+                logger.warning(
+                    "Telegram team gate validation failed: profiles '%s' and '%s' "
+                    "use the same bot token",
+                    other_profile,
+                    profile,
+                )
+                return False
+
+        installed = self.__dict__.get("_telegram_team_gate_adapters")
+        if not isinstance(installed, dict):
+            installed = {}
+            self._telegram_team_gate_adapters = installed
+        previous = installed.get(profile)
+        callback = self.__dict__.get("_telegram_team_route_gate_callback")
+        if previous is adapter and getattr(adapter, "_team_route_gate", None) is callback:
+            return True
+        if previous is not None and previous is not adapter:
+            self._clear_telegram_team_gate(previous)
+            installed.pop(profile, None)
+
+        setter = getattr(adapter, "set_team_route_gate", None)
+        if not callable(setter) or not callable(callback):
+            return False
+        try:
+            setter(callback)
+        except Exception:
+            # Adapter exceptions are intentionally not interpolated: a custom
+            # adapter could include its token in exception text.
+            logger.warning(
+                "Telegram team gate installation failed for profile '%s'",
+                profile,
+            )
+            return False
+        installed[profile] = adapter
+        return True
+
+    def _remove_telegram_team_gate(self, adapter: Any) -> None:
+        """Disable a tracked gate before a failed/stale adapter is discarded."""
+        installed = self.__dict__.get("_telegram_team_gate_adapters")
+        if not isinstance(installed, dict):
+            return
+        owned_profiles = [
+            profile for profile, current in installed.items() if current is adapter
+        ]
+        if not owned_profiles:
+            return
+        was_enabled = self.telegram_team_routing_enabled
+        self._clear_telegram_team_gate(adapter)
+        for profile in owned_profiles:
+            installed.pop(profile, None)
+        if was_enabled:
+            self._disable_telegram_team_runtime(
+                "configured adapter removed for profile(s): "
+                + ", ".join(sorted(owned_profiles))
+            )
+
+    def _configure_primary_telegram_team_adapter(
+        self, adapter: BasePlatformAdapter
+    ) -> None:
+        """Apply pending/current team ownership and gate to a primary adapter."""
+        if not self._prepare_telegram_team_runtime():
+            return
+        profile = self._active_profile_name()
+        team_config = self.__dict__.get("_telegram_team_config")
+        if (
+            getattr(adapter, "platform", None) is not Platform.TELEGRAM
+            or team_config is None
+            or profile not in team_config.members
+        ):
+            return
+        if not self._install_telegram_team_gate(profile, adapter):
+            raise MultiplexConfigError(
+                f"Telegram team adapter validation failed for profile '{profile}'"
+            )
+
+    def _validate_and_install_telegram_team_runtime(self) -> bool:
+        """Atomically validate the live multiplex roster and activate its gates."""
+        if not self._prepare_telegram_team_runtime():
+            return False
+        team_config = self.__dict__.get("_telegram_team_config")
+        if team_config is None:
+            return False
+
+        try:
+            from plugins.platforms.telegram.adapter import TelegramAdapter
+        except Exception:
+            self._disable_telegram_team_runtime("TelegramAdapter is unavailable")
+            return False
+
+        active_profile = self._active_profile_name()
+        candidates: Dict[str, BasePlatformAdapter] = {}
+        token_owners: Dict[str, str] = {}
+        for profile in team_config.members:
+            adapter = self._telegram_team_adapter_for_profile(profile, active_profile)
+            if adapter is None:
+                self._disable_telegram_team_runtime(
+                    f"team profile '{profile}' is not served in this process"
+                )
+                return False
+            if not isinstance(adapter, TelegramAdapter):
+                self._disable_telegram_team_runtime(
+                    f"team profile '{profile}' does not resolve to a TelegramAdapter"
+                )
+                return False
+            owner = self._telegram_team_adapter_owner(adapter, profile)
+            if owner != profile:
+                self._disable_telegram_team_runtime(
+                    f"Telegram adapter for profile '{profile}' is owned by "
+                    f"'{owner or 'no profile'}'"
+                )
+                return False
+            token = self._telegram_team_adapter_token(adapter)
+            if token is None:
+                self._disable_telegram_team_runtime(
+                    f"Telegram adapter for profile '{profile}' has no bot token"
+                )
+                return False
+            duplicate_owner = token_owners.get(token)
+            if duplicate_owner is not None:
+                self._disable_telegram_team_runtime(
+                    f"Telegram profiles '{duplicate_owner}' and '{profile}' use "
+                    "the same bot token"
+                )
+                return False
+            token_owners[token] = profile
+            candidates[profile] = adapter
+
+        for profile, adapter in candidates.items():
+            if self._install_telegram_team_gate(profile, adapter):
+                continue
+            # Roll back every configured member, including the adapter whose
+            # setter may have mutated state before raising.
+            for candidate in candidates.values():
+                self._clear_telegram_team_gate(candidate)
+            self._disable_telegram_team_runtime(
+                f"could not install the shared gate for profile '{profile}'"
+            )
+            return False
+
+        self._telegram_team_profiles = tuple(sorted(candidates))
+        self._telegram_team_routing_enabled = True
+        logger.info(
+            "Telegram team routing enabled for profiles: %s",
+            ", ".join(self._telegram_team_profiles),
+        )
+        return True
+
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
 
@@ -15994,6 +16391,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Failed to start adapters for profile '%s': %s",
                     profile_name, e, exc_info=True,
                 )
+
+        # Team activation is all-or-nothing and happens only after every served
+        # profile had a chance to publish its connected Telegram adapter.
+        self._validate_and_install_telegram_team_runtime()
 
         # Record the authoritative served set in runtime status for `hermes status`.
         # "Served" means eligible for shared routing, HTTP prefixes, cron, and
@@ -16210,6 +16611,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _set_owner = getattr(adapter, "set_owner_profile", None)
         if callable(_set_owner):
             _set_owner(profile_name)
+        team_gate_installed = self._install_telegram_team_gate(profile_name, adapter)
+        team_config = self.__dict__.get("_telegram_team_config")
+        if (
+            platform is Platform.TELEGRAM
+            and team_config is not None
+            and profile_name in team_config.members
+            and not team_gate_installed
+        ):
+            raise MultiplexConfigError(
+                "Telegram team adapter validation failed for profile "
+                f"'{profile_name}'"
+            )
         adapter.set_busy_session_handler(
             self._make_profile_busy_session_handler(profile_name)
         )
@@ -16267,6 +16680,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         profile_map = self._profile_adapters.setdefault(profile_name, {})
                         if platform not in profile_map:
                             profile_map[platform] = adapter
+                            if platform is Platform.TELEGRAM:
+                                self._validate_and_install_telegram_team_runtime()
                             self._sync_voice_mode_state_to_adapter(adapter)
                             logger.info(
                                 "✓ %s reconnected (profile: %s)",
