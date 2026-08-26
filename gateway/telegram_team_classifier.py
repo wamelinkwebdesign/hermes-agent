@@ -14,7 +14,8 @@ import math
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Literal, cast
 
 from gateway.telegram_team_routing import TelegramTeamConfig
 
@@ -29,27 +30,25 @@ MAX_CLASSIFIER_TIMEOUT_SECONDS = 60.0
 
 _PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _DECISIONS = frozenset({"owner", "self", "clarify"})
-_SAFE_REASONS = frozenset(
-    {
-        "constructed",
-        "model_owner",
-        "model_self",
-        "model_clarify",
-        "invalid_output",
-        "invalid_input",
-        "invalid_config",
-        "no_specialists",
-        "provider_error",
-        "timeout",
-        "response_error",
-    }
-)
+_SAFE_REASONS = frozenset({
+    "constructed",
+    "model_owner",
+    "model_self",
+    "model_clarify",
+    "invalid_output",
+    "invalid_input",
+    "invalid_config",
+    "no_specialists",
+    "provider_error",
+    "timeout",
+    "response_error",
+})
 
 ClassificationKind = Literal["owner", "self", "clarify"]
 AuxiliaryCall = Callable[..., Awaitable[Any]]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ClassificationDecision:
     """One immutable, public routing state with an optional safe reason code."""
 
@@ -57,16 +56,23 @@ class ClassificationDecision:
     profile: str | None = None
     reason: str = field(default="constructed", repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        if self.decision not in _DECISIONS:
+    def __init__(
+        self,
+        decision: ClassificationKind,
+        profile: str | None = None,
+        reason: str = "constructed",
+    ) -> None:
+        if type(decision) is not str or decision not in _DECISIONS:
             raise ValueError("invalid classification decision")
-        if self.decision == "owner":
-            if not isinstance(self.profile, str) or not _PROFILE_RE.fullmatch(self.profile):
-                raise ValueError("owner decision requires a valid profile")
-        elif self.profile is not None:
+        if decision == "owner":
+            raise ValueError("owner decisions require a validated roster")
+        if profile is not None:
             raise ValueError("non-owner decisions cannot carry a profile")
-        if self.reason not in _SAFE_REASONS:
+        if type(reason) is not str or reason not in _SAFE_REASONS:
             raise ValueError("invalid classification reason")
+        object.__setattr__(self, "decision", decision)
+        object.__setattr__(self, "profile", None)
+        object.__setattr__(self, "reason", reason)
 
 
 class _DuplicateKeyError(ValueError):
@@ -77,19 +83,71 @@ def _clarify(reason: str) -> ClassificationDecision:
     return ClassificationDecision("clarify", reason=reason)
 
 
+def _owner_from_validated_roster(
+    profile: object,
+    specialists: tuple[str, ...],
+) -> ClassificationDecision:
+    """Privately construct an owner only from one freshly validated roster."""
+    if type(profile) is not str or profile not in specialists:
+        raise ValueError("owner profile is outside the validated roster")
+    decision = object.__new__(ClassificationDecision)
+    object.__setattr__(decision, "decision", "owner")
+    object.__setattr__(decision, "profile", profile)
+    object.__setattr__(decision, "reason", "model_owner")
+    return decision
+
+
 def _specialist_profiles(config: object) -> tuple[str, ...] | None:
     try:
-        if not isinstance(config, TelegramTeamConfig):
+        if type(config) is not TelegramTeamConfig:
+            return None
+        typed_config = cast(TelegramTeamConfig, config)
+        coordinator_profile = typed_config.coordinator_profile
+        coordinator_username = typed_config.coordinator_username
+        raw_members = typed_config.members
+        raw_allowed_chats = typed_config.allowed_chats
+        if (
+            type(coordinator_profile) is not str
+            or type(coordinator_username) is not str
+            or type(raw_members) is not MappingProxyType
+            or type(raw_allowed_chats) is not frozenset
+        ):
+            return None
+
+        members: dict[str, str] = {}
+        for profile, username in raw_members.items():
+            if type(profile) is not str or type(username) is not str:
+                return None
+            members[profile] = username
+
+        allowed_chats: list[str] = []
+        for chat_id in raw_allowed_chats:
+            if type(chat_id) is not str:
+                return None
+            allowed_chats.append(chat_id)
+
+        validated = TelegramTeamConfig.from_raw({
+            "coordinator_profile": coordinator_profile,
+            "coordinator_username": coordinator_username,
+            "members": members,
+            "allowed_chats": allowed_chats,
+        })
+        if validated is None:
+            return None
+        if (
+            coordinator_profile != validated.coordinator_profile
+            or coordinator_username != validated.coordinator_username
+            or members != dict(validated.members)
+            or raw_allowed_chats != validated.allowed_chats
+        ):
             return None
         profiles = tuple(
             sorted(
                 profile
-                for profile in config.members
-                if profile != config.coordinator_profile
+                for profile in validated.members
+                if profile != validated.coordinator_profile
             )
         )
-        if any(not _PROFILE_RE.fullmatch(profile) for profile in profiles):
-            return None
     except Exception:
         return None
     return profiles
@@ -113,16 +171,18 @@ def parse_classification_output(
     specialists = _specialist_profiles(config)
     if specialists is None:
         return _clarify("invalid_config")
-    if (
-        not isinstance(output, str)
-        or not output
-        or len(output) > MAX_CLASSIFIER_OUTPUT_CHARS
-    ):
+    if type(output) is not str:
         return _clarify("invalid_output")
 
-    # Python's JSON decoder accepts lone escaped surrogates. Strict UTF-8
-    # encoding rejects those malformed Unicode scalar values before parsing.
     try:
+        if (
+            not output
+            or len(output) > MAX_CLASSIFIER_OUTPUT_CHARS
+            or any(ord(character) < 0x20 for character in output)
+        ):
+            return _clarify("invalid_output")
+        # Python's JSON decoder accepts lone escaped surrogates. Strict UTF-8
+        # encoding rejects those malformed Unicode scalar values before parsing.
         output.encode("utf-8", errors="strict")
         parsed = json.loads(output, object_pairs_hook=_reject_duplicate_keys)
     except Exception:
@@ -137,13 +197,12 @@ def parse_classification_output(
             return _clarify("invalid_output")
         profile = parsed.get("profile")
         if (
-            not isinstance(profile, str)
+            type(profile) is not str
             or not _PROFILE_RE.fullmatch(profile)
-            or profile == config.coordinator_profile
             or profile not in specialists
         ):
             return _clarify("invalid_output")
-        return ClassificationDecision("owner", profile, "model_owner")
+        return _owner_from_validated_roster(profile, specialists)
 
     if decision == "self" and set(parsed) == {"decision"}:
         return ClassificationDecision("self", reason="model_self")
@@ -198,7 +257,7 @@ def build_classification_messages(
     specialists = _specialist_profiles(config)
     if specialists is None:
         raise ValueError("validated TelegramTeamConfig required")
-    if not isinstance(text, str) or (context is not None and not isinstance(context, str)):
+    if type(text) is not str or (context is not None and type(context) is not str):
         raise TypeError("text and context must be strings")
 
     roster = "\n".join(f"- {profile}" for profile in specialists) or "- (none)"
@@ -220,7 +279,9 @@ def build_classification_messages(
     payload = json.dumps(
         {
             "current_text": text[:MAX_CLASSIFIER_TEXT_CHARS],
-            "context": (context or "")[:MAX_CLASSIFIER_CONTEXT_CHARS],
+            "context": (
+                "" if context is None else context[:MAX_CLASSIFIER_CONTEXT_CHARS]
+            ),
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -228,9 +289,7 @@ def build_classification_messages(
     # Keep hostile text from spelling the trusted envelope delimiters. These
     # JSON escapes decode back to the original semantic text for the model.
     payload = (
-        payload.replace("&", "\\u0026")
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
+        payload.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
     )
     user = f"<untrusted-routing-data>\n{payload}\n</untrusted-routing-data>"
     return [
@@ -240,11 +299,14 @@ def build_classification_messages(
 
 
 def _normalize_timeout(value: object) -> float | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        timeout = float(value)
-    except (TypeError, ValueError, OverflowError):
+    if type(value) is int:
+        try:
+            timeout = float(cast(int, value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    elif type(value) is float:
+        timeout = cast(float, value)
+    else:
         return None
     if not math.isfinite(timeout) or timeout <= 0:
         return None
@@ -264,7 +326,7 @@ async def classify_new_root(
     timeout_seconds: float = DEFAULT_CLASSIFIER_TIMEOUT_SECONDS,
 ) -> ClassificationDecision:
     """Classify one new root through the canonical bounded auxiliary call path."""
-    if not isinstance(text, str) or (context is not None and not isinstance(context, str)):
+    if type(text) is not str or (context is not None and type(context) is not str):
         return _clarify("invalid_input")
 
     specialists = _specialist_profiles(config)
