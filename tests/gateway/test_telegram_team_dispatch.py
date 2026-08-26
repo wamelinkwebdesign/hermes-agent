@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import time
 import weakref
 from datetime import datetime, timezone
@@ -13,7 +15,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 from gateway.telegram_team_routing import RootOwnership
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -78,6 +80,32 @@ def _runner() -> tuple[GatewayRunner, dict[str, TelegramAdapter]]:
         adapter.gateway_runner = runner
     assert runner._validate_and_install_telegram_team_runtime() is True
     return runner, roster
+
+
+def _prepare_batching(adapter: TelegramAdapter) -> None:
+    adapter._drop_delayed_deliveries = False
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._pending_photo_batches = {}
+    adapter._pending_photo_batch_tasks = {}
+    adapter._media_group_events = {}
+    adapter._media_group_tasks = {}
+    adapter._held_inbound_events = []
+    adapter._held_inbound_redispatch_task = None
+    adapter.HELD_INBOUND_MAX = 64
+    adapter._text_batch_delay_seconds = 3600
+    adapter._text_batch_split_delay_seconds = 3600
+    adapter._TEXT_BATCH_FAST_DELAY_S = 3600
+    adapter._TEXT_BATCH_SHORT_DELAY_S = 3600
+    adapter._media_batch_delay_seconds = 3600
+    adapter.MEDIA_GROUP_WAIT_SECONDS = 3600
+
+
+async def _cancel_batch_tasks(*tasks) -> None:
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _raw_message(
@@ -233,6 +261,136 @@ async def test_team_ingress_handler_exception_fails_closed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pending_reservation_consumes_duplicate_then_commit_consumes_replay(
+    monkeypatch,
+):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocking_base(_self, _event):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _blocking_base)
+    commit = Mock(wraps=dispatcher.commit_ingress)
+    dispatcher.commit_ingress = commit
+    first = _event(adapter, 90, text="@Woz_Bot investigate")
+
+    first_task = asyncio.create_task(adapter.handle_message(first))
+    await entered.wait()
+    await adapter.handle_message(
+        _event(adapter, 90, text="@Woz_Bot duplicate while pending")
+    )
+    commit.assert_not_called()
+
+    release.set()
+    await first_task
+    commit.assert_called_once()
+    await adapter.handle_message(_event(adapter, 90, text="@Woz_Bot replay"))
+    commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "cancellation"])
+async def test_base_submission_failure_releases_reservation_and_retry_dispatches(
+    monkeypatch,
+    failure,
+):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    calls = 0
+
+    async def _base(_self, _event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if failure == "cancellation":
+                raise asyncio.CancelledError
+            raise RuntimeError("base rejected submission")
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+    release = Mock(wraps=dispatcher.release_ingress)
+    commit = Mock(wraps=dispatcher.commit_ingress)
+    dispatcher.release_ingress = release
+    dispatcher.commit_ingress = commit
+
+    first = _event(adapter, 91, text="@Woz_Bot investigate")
+    expected_error = asyncio.CancelledError if failure == "cancellation" else RuntimeError
+    with pytest.raises(expected_error):
+        await adapter.handle_message(first)
+
+    release.assert_called_once()
+    commit.assert_not_called()
+    # Root/alias preparation is intentionally idempotent and may remain after
+    # Base rejects submission; the released reservation must not suppress retry.
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 91) == RootOwnership(
+        "91",
+        "engineering",
+    )
+
+    retry = _event(adapter, 91, text="@Woz_Bot investigate again")
+    await adapter.handle_message(retry)
+    assert calls == 2
+    commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("callback_failure", "expected_error"),
+    [
+        ("exception", None),
+        ("cancellation", asyncio.CancelledError),
+        ("invalid-decision", None),
+    ],
+)
+async def test_ingress_callback_failure_after_attachment_releases_before_consuming(
+    monkeypatch,
+    callback_failure,
+    expected_error,
+):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    original_handler = adapter._team_ingress_handler
+    assert original_handler is not None
+    base_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
+    release = Mock(wraps=dispatcher.release_ingress)
+    dispatcher.release_ingress = release
+
+    async def _failing_handler(current_adapter, event):
+        consumed = await original_handler(current_adapter, event)
+        assert consumed is False
+        assert getattr(event, "_telegram_team_ingress_reservation", None) is not None
+        if callback_failure == "cancellation":
+            raise asyncio.CancelledError
+        if callback_failure == "exception":
+            raise RuntimeError("callback failed after reservation")
+        return "invalid"
+
+    adapter.set_team_ingress_handler(_failing_handler)  # type: ignore[arg-type]
+    first = _event(adapter, 92, text="@Woz_Bot investigate")
+    if expected_error is None:
+        await adapter.handle_message(first)
+    else:
+        with pytest.raises(expected_error):
+            await adapter.handle_message(first)
+
+    release.assert_called_once()
+    base_handle.assert_not_awaited()
+    adapter.set_team_ingress_handler(original_handler)
+    await adapter.handle_message(_event(adapter, 92, text="@Woz_Bot retry"))
+    base_handle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_replay_is_consumed_before_base_session_handling(monkeypatch):
     runner, roster = _runner()
     adapter = roster["engineering"]
@@ -253,6 +411,262 @@ async def test_duplicate_replay_is_consumed_before_base_session_handling(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("batch_kind", ["text", "photo", "media-group"])
+async def test_real_telegram_batch_paths_reserve_and_bind_every_constituent_id(
+    monkeypatch,
+    batch_kind,
+):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    base_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
+    message_type = MessageType.TEXT if batch_kind == "text" else MessageType.PHOTO
+    first = _event(
+        adapter,
+        900,
+        text="@Woz_Bot first",
+        message_type=message_type,
+    )
+    second = _event(
+        adapter,
+        901,
+        text="@Woz_Bot second",
+        message_type=message_type,
+    )
+
+    scheduled = []
+    if batch_kind == "text":
+        adapter._enqueue_text_event(first)
+        scheduled.append(next(iter(adapter._pending_text_batch_tasks.values())))
+        adapter._enqueue_text_event(second)
+        scheduled.append(next(iter(adapter._pending_text_batch_tasks.values())))
+        await _cancel_batch_tasks(*scheduled)
+        batch_key = next(iter(adapter._pending_text_batches))
+        adapter._pending_text_batch_tasks.clear()
+        adapter._text_batch_delay_seconds = 0
+        adapter._TEXT_BATCH_FAST_DELAY_S = 0
+        await adapter._flush_text_batch(batch_key)
+    elif batch_kind == "photo":
+        adapter._enqueue_photo_event("photo-burst", first)
+        scheduled.append(next(iter(adapter._pending_photo_batch_tasks.values())))
+        adapter._enqueue_photo_event("photo-burst", second)
+        scheduled.append(next(iter(adapter._pending_photo_batch_tasks.values())))
+        await _cancel_batch_tasks(*scheduled)
+        batch_key = next(iter(adapter._pending_photo_batches))
+        adapter._pending_photo_batch_tasks.clear()
+        adapter._media_batch_delay_seconds = 0
+        await adapter._flush_photo_batch(batch_key)
+    else:
+        await adapter._queue_media_group_event("album-1", first)
+        scheduled.append(next(iter(adapter._media_group_tasks.values())))
+        await adapter._queue_media_group_event("album-1", second)
+        scheduled.append(next(iter(adapter._media_group_tasks.values())))
+        await _cancel_batch_tasks(*scheduled)
+        batch_key = next(iter(adapter._media_group_events))
+        adapter._media_group_tasks.clear()
+        adapter.MEDIA_GROUP_WAIT_SECONDS = 0
+        await adapter._flush_media_group_event(batch_key)
+
+    base_handle.assert_awaited_once()
+    dispatched = base_handle.await_args_list[0].args[0]
+    assert dispatched is first
+    assert dispatched.raw_message.message_id == 900
+    assert dispatched.message_id == "900"
+    assert dispatched.source.message_id == "900"
+    assert getattr(dispatched, "_telegram_batch_message_ids") == ("900", "901")
+    assert "telegram_batch_message_ids" not in dispatched.metadata
+    assert "telegram_batch_message_ids" not in dispatched.source.to_dict()
+    expected = RootOwnership("900", "engineering")
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.resolve_reply_owner(
+        _ALLOWED_CHAT, 900
+    ) == expected
+    assert dispatcher.resolve_reply_owner(
+        _ALLOWED_CHAT, 901
+    ) == expected
+
+    await adapter.handle_message(
+        _event(
+            adapter,
+            901,
+            text="@Woz_Bot duplicate constituent",
+            message_type=message_type,
+        )
+    )
+    base_handle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_known_parent_batch_maps_every_constituent_to_parent_root(monkeypatch):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, 850, "engineering") is True
+    _prepare_batching(adapter)
+    base_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
+    first = _event(adapter, 900, reply_to_message_id=850)
+    second = _event(adapter, 901, reply_to_message_id=850)
+
+    adapter._enqueue_text_event(first)
+    task_1 = next(iter(adapter._pending_text_batch_tasks.values()))
+    adapter._enqueue_text_event(second)
+    task_2 = next(iter(adapter._pending_text_batch_tasks.values()))
+    await _cancel_batch_tasks(task_1, task_2)
+    batch_key = next(iter(adapter._pending_text_batches))
+    adapter._pending_text_batch_tasks.clear()
+    adapter._text_batch_delay_seconds = 0
+    adapter._TEXT_BATCH_FAST_DELAY_S = 0
+    await adapter._flush_text_batch(batch_key)
+
+    expected = RootOwnership("850", "engineering")
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 900) == expected
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 901) == expected
+    base_handle.assert_awaited_once_with(first)
+
+
+@pytest.mark.asyncio
+async def test_unaddressed_batch_carries_validated_ids_only_in_runner_capability(
+    monkeypatch,
+):
+    runner, roster = _runner()
+    adapter = roster["default"]
+    _prepare_batching(adapter)
+    base_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
+    first = _event(adapter, 900, text="please investigate")
+    second = _event(adapter, 901, text="and include this")
+
+    adapter._enqueue_text_event(first)
+    task_1 = next(iter(adapter._pending_text_batch_tasks.values()))
+    adapter._enqueue_text_event(second)
+    task_2 = next(iter(adapter._pending_text_batch_tasks.values()))
+    await _cancel_batch_tasks(task_1, task_2)
+    batch_key = next(iter(adapter._pending_text_batches))
+    adapter._pending_text_batch_tasks.clear()
+    adapter._text_batch_delay_seconds = 0
+    adapter._TEXT_BATCH_FAST_DELAY_S = 0
+    await adapter._flush_text_batch(batch_key)
+
+    base_handle.assert_awaited_once_with(first)
+    assert getattr(first, "_telegram_team_constituent_message_ids") == ("900", "901")
+    assert (
+        getattr(first, "_telegram_team_constituent_ids_capability")
+        is getattr(runner, "_telegram_team_constituent_ids_capability")
+    )
+    assert "constituent" not in repr(first.metadata).lower()
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.resolve_reply_owner(
+        _ALLOWED_CHAT, 900
+    ) is None
+    assert dispatcher.resolve_reply_owner(
+        _ALLOWED_CHAT, 901
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_interleaved_team_owners_do_not_coalesce_across_adapters():
+    _, roster = _runner()
+    engineering = roster["engineering"]
+    design = roster["design"]
+    _prepare_batching(engineering)
+    _prepare_batching(design)
+
+    engineering._enqueue_text_event(
+        _event(engineering, 910, text="@Woz_Bot first")
+    )
+    engineering_task_1 = next(iter(engineering._pending_text_batch_tasks.values()))
+    design._enqueue_text_event(_event(design, 920, text="@Virgil_Bot first"))
+    design_task_1 = next(iter(design._pending_text_batch_tasks.values()))
+    engineering._enqueue_text_event(
+        _event(engineering, 911, text="@Woz_Bot second")
+    )
+    engineering_task_2 = next(iter(engineering._pending_text_batch_tasks.values()))
+    design._enqueue_text_event(_event(design, 921, text="@Virgil_Bot second"))
+    design_task_2 = next(iter(design._pending_text_batch_tasks.values()))
+
+    assert len(engineering._pending_text_batches) == 1
+    assert len(design._pending_text_batches) == 1
+    engineering_batch = next(iter(engineering._pending_text_batches.values()))
+    design_batch = next(iter(design._pending_text_batches.values()))
+    assert getattr(engineering_batch, "_telegram_batch_message_ids") == (
+        "910",
+        "911",
+    )
+    assert getattr(design_batch, "_telegram_batch_message_ids") == ("920", "921")
+    await _cancel_batch_tasks(
+        engineering_task_1,
+        engineering_task_2,
+        design_task_1,
+        design_task_2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_identical_media_group_ids_do_not_coalesce_across_sessions():
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    first_session = _event(
+        adapter,
+        930,
+        text="@Woz_Bot first session",
+        message_type=MessageType.PHOTO,
+    )
+    second_session = _event(
+        adapter,
+        940,
+        text="@Woz_Bot second session",
+        message_type=MessageType.PHOTO,
+    )
+    first_session.source.user_id = "111"
+    second_session.source.user_id = "222"
+    second_session.source.thread_id = "88"
+
+    await adapter._queue_media_group_event("album-reused", first_session)
+    first_task = next(iter(adapter._media_group_tasks.values()))
+    await adapter._queue_media_group_event("album-reused", second_session)
+    tasks = list(adapter._media_group_tasks.values())
+
+    assert len(adapter._media_group_events) == 2
+    batches = list(adapter._media_group_events.values())
+    assert getattr(batches[0], "_telegram_batch_message_ids") == ("930",)
+    assert getattr(batches[1], "_telegram_batch_message_ids") == ("940",)
+    await _cancel_batch_tasks(first_task, *tasks)
+
+
+@pytest.mark.asyncio
+async def test_batch_identity_overflow_splits_without_discarding_message_ids():
+    _, roster = _runner()
+    adapter = roster["engineering"]
+    _prepare_batching(adapter)
+    scheduled = []
+
+    for message_id in range(1, 66):
+        adapter._enqueue_text_event(
+            _event(adapter, message_id, text=f"@Woz_Bot chunk {message_id}")
+        )
+        scheduled.append(next(reversed(adapter._pending_text_batch_tasks.values())))
+
+    assert len(adapter._pending_text_batches) == 2
+    batches = list(adapter._pending_text_batches.values())
+    assert getattr(batches[0], "_telegram_batch_message_ids") == tuple(
+        str(message_id) for message_id in range(1, 65)
+    )
+    assert getattr(batches[1], "_telegram_batch_message_ids") == ("65",)
+    assert {
+        message_id
+        for batch in batches
+        for message_id in getattr(batch, "_telegram_batch_message_ids")
+    } == {str(message_id) for message_id in range(1, 66)}
+    await _cancel_batch_tasks(*scheduled)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event_kwargs",
     [
@@ -269,11 +683,222 @@ async def test_dm_outside_chat_and_commands_are_not_claimed(event_kwargs):
     runner._telegram_team_dispatcher.claim_ingress = claim
     event = _event(adapter, 110, **event_kwargs)
 
-    consumed = await adapter._team_ingress_handler(adapter, event)
+    handler = adapter._team_ingress_handler
+    assert handler is not None
+    consumed = await handler(adapter, event)
 
     assert consumed is False
     claim.assert_not_called()
     assert "telegram_team_ingress_claimed" not in event.metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/stop@Woz_Bot", "/new", "/status", "/approve"])
+async def test_command_reply_to_known_root_uses_root_owner_session_without_reservation(
+    command,
+):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, 700, "engineering") is True
+    reserve = Mock(side_effect=AssertionError("commands must not reserve ingress"))
+    claim = Mock(side_effect=AssertionError("commands must not claim ingress"))
+    dispatcher.reserve_ingress_batch = reserve
+    dispatcher.claim_ingress = claim
+    event = _event(
+        adapter,
+        701,
+        text=command,
+        reply_to_message_id=700,
+        message_type=MessageType.COMMAND,
+    )
+
+    handler = adapter._team_ingress_handler
+    assert handler is not None
+    consumed = await handler(adapter, event)
+
+    assert consumed is False
+    assert event.source.profile == "engineering"
+    assert event.source.session_scope_id == f"telegram-team:{_ALLOWED_CHAT}:700"
+    assert event.metadata["telegram_team_root_message_id"] == "700"
+    assert event.metadata["telegram_team_owner_profile"] == "engineering"
+    assert event.metadata["telegram_team_route_reason"] == "command_reply_to_root"
+    assert "telegram_team_ingress_claimed" not in event.metadata
+    command_key = build_session_key(
+        event.source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+        profile=adapter._session_key_profile(event.source),
+    )
+    root_source = dataclasses.replace(
+        event.source,
+        message_id="700",
+        session_scope_id=f"telegram-team:{_ALLOWED_CHAT}:700",
+    )
+    root_key = build_session_key(
+        root_source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+        profile=adapter._session_key_profile(root_source),
+    )
+    assert command_key == root_key
+    reserve.assert_not_called()
+    claim.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_to_message_id", [None, 999])
+async def test_bare_or_unrelated_command_keeps_legacy_session_and_does_not_reserve(
+    reply_to_message_id,
+):
+    runner, roster = _runner()
+    adapter = roster["default"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    reserve = Mock(side_effect=AssertionError("commands must not reserve ingress"))
+    claim = Mock(side_effect=AssertionError("commands must not claim ingress"))
+    dispatcher.reserve_ingress_batch = reserve
+    dispatcher.claim_ingress = claim
+    event = _event(
+        adapter,
+        702,
+        text="/status",
+        reply_to_message_id=reply_to_message_id,
+        message_type=MessageType.COMMAND,
+    )
+    source_before = event.source.to_dict()
+    metadata_before = dict(event.metadata)
+
+    handler = adapter._team_ingress_handler
+    assert handler is not None
+    assert await handler(adapter, event) is False
+
+    assert event.source.to_dict() == source_before
+    assert event.metadata == metadata_before
+    reserve.assert_not_called()
+    claim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_command_reply_to_known_root_is_consumed_by_nonowner_without_reservation():
+    runner, roster = _runner()
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, 700, "engineering") is True
+    reserve = Mock(side_effect=AssertionError("commands must not reserve ingress"))
+    dispatcher.reserve_ingress_batch = reserve
+    event = _event(
+        roster["design"],
+        703,
+        text="/status",
+        reply_to_message_id=700,
+        message_type=MessageType.COMMAND,
+    )
+
+    handler = roster["design"]._team_ingress_handler
+    assert handler is not None
+    assert await handler(roster["design"], event) is True
+    reserve.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_branch",
+    [
+        "resolve-owner-raises",
+        "wrong-parent-owner",
+        "record-alias-fails",
+        "resolve-addressed-raises",
+        "decision-owner-mismatch",
+        "record-root-fails",
+        "source-scope-raises",
+    ],
+)
+async def test_every_post_reservation_ingress_failure_releases_atomically(
+    monkeypatch,
+    failure_branch,
+):
+    import gateway.telegram_team_routing as routing
+
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    event = _event(adapter, 730, text="@Woz_Bot investigate")
+
+    if failure_branch == "resolve-owner-raises":
+        dispatcher.resolve_reply_owner = Mock(side_effect=RuntimeError("resolve failed"))
+    elif failure_branch == "wrong-parent-owner":
+        event = _event(adapter, 730, reply_to_message_id=700)
+        dispatcher.resolve_reply_owner = Mock(
+            return_value=RootOwnership("700", "design")
+        )
+    elif failure_branch == "record-alias-fails":
+        assert dispatcher.record_root(_ALLOWED_CHAT, 700, "engineering") is True
+        event = _event(adapter, 730, reply_to_message_id=700)
+        dispatcher.record_inbound_alias = Mock(return_value=False)
+    elif failure_branch == "resolve-addressed-raises":
+        monkeypatch.setattr(
+            routing,
+            "resolve_addressed_owner",
+            Mock(side_effect=RuntimeError("routing failed")),
+        )
+    elif failure_branch == "decision-owner-mismatch":
+        event = _event(adapter, 730, text="unaddressed")
+    elif failure_branch == "record-root-fails":
+        dispatcher.record_root = Mock(return_value=False)
+    else:
+        assert event.source is not None
+        source_type = type(event.source)
+
+        class ExplodingSource(source_type):
+            _explode_on_scope = False
+
+            def __setattr__(self, name, value):
+                if name == "session_scope_id" and self._explode_on_scope:
+                    raise RuntimeError("source scope assignment failed")
+                super().__setattr__(name, value)
+
+        event.source.__class__ = ExplodingSource
+        setattr(event.source, "_explode_on_scope", True)
+
+    handler = adapter._team_ingress_handler
+    assert handler is not None
+    consumed = await handler(adapter, event)
+
+    assert consumed is True
+    retry = dispatcher.reserve_ingress_batch(_ALLOWED_CHAT, [730], "engineering")
+    assert retry.reserved is True
+    assert retry.reservation is not None
+    assert dispatcher.release_ingress(retry.reservation) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "forgery",
+    ["unknown-capability", "external-metadata", "external-runner-metadata"],
+)
+async def test_forged_batch_identity_is_consumed_without_reserving(forgery):
+    runner, roster = _runner()
+    adapter = roster["engineering"]
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    reserve = Mock(side_effect=AssertionError("forged state must not reserve"))
+    dispatcher.reserve_ingress_batch = reserve
+    event = _event(adapter, 740, text="@Woz_Bot investigate")
+    if forgery == "unknown-capability":
+        setattr(event, "_telegram_batch_message_ids", ("740", "741"))
+        setattr(event, "_telegram_batch_identity_capability", object())
+    elif forgery == "external-metadata":
+        event.metadata["telegram_batch_message_ids"] = ["740", "741"]
+    else:
+        event.metadata["_telegram_team_constituent_message_ids"] = ["740", "741"]
+
+    handler = adapter._team_ingress_handler
+    assert handler is not None
+    assert await handler(adapter, event) is True
+    reserve.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@ import re
 import threading
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import ClassVar, cast
 
@@ -22,6 +22,7 @@ _MAX_MESSAGE_ID_LENGTH = len(str(_MAX_MESSAGE_ID))
 
 _DEFAULT_MAX_CLAIMS = 4096
 _DEFAULT_MAX_ALIASES = 8192
+MAX_TELEGRAM_BATCH_MESSAGE_IDS = 64
 
 
 def _normalize_username(value: object) -> str | None:
@@ -180,6 +181,32 @@ class IngressClaim:
     adapter_profile: str | None
 
 
+@dataclass(frozen=True, eq=False, repr=False)
+class IngressReservation:
+    """Opaque immutable identity for one pending atomic ingress reservation."""
+
+    _dispatcher_identity: object
+    _keys: tuple[tuple[str, str], ...]
+    _adapter_profile: str
+
+    def __repr__(self) -> str:
+        return "<IngressReservation>"
+
+
+@dataclass(frozen=True)
+class IngressReservationResult:
+    """Result of atomically reserving one bounded Telegram ingress batch."""
+
+    reserved: bool
+    duplicate: bool
+    adapter_profile: str | None
+    reservation: IngressReservation | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
 @dataclass(frozen=True)
 class RootOwnership:
     """Canonical Telegram root message and the profile that owns its replies."""
@@ -225,9 +252,126 @@ class TelegramTeamDispatcher:
         self._max_claims = max_claims
         self._max_aliases = max_aliases
         self._lock = threading.Lock()
+        self._reservation_identity = object()
         self._claims: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._pending_reservations: dict[
+            tuple[str, str], IngressReservation
+        ] = {}
         self._aliases: dict[tuple[str, str], RootOwnership] = {}
         self._families: OrderedDict[tuple[str, str], _RootFamily] = OrderedDict()
+
+    def reserve_ingress_batch(
+        self,
+        chat_id: object,
+        inbound_message_ids: object,
+        adapter_profile: object,
+    ) -> IngressReservationResult:
+        """Atomically reserve a bounded batch without evicting committed claims."""
+        rejected = IngressReservationResult(False, False, None)
+        normalized_chat_id = _normalize_group_chat_id(chat_id)
+        normalized_profile = _normalize_profile(adapter_profile)
+        if normalized_chat_id is None or normalized_profile is None:
+            return rejected
+        if isinstance(inbound_message_ids, (str, bytes, bytearray, Mapping)):
+            return rejected
+        try:
+            iterator = iter(cast(Iterable[object], inbound_message_ids))
+        except Exception:
+            return rejected
+
+        normalized_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for attempt in range(MAX_TELEGRAM_BATCH_MESSAGE_IDS + 1):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                break
+            except Exception:
+                return rejected
+            if attempt == MAX_TELEGRAM_BATCH_MESSAGE_IDS:
+                return rejected
+            try:
+                normalized_id = _normalize_message_id(value)
+            except Exception:
+                return rejected
+            if normalized_id is None:
+                return rejected
+            if normalized_id not in seen_ids:
+                normalized_ids.append(normalized_id)
+                seen_ids.add(normalized_id)
+        if not normalized_ids or len(normalized_ids) > self._max_claims:
+            return rejected
+
+        keys = tuple((normalized_chat_id, message_id) for message_id in normalized_ids)
+        with self._lock:
+            for key in keys:
+                committed_profile = self._claims.get(key)
+                if committed_profile is not None:
+                    return IngressReservationResult(
+                        False,
+                        True,
+                        committed_profile,
+                    )
+                pending = self._pending_reservations.get(key)
+                if pending is not None:
+                    return IngressReservationResult(
+                        False,
+                        True,
+                        pending._adapter_profile,
+                    )
+            if len(self._pending_reservations) + len(keys) > self._max_claims:
+                return rejected
+
+            reservation = IngressReservation(
+                self._reservation_identity,
+                keys,
+                normalized_profile,
+            )
+            for key in keys:
+                self._pending_reservations[key] = reservation
+            return IngressReservationResult(
+                True,
+                False,
+                normalized_profile,
+                reservation,
+            )
+
+    def commit_ingress(self, reservation: object) -> bool:
+        """Commit only the exact pending reservation returned by this dispatcher."""
+        if (
+            not isinstance(reservation, IngressReservation)
+            or reservation._dispatcher_identity is not self._reservation_identity
+        ):
+            return False
+        with self._lock:
+            if not reservation._keys or any(
+                self._pending_reservations.get(key) is not reservation
+                for key in reservation._keys
+            ):
+                return False
+            for key in reservation._keys:
+                self._pending_reservations.pop(key, None)
+                self._claims[key] = reservation._adapter_profile
+            while len(self._claims) > self._max_claims:
+                self._claims.popitem(last=False)
+            return True
+
+    def release_ingress(self, reservation: object) -> bool:
+        """Release only the exact pending reservation returned by this dispatcher."""
+        if (
+            not isinstance(reservation, IngressReservation)
+            or reservation._dispatcher_identity is not self._reservation_identity
+        ):
+            return False
+        with self._lock:
+            if not reservation._keys or any(
+                self._pending_reservations.get(key) is not reservation
+                for key in reservation._keys
+            ):
+                return False
+            for key in reservation._keys:
+                self._pending_reservations.pop(key, None)
+            return True
 
     def claim_ingress(
         self,
@@ -236,34 +380,24 @@ class TelegramTeamDispatcher:
         adapter_profile: object,
     ) -> IngressClaim:
         """Claim a Telegram update once across every adapter using this dispatcher."""
-        normalized_chat_id = _normalize_group_chat_id(chat_id)
-        normalized_message_id = _normalize_message_id(inbound_message_id)
-        normalized_profile = _normalize_profile(adapter_profile)
-        if (
-            normalized_chat_id is None
-            or normalized_message_id is None
-            or normalized_profile is None
-        ):
-            return IngressClaim(claimed=False, duplicate=False, adapter_profile=None)
-
-        key = (normalized_chat_id, normalized_message_id)
-        with self._lock:
-            first_profile = self._claims.get(key)
-            if first_profile is not None:
+        attempt = self.reserve_ingress_batch(
+            chat_id,
+            [inbound_message_id],
+            adapter_profile,
+        )
+        if attempt.reserved and attempt.reservation is not None:
+            if self.commit_ingress(attempt.reservation):
                 return IngressClaim(
-                    claimed=False,
-                    duplicate=True,
-                    adapter_profile=first_profile,
+                    claimed=True,
+                    duplicate=False,
+                    adapter_profile=attempt.adapter_profile,
                 )
-
-            self._claims[key] = normalized_profile
-            while len(self._claims) > self._max_claims:
-                self._claims.popitem(last=False)
-
+            self.release_ingress(attempt.reservation)
+            return IngressClaim(False, False, None)
         return IngressClaim(
-            claimed=True,
-            duplicate=False,
-            adapter_profile=normalized_profile,
+            claimed=False,
+            duplicate=attempt.duplicate,
+            adapter_profile=attempt.adapter_profile,
         )
 
     def record_root(

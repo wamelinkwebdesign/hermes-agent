@@ -443,6 +443,113 @@ def test_ingress_claims_evict_the_oldest_entry_deterministically():
     assert dispatcher.claim_ingress(-1001, 1, "engineering").claimed is True
 
 
+def test_ingress_batch_reservation_blocks_duplicates_then_release_allows_retry():
+    dispatcher = _dispatcher()
+
+    first = dispatcher.reserve_ingress_batch(-1001, [900, 901], "engineering")
+    assert first.reserved is True
+    assert first.duplicate is False
+    assert first.adapter_profile == "engineering"
+    assert first.reservation is not None
+
+    duplicate = dispatcher.reserve_ingress_batch(-1001, [901], "design-team")
+    assert duplicate.reserved is False
+    assert duplicate.duplicate is True
+    assert duplicate.adapter_profile == "engineering"
+    assert duplicate.reservation is None
+
+    assert dispatcher.release_ingress(first.reservation) is True
+    retry = dispatcher.reserve_ingress_batch(-1001, [900, 901], "design-team")
+    assert retry.reserved is True
+    assert retry.adapter_profile == "design-team"
+    assert retry.reservation is not None
+
+    assert dispatcher.commit_ingress(retry.reservation) is True
+    replay = dispatcher.reserve_ingress_batch(-1001, [900], "engineering")
+    assert replay.reserved is False
+    assert replay.duplicate is True
+    assert replay.adapter_profile == "design-team"
+
+
+def test_ingress_reservation_requires_exact_opaque_identity_and_dispatcher():
+    dispatcher = _dispatcher()
+    other = _dispatcher()
+    attempt = dispatcher.reserve_ingress_batch(-1001, [900, 901], "engineering")
+    reservation = attempt.reservation
+    assert reservation is not None
+
+    assert repr(reservation) == "<IngressReservation>"
+    assert other.release_ingress(reservation) is False
+    assert other.commit_ingress(reservation) is False
+    assert dispatcher.release_ingress(object()) is False
+
+    duplicate = dispatcher.reserve_ingress_batch(-1001, [900], "design-team")
+    assert duplicate.duplicate is True
+    assert dispatcher.release_ingress(reservation) is True
+    assert dispatcher.release_ingress(reservation) is False
+
+
+def test_ingress_reservation_identity_cannot_change_profile_or_id_family():
+    dispatcher = _dispatcher()
+    attempt = dispatcher.reserve_ingress_batch(-1001, [900, 901], "engineering")
+    reservation = attempt.reservation
+    assert reservation is not None
+
+    with pytest.raises(AttributeError):
+        reservation._keys = (("-1001", "999"),)
+    with pytest.raises(AttributeError):
+        reservation._adapter_profile = "design-team"
+
+    assert dispatcher.release_ingress(reservation) is True
+
+
+@pytest.mark.parametrize(
+    "message_ids",
+    [
+        [],
+        [900, 0],
+        [900, True],
+        [900, "0901"],
+        list(range(1, 66)),
+        "900",
+        {"900": True},
+    ],
+)
+def test_invalid_or_oversized_ingress_batch_is_atomic_and_preserves_claim_order(
+    message_ids,
+):
+    dispatcher = _dispatcher(max_claims=2)
+    assert dispatcher.claim_ingress(-1001, 10, "default").claimed is True
+    assert dispatcher.claim_ingress(-1001, 11, "default").claimed is True
+
+    rejected = dispatcher.reserve_ingress_batch(-1001, message_ids, "engineering")
+
+    assert rejected.reserved is False
+    assert rejected.duplicate is False
+    assert rejected.adapter_profile is None
+    assert rejected.reservation is None
+    assert dispatcher.claim_ingress(-1001, 12, "default").claimed is True
+    assert dispatcher.claim_ingress(-1001, 11, "engineering").duplicate is True
+    assert dispatcher.claim_ingress(-1001, 10, "engineering").claimed is True
+
+
+def test_pending_reservations_are_bounded_without_evicting_committed_claims():
+    dispatcher = _dispatcher(max_claims=2)
+    assert dispatcher.claim_ingress(-1001, 10, "default").claimed is True
+    assert dispatcher.claim_ingress(-1001, 11, "default").claimed is True
+
+    first = dispatcher.reserve_ingress_batch(-1001, [20, 21], "engineering")
+    assert first.reserved is True
+    overflow = dispatcher.reserve_ingress_batch(-1001, [22], "design-team")
+    assert overflow.reserved is False
+    assert overflow.duplicate is False
+    assert dispatcher.claim_ingress(-1001, 10, "engineering").duplicate is True
+    assert dispatcher.claim_ingress(-1001, 11, "engineering").duplicate is True
+
+    assert dispatcher.release_ingress(first.reservation) is True
+    assert dispatcher.reserve_ingress_batch(-1001, [22], "design-team").reserved is True
+
+
 def test_root_and_arbitrarily_deep_human_aliases_keep_one_immutable_owner():
     module = _routing_module()
     dispatcher = _dispatcher()

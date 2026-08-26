@@ -7091,9 +7091,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._telegram_team_dispatcher = None
         self._telegram_team_route_gate_callback = None
         self._telegram_team_ingress_callback = None
-        # Process-local object identity authorizes runner-built routed events.
-        # It is attached dynamically to MessageEvent and never serialized.
+        # Process-local object identities authorize runner-built routed events
+        # and validated, internal-only ingress batch state.
         self._telegram_team_route_capability = object()
+        self._telegram_team_constituent_ids_capability = object()
         self._telegram_team_gate_adapters: Dict[str, BasePlatformAdapter] = {}
         self._telegram_team_routing_enabled = False
         self._telegram_team_profiles: tuple[str, ...] = ()
@@ -16187,6 +16188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         no model routing, context retrieval, specialist dispatch, or delivery.
         """
         from gateway.telegram_team_routing import (
+            MAX_TELEGRAM_BATCH_MESSAGE_IDS,
             TelegramTeamRouteContext,
             _normalize_group_chat_id,
             _normalize_message_id,
@@ -16224,12 +16226,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             return True
         raw_chat_id = cast(str, raw_chat_id)
-
-        # Commands keep the existing command/session path and are never claimed.
-        if not routed_marker_present and (
-            event.message_type is MessageType.COMMAND or event.is_command()
-        ):
-            return False
 
         if (
             self.__dict__.get("_telegram_team_routing_enabled") is not True
@@ -16286,6 +16282,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             return True
 
+        # Commands remain outside ingress dedupe, but command replies to a known
+        # route must share the root owner's exact scoped session.
+        if not routed_marker_present and (
+            event.message_type is MessageType.COMMAND or event.is_command()
+        ):
+            try:
+                command_ownership = dispatcher.resolve_reply_owner(
+                    raw_chat_id,
+                    context.reply_to_message_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Telegram team command route lookup failed",
+                    exc_info=True,
+                )
+                return True
+            if command_ownership is None:
+                return False
+            if (
+                context.reply_to_message_id is None
+                or command_ownership.owner_profile != profile
+            ):
+                return True
+            source.profile = profile
+            source.session_scope_id = (
+                f"telegram-team:{raw_chat_id}:"
+                f"{command_ownership.root_message_id}"
+            )
+            try:
+                command_metadata = dict(metadata)
+            except Exception:
+                logger.warning(
+                    "Telegram team command metadata preparation failed",
+                    exc_info=True,
+                )
+                return True
+            command_metadata.update(
+                {
+                    "telegram_team_root_message_id": (
+                        command_ownership.root_message_id
+                    ),
+                    "telegram_team_owner_profile": profile,
+                    "telegram_team_route_reason": "command_reply_to_root",
+                }
+            )
+            command_metadata.pop("telegram_team_ingress_claimed", None)
+            event.metadata = command_metadata
+            return False
+
+        forbidden_batch_metadata = (
+            "_telegram_batch_message_ids",
+            "_telegram_batch_identity_capability",
+            "telegram_batch_message_ids",
+            "telegram_constituent_message_ids",
+            "telegram_team_constituent_message_ids",
+            "_telegram_team_constituent_message_ids",
+            "_telegram_team_constituent_ids_capability",
+            "_telegram_team_ingress_reservation",
+            "_telegram_team_ingress_dispatcher",
+        )
+        if any(key in metadata for key in forbidden_batch_metadata):
+            return True
+
+        if routed_marker_present:
+            raw_constituent_ids = getattr(
+                event,
+                "_telegram_team_constituent_message_ids",
+                None,
+            )
+            constituent_capability = getattr(
+                event,
+                "_telegram_team_constituent_ids_capability",
+                None,
+            )
+            expected_constituent_capability = self.__dict__.get(
+                "_telegram_team_constituent_ids_capability"
+            )
+        else:
+            raw_constituent_ids = getattr(
+                event,
+                "_telegram_batch_message_ids",
+                None,
+            )
+            constituent_capability = getattr(
+                event,
+                "_telegram_batch_identity_capability",
+                None,
+            )
+            expected_constituent_capability = getattr(
+                adapter,
+                "_telegram_batch_identity_capability",
+                None,
+            )
+
+        if raw_constituent_ids is None and constituent_capability is None:
+            constituent_ids = (context.message_id,)
+        else:
+            if (
+                constituent_capability is None
+                or constituent_capability is not expected_constituent_capability
+                or not isinstance(raw_constituent_ids, (tuple, list))
+                or not 1
+                <= len(raw_constituent_ids)
+                <= MAX_TELEGRAM_BATCH_MESSAGE_IDS
+            ):
+                return True
+            normalized_constituent_ids = tuple(
+                _normalize_message_id(message_id)
+                for message_id in raw_constituent_ids
+            )
+            if (
+                any(message_id is None for message_id in normalized_constituent_ids)
+                or normalized_constituent_ids[0] != context.message_id
+                or len(set(normalized_constituent_ids))
+                != len(normalized_constituent_ids)
+            ):
+                return True
+            constituent_ids = cast(Tuple[str, ...], normalized_constituent_ids)
+
         if routed_marker_present:
             capability = self.__dict__.get("_telegram_team_route_capability")
             root_message_id = _normalize_message_id(
@@ -16313,76 +16428,123 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             return False
 
-        claim = dispatcher.claim_ingress(raw_chat_id, context.message_id, profile)
-        if claim.duplicate:
+        reservation_attempt = dispatcher.reserve_ingress_batch(
+            raw_chat_id,
+            constituent_ids,
+            profile,
+        )
+        if reservation_attempt.duplicate:
             return True
-        if not claim.claimed or claim.adapter_profile != profile:
+        reservation = reservation_attempt.reservation
+        if (
+            not reservation_attempt.reserved
+            or reservation_attempt.adapter_profile != profile
+            or reservation is None
+        ):
             return True
 
-        ownership = dispatcher.resolve_reply_owner(
-            raw_chat_id,
-            context.reply_to_message_id,
-        )
-        deferred_root_binding = False
-        if ownership is not None:
-            if ownership.owner_profile != profile or context.reply_to_message_id is None:
-                return True
-            if not dispatcher.record_inbound_alias(
+        try:
+            # Root-family bindings are idempotent and intentionally survive a
+            # later Base submission failure; releasing this reservation keeps
+            # the exact update retryable without breaking immediate reply routing.
+            ownership = dispatcher.resolve_reply_owner(
                 raw_chat_id,
-                context.message_id,
                 context.reply_to_message_id,
-            ):
-                return True
-            root_message_id = ownership.root_message_id
-            owner_profile = ownership.owner_profile
-            route_reason = "reply_to_root_chain"
-        else:
-            try:
+            )
+            deferred_root_binding = False
+            if ownership is not None:
+                if (
+                    ownership.owner_profile != profile
+                    or context.reply_to_message_id is None
+                ):
+                    return True
+                for constituent_id in constituent_ids:
+                    if not dispatcher.record_inbound_alias(
+                        raw_chat_id,
+                        constituent_id,
+                        context.reply_to_message_id,
+                    ):
+                        return True
+                root_message_id = ownership.root_message_id
+                owner_profile = ownership.owner_profile
+                route_reason = "reply_to_root_chain"
+            else:
                 decision = resolve_addressed_owner(
                     mentions=set(context.mentions),
                     reply_author_username=context.reply_author_username,
                     config=team_config,
                     chat_id=raw_chat_id,
                 )
-            except Exception:
-                logger.warning(
-                    "Telegram team structural ingress resolution failed",
-                    exc_info=True,
-                )
-                return True
-            if not decision.accepted or decision.owner_profile != profile:
-                return True
-            root_message_id = context.message_id
-            owner_profile = decision.owner_profile
-            route_reason = decision.reason
-            if route_reason == "unaddressed_ingress":
-                deferred_root_binding = True
-            elif not dispatcher.record_root(
-                raw_chat_id,
-                root_message_id,
-                owner_profile,
-            ):
-                return True
+                if not decision.accepted or decision.owner_profile != profile:
+                    return True
+                root_message_id = context.message_id
+                owner_profile = decision.owner_profile
+                route_reason = decision.reason
+                if route_reason == "unaddressed_ingress":
+                    deferred_root_binding = True
+                else:
+                    if not dispatcher.record_root(
+                        raw_chat_id,
+                        root_message_id,
+                        owner_profile,
+                    ):
+                        return True
+                    for constituent_id in constituent_ids[1:]:
+                        if not dispatcher.record_inbound_alias(
+                            raw_chat_id,
+                            constituent_id,
+                            root_message_id,
+                        ):
+                            return True
 
-        source.profile = owner_profile
-        source.session_scope_id = (
-            f"telegram-team:{raw_chat_id}:{root_message_id}"
-        )
-        prepared_metadata = dict(metadata)
-        prepared_metadata.update(
-            {
-                "telegram_team_root_message_id": root_message_id,
-                "telegram_team_owner_profile": owner_profile,
-                "telegram_team_route_reason": route_reason,
-                "telegram_team_ingress_claimed": True,
-            }
-        )
-        if deferred_root_binding:
-            prepared_metadata["telegram_team_root_binding_deferred"] = True
-        else:
-            prepared_metadata.pop("telegram_team_root_binding_deferred", None)
-        event.metadata = prepared_metadata
-        return False
+            source.profile = owner_profile
+            source.session_scope_id = (
+                f"telegram-team:{raw_chat_id}:{root_message_id}"
+            )
+            prepared_metadata = dict(metadata)
+            prepared_metadata.update(
+                {
+                    "telegram_team_root_message_id": root_message_id,
+                    "telegram_team_owner_profile": owner_profile,
+                    "telegram_team_route_reason": route_reason,
+                    "telegram_team_ingress_claimed": True,
+                }
+            )
+            if deferred_root_binding:
+                prepared_metadata["telegram_team_root_binding_deferred"] = True
+            else:
+                prepared_metadata.pop("telegram_team_root_binding_deferred", None)
+            event.metadata = prepared_metadata
+
+            ingress_capability = self.__dict__.get(
+                "_telegram_team_constituent_ids_capability"
+            )
+            if ingress_capability is None:
+                ingress_capability = object()
+                self._telegram_team_constituent_ids_capability = ingress_capability
+            setattr(
+                event,
+                "_telegram_team_constituent_message_ids",
+                constituent_ids,
+            )
+            setattr(
+                event,
+                "_telegram_team_constituent_ids_capability",
+                ingress_capability,
+            )
+            setattr(event, "_telegram_team_ingress_dispatcher", dispatcher)
+            setattr(event, "_telegram_team_ingress_reservation", reservation)
+            reservation = None
+            return False
+        except Exception:
+            logger.warning(
+                "Telegram team ingress preparation failed",
+                exc_info=True,
+            )
+            return True
+        finally:
+            if reservation is not None:
+                dispatcher.release_ingress(reservation)
 
     def build_target_event(
         self,
@@ -16475,6 +16637,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             capability = object()
             self._telegram_team_route_capability = capability
         setattr(routed, "_telegram_team_route_capability", capability)
+        ingress_capability = self.__dict__.get(
+            "_telegram_team_constituent_ids_capability"
+        )
+        if ingress_capability is None:
+            ingress_capability = object()
+            self._telegram_team_constituent_ids_capability = ingress_capability
+        constituent_ids = getattr(
+            original,
+            "_telegram_team_constituent_message_ids",
+            None,
+        )
+        if (
+            ingress_capability is None
+            or getattr(original, "_telegram_team_constituent_ids_capability", None)
+            is not ingress_capability
+            or not isinstance(constituent_ids, tuple)
+        ):
+            constituent_ids = (message_id,)
+        setattr(
+            routed,
+            "_telegram_team_constituent_message_ids",
+            constituent_ids,
+        )
+        setattr(
+            routed,
+            "_telegram_team_constituent_ids_capability",
+            ingress_capability,
+        )
         return routed
 
     @staticmethod

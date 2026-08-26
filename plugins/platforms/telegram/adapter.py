@@ -452,7 +452,11 @@ from gateway.platforms.helpers import (
     compile_mention_patterns,
     convert_table_to_bullets as _wrap_markdown_tables,
 )
-from gateway.telegram_team_routing import TelegramTeamRouteContext
+from gateway.telegram_team_routing import (
+    MAX_TELEGRAM_BATCH_MESSAGE_IDS,
+    TelegramTeamRouteContext,
+    _normalize_message_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +683,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._team_ingress_handler: Optional[
             Callable[["TelegramAdapter", MessageEvent], Awaitable[bool]]
         ] = None
+        # Per-adapter identity authenticates internal-only constituent IDs on
+        # batched MessageEvent objects. Neither value is part of event metadata.
+        self._telegram_batch_identity_capability = object()
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
@@ -9040,6 +9047,31 @@ class TelegramAdapter(BasePlatformAdapter):
         """Register the runner-owned Telegram-only normalized ingress seam."""
         self._team_ingress_handler = callback
 
+    @staticmethod
+    def _finalize_team_ingress_reservation(
+        event: MessageEvent,
+        *,
+        commit: bool,
+    ) -> bool:
+        """Commit/release runner-owned ingress state without exposing identity."""
+        reservation = getattr(event, "_telegram_team_ingress_reservation", None)
+        dispatcher = getattr(event, "_telegram_team_ingress_dispatcher", None)
+        if reservation is None:
+            return False
+        method_name = "commit_ingress" if commit else "release_ingress"
+        method = getattr(dispatcher, method_name, None)
+        try:
+            return callable(method) and method(reservation) is True
+        finally:
+            for attribute in (
+                "_telegram_team_ingress_reservation",
+                "_telegram_team_ingress_dispatcher",
+            ):
+                try:
+                    delattr(event, attribute)
+                except AttributeError:
+                    pass
+
     async def handle_message(self, event: MessageEvent) -> None:
         """Run every normalized Telegram event through central team ingress."""
         handler = getattr(self, "_team_ingress_handler", None)
@@ -9047,8 +9079,10 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 consumed = await handler(self, event)
             except asyncio.CancelledError:
+                self._finalize_team_ingress_reservation(event, commit=False)
                 raise
             except Exception:
+                self._finalize_team_ingress_reservation(event, commit=False)
                 logger.warning(
                     "[%s] Telegram team ingress raised; consuming message",
                     self.name,
@@ -9056,16 +9090,28 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return
             if not isinstance(consumed, bool):
+                self._finalize_team_ingress_reservation(event, commit=False)
                 logger.warning(
-                    "[%s] Telegram team ingress returned invalid decision %r; "
+                    "[%s] Telegram team ingress returned an invalid decision; "
                     "consuming message",
                     self.name,
-                    consumed,
                 )
                 return
             if consumed:
+                self._finalize_team_ingress_reservation(event, commit=False)
                 return
-        await super().handle_message(event)
+        try:
+            await super().handle_message(event)
+        except BaseException:
+            self._finalize_team_ingress_reservation(event, commit=False)
+            raise
+        else:
+            if getattr(event, "_telegram_team_ingress_reservation", None) is not None:
+                if not self._finalize_team_ingress_reservation(event, commit=True):
+                    logger.error(
+                        "[%s] Telegram team ingress reservation commit failed",
+                        self.name,
+                    )
 
     def _team_route_context(
         self,
@@ -9965,6 +10011,104 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=self._session_key_profile(event.source),
         )
 
+    def _telegram_batch_capability(self) -> object:
+        capability = self.__dict__.get("_telegram_batch_identity_capability")
+        if capability is None:
+            capability = object()
+            self._telegram_batch_identity_capability = capability
+        return capability
+
+    @staticmethod
+    def _telegram_event_message_id(event: MessageEvent) -> str | None:
+        raw_message = getattr(event, "raw_message", None)
+        source = getattr(event, "source", None)
+        raw_values = (
+            getattr(event, "message_id", None),
+            getattr(source, "message_id", None) if source is not None else None,
+            getattr(raw_message, "message_id", None) if raw_message is not None else None,
+        )
+        normalized = [
+            _normalize_message_id(value) for value in raw_values if value is not None
+        ]
+        if not normalized or any(value is None for value in normalized):
+            return None
+        first = normalized[0]
+        return first if all(value == first for value in normalized) else None
+
+    def _merge_telegram_batch_identity(
+        self,
+        target: MessageEvent,
+        incoming: MessageEvent | None = None,
+    ) -> bool:
+        """Atomically initialize or merge bounded internal constituent IDs."""
+        capability = self._telegram_batch_capability()
+
+        def _validated_ids(event: MessageEvent) -> tuple[str, ...] | None:
+            current_id = self._telegram_event_message_id(event)
+            raw_ids = getattr(event, "_telegram_batch_message_ids", None)
+            raw_capability = getattr(
+                event,
+                "_telegram_batch_identity_capability",
+                None,
+            )
+            if raw_ids is None and raw_capability is None:
+                return (current_id,) if current_id is not None else None
+            if raw_capability is not capability or not isinstance(raw_ids, (tuple, list)):
+                return None
+            if not raw_ids or len(raw_ids) > MAX_TELEGRAM_BATCH_MESSAGE_IDS:
+                return None
+            normalized_ids: list[str] = []
+            for value in raw_ids:
+                normalized_id = _normalize_message_id(value)
+                if normalized_id is None or normalized_id in normalized_ids:
+                    return None
+                normalized_ids.append(normalized_id)
+            if current_id is None or normalized_ids[0] != current_id:
+                return None
+            return tuple(normalized_ids)
+
+        target_ids = _validated_ids(target)
+        incoming_ids = _validated_ids(incoming) if incoming is not None else ()
+        if target_ids is None or incoming_ids is None:
+            # Synthetic legacy events without Telegram IDs remain batchable
+            # outside team mode. Real PTB updates always carry a message ID.
+            return (
+                target_ids is None
+                and self._telegram_event_message_id(target) is None
+                and (
+                    incoming is None
+                    or (
+                        incoming_ids is None
+                        and self._telegram_event_message_id(incoming) is None
+                    )
+                )
+                and getattr(self, "_team_ingress_handler", None) is None
+            )
+
+        merged_ids = list(target_ids)
+        for message_id in incoming_ids:
+            if message_id not in merged_ids:
+                merged_ids.append(message_id)
+        if len(merged_ids) > MAX_TELEGRAM_BATCH_MESSAGE_IDS:
+            return False
+        setattr(target, "_telegram_batch_message_ids", tuple(merged_ids))
+        setattr(target, "_telegram_batch_identity_capability", capability)
+        return True
+
+    def _isolated_telegram_batch_key(
+        self,
+        base_key: str,
+        event: MessageEvent,
+        existing_keys: Any,
+    ) -> str:
+        message_id = self._telegram_event_message_id(event) or str(id(event))
+        key = f"{base_key}:isolated:{message_id}"
+        suffix = 1
+        while key in existing_keys:
+            suffix += 1
+            key = f"{base_key}:isolated:{message_id}:{suffix}"
+        return key
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -9978,9 +10122,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         key = self._text_batch_key(event)
+        self._merge_telegram_batch_identity(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
         if existing is None:
+            event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            self._pending_text_batches[key] = event
+        elif not self._merge_telegram_batch_identity(existing, event):
+            key = self._isolated_telegram_batch_key(
+                key,
+                event,
+                self._pending_text_batches,
+            )
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
@@ -10104,8 +10257,16 @@ class TelegramAdapter(BasePlatformAdapter):
             self._hold_inbound_event(event, where="photo-enqueue")
             return
 
+        self._merge_telegram_batch_identity(event)
         existing = self._pending_photo_batches.get(batch_key)
         if existing is None:
+            self._pending_photo_batches[batch_key] = event
+        elif not self._merge_telegram_batch_identity(existing, event):
+            batch_key = self._isolated_telegram_batch_key(
+                batch_key,
+                event,
+                self._pending_photo_batches,
+            )
             self._pending_photo_batches[batch_key] = event
         else:
             existing.media_urls.extend(event.media_urls)
@@ -10431,8 +10592,17 @@ class TelegramAdapter(BasePlatformAdapter):
             self._hold_inbound_event(event, where="media-group-enqueue")
             return
 
+        media_group_id = f"{self._text_batch_key(event)}:album:{media_group_id}"
+        self._merge_telegram_batch_identity(event)
         existing = self._media_group_events.get(media_group_id)
         if existing is None:
+            self._media_group_events[media_group_id] = event
+        elif not self._merge_telegram_batch_identity(existing, event):
+            media_group_id = self._isolated_telegram_batch_key(
+                media_group_id,
+                event,
+                self._media_group_events,
+            )
             self._media_group_events[media_group_id] = event
         else:
             existing.media_urls.extend(event.media_urls)
