@@ -8993,8 +8993,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
                 if entity_type not in {"mention", "bot_command"}:
                     continue
-                offset = int(getattr(entity, "offset", -1))
-                length = int(getattr(entity, "length", 0))
+                try:
+                    offset = int(getattr(entity, "offset", -1))
+                    length = int(getattr(entity, "length", 0))
+                except (TypeError, ValueError):
+                    continue
                 if offset < 0 or length <= 0:
                     continue
                 entity_text = cls._telegram_entity_text(source_text, offset, length).strip()
@@ -9050,12 +9053,19 @@ class TelegramAdapter(BasePlatformAdapter):
             decision = callback(context)
         except Exception:
             logger.warning(
-                "[%s] Telegram team route gate raised; preserving legacy routing",
+                "[%s] Telegram team route gate raised; rejecting message",
                 self.name,
                 exc_info=True,
             )
-            return None
-        return decision if isinstance(decision, bool) else None
+            return False
+        if not isinstance(decision, bool):
+            logger.warning(
+                "[%s] Telegram team route gate returned invalid decision %r; rejecting message",
+                self.name,
+                decision,
+            )
+            return False
+        return decision
 
     @classmethod
     def _extract_bot_mention_usernames(cls, message: Message, self_username: str = "") -> set[str]:
@@ -9796,14 +9806,14 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if not self._should_process_message(msg, is_command=True):
-            return
         if not self._is_user_authorized_from_message(msg):
             logger.warning(
                 "[Telegram] Blocked unauthorized user %s in chat %s",
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            return
+        if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
 
