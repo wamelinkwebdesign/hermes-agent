@@ -22,7 +22,11 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    is_shared_multi_user_session,
+)
 
 
 UID = "8693894969"
@@ -208,6 +212,40 @@ class TestOwnerProfileKeying:
 
 
 class TestRootScopedSessionKeys:
+    def test_scoped_non_dm_is_shared_under_default_per_user_setting(self):
+        source = _team_source()
+
+        assert is_shared_multi_user_session(source) is True
+
+    def test_unscoped_non_dm_sharing_behavior_is_unchanged(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001234567890",
+            chat_type="group",
+            user_id="alice",
+        )
+
+        assert is_shared_multi_user_session(source) is False
+        assert (
+            is_shared_multi_user_session(source, group_sessions_per_user=False)
+            is True
+        )
+
+    def test_dm_with_scope_remains_single_user(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=UID,
+            chat_type="dm",
+            user_id=UID,
+            session_scope_id="telegram-team:-1001234567890:501",
+        )
+
+        assert is_shared_multi_user_session(source) is False
+        assert (
+            is_shared_multi_user_session(source, group_sessions_per_user=False)
+            is False
+        )
+
     def test_same_root_is_stable_and_different_roots_do_not_collide(self):
         root_501_a = build_session_key(_team_source(root_message_id="501"), profile="engineering")
         root_501_b = build_session_key(_team_source(root_message_id="501"), profile="engineering")

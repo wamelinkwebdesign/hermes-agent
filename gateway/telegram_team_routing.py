@@ -8,7 +8,7 @@ from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import ClassVar
+from typing import ClassVar, cast
 
 _PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _USERNAME_RE = re.compile(r"[A-Za-z0-9_]{5,32}\Z")
@@ -324,16 +324,42 @@ class TelegramTeamDispatcher:
         normalized_root_id = _normalize_message_id(root_message_id)
         if normalized_chat_id is None or normalized_root_id is None:
             return False
-        if (
-            isinstance(message_ids, (str, bytes, bytearray, Mapping))
-            or not isinstance(message_ids, Iterable)
-        ):
+
+        root_key = (normalized_chat_id, normalized_root_id)
+        with self._lock:
+            ownership = self._aliases.get(root_key)
+            family = self._families.get(root_key)
+            if (
+                ownership is None
+                or ownership.root_message_id != normalized_root_id
+                or family is None
+                or family.ownership != ownership
+            ):
+                return False
+
+        if isinstance(message_ids, (str, bytes, bytearray, Mapping)):
+            return False
+
+        try:
+            iterator = iter(cast(Iterable[object], message_ids))
+        except Exception:
             return False
 
         normalized_ids: list[str] = []
         seen_ids: set[str] = set()
-        for value in message_ids:
-            normalized_id = _normalize_message_id(value)
+        for attempt in range(self._max_aliases + 1):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                break
+            except Exception:
+                return False
+            if attempt == self._max_aliases:
+                return False
+            try:
+                normalized_id = _normalize_message_id(value)
+            except Exception:
+                return False
             if normalized_id is None:
                 return False
             if normalized_id not in seen_ids:
@@ -342,11 +368,12 @@ class TelegramTeamDispatcher:
         if not normalized_ids:
             return False
 
-        root_key = (normalized_chat_id, normalized_root_id)
         message_keys = [(normalized_chat_id, message_id) for message_id in normalized_ids]
         with self._lock:
-            ownership = self._aliases.get(root_key)
-            if ownership is None or ownership.root_message_id != normalized_root_id:
+            if (
+                self._aliases.get(root_key) != ownership
+                or self._families.get(root_key) is not family
+            ):
                 return False
             return self._record_aliases_locked(root_key, ownership, message_keys)
 

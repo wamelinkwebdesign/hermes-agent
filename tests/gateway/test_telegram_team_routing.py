@@ -588,3 +588,169 @@ def test_alias_batch_larger_than_capacity_fails_without_evicting_existing_roots(
         owner_profile="engineering",
     )
     assert dispatcher.resolve_reply_owner(-1001, 301) is None
+
+
+def test_oversized_outbound_iterable_consumes_at_most_max_aliases_plus_one():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=3)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    class CountingIterator:
+        def __init__(self):
+            self.next_calls = 0
+            self._values = iter(range(301, 310))
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            return next(self._values)
+
+    message_ids = CountingIterator()
+
+    assert dispatcher.record_outbound_alias(-1001, message_ids, 100) is False
+    assert message_ids.next_calls == 4
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+    assert dispatcher.record_outbound_alias(-1001, [301], 100) is True
+
+
+def test_infinite_duplicate_outbound_iterable_stops_at_total_attempt_bound():
+    dispatcher = _dispatcher(max_aliases=3)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    class GuardedInfiniteDuplicates:
+        def __init__(self):
+            self.next_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self.next_calls > 4:
+                raise AssertionError("outbound alias iterator was over-consumed")
+            return 301
+
+    message_ids = GuardedInfiniteDuplicates()
+
+    assert dispatcher.record_outbound_alias(-1001, message_ids, 100) is False
+    assert message_ids.next_calls == 4
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+
+
+def test_outbound_iterator_construction_exception_fails_closed():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=3)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    class RaisingIterable:
+        def __iter__(self):
+            raise RuntimeError("iterator unavailable")
+
+    assert dispatcher.record_outbound_alias(-1001, RaisingIterable(), 100) is False
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+    assert dispatcher.record_outbound_alias(-1001, [301], 100) is True
+
+
+def test_outbound_iteration_exception_is_atomic_and_later_batch_works():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=3)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    class RaisingIterator:
+        def __init__(self):
+            self.next_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self.next_calls == 1:
+                return 301
+            raise RuntimeError("iteration failed")
+
+    message_ids = RaisingIterator()
+
+    assert dispatcher.record_outbound_alias(-1001, message_ids, 100) is False
+    assert message_ids.next_calls == 2
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+    assert dispatcher.record_outbound_alias(-1001, [301], 100) is True
+
+
+def test_unknown_outbound_root_does_not_construct_user_iterator():
+    dispatcher = _dispatcher(max_aliases=3)
+
+    class IteratorProbe:
+        def __init__(self):
+            self.iter_calls = 0
+
+        def __iter__(self):
+            self.iter_calls += 1
+            return iter([301])
+
+    message_ids = IteratorProbe()
+
+    assert dispatcher.record_outbound_alias(-1001, message_ids, 999) is False
+    assert message_ids.iter_calls == 0
+
+
+def test_outbound_batch_revalidates_root_family_before_commit():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=2)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+
+    class ReplacingIterator:
+        def __init__(self):
+            self._replaced = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._replaced:
+                raise StopIteration
+            self._replaced = True
+            assert dispatcher.record_root(-1001, 200, "design-team") is True
+            assert dispatcher.record_root(-1001, 300, "default") is True
+            assert dispatcher.record_root(-1001, 100, "engineering") is True
+            return 301
+
+    assert dispatcher.record_outbound_alias(-1001, ReplacingIterator(), 100) is False
+    assert dispatcher.resolve_reply_owner(-1001, 301) is None
+    assert dispatcher.resolve_reply_owner(-1001, 100) == module.RootOwnership(
+        root_message_id="100",
+        owner_profile="engineering",
+    )
+
+
+def test_rejected_outbound_batch_does_not_reorder_root_families():
+    module = _routing_module()
+    dispatcher = _dispatcher(max_aliases=2)
+    assert dispatcher.record_root(-1001, 100, "engineering") is True
+    assert dispatcher.record_root(-1001, 200, "design-team") is True
+
+    assert dispatcher.record_outbound_alias(-1001, [301, 302, 303], 100) is False
+    assert dispatcher.record_root(-1001, 300, "default") is True
+
+    assert dispatcher.resolve_reply_owner(-1001, 100) is None
+    assert dispatcher.resolve_reply_owner(-1001, 200) == module.RootOwnership(
+        root_message_id="200",
+        owner_profile="design-team",
+    )
+    assert dispatcher.resolve_reply_owner(-1001, 300) == module.RootOwnership(
+        root_message_id="300",
+        owner_profile="default",
+    )

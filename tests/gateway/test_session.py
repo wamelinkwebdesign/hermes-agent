@@ -255,6 +255,25 @@ class TestBuildSessionContextPrompt:
 
         assert "current turn's sender prefix" not in prompt
 
+    def test_scoped_telegram_group_prompt_is_multi_user_by_default(self):
+        config = GatewayConfig()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001234567890",
+            chat_name="Team Room",
+            chat_type="group",
+            user_id="12345",
+            user_name="Alice",
+            session_scope_id="telegram-team:-1001234567890:501",
+        )
+
+        context = build_session_context(source, config)
+        prompt = build_session_context_prompt(context)
+
+        assert context.shared_multi_user_session is True
+        assert "**Session type:** Multi-user session" in prompt
+        assert "**User:**" not in prompt
+
 
     def test_local_delivery_path_uses_display_hermes_home(self):
         config = GatewayConfig()

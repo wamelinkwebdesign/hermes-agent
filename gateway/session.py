@@ -1096,12 +1096,15 @@ def is_shared_multi_user_session(
 
     Mirrors the isolation rules in :func:`build_session_key`:
       - DMs are never shared.
+      - Scoped non-DM roots are always shared across participants.
       - Threads are shared unless ``thread_sessions_per_user`` is True.
       - Non-thread group/channel sessions are shared unless
         ``group_sessions_per_user`` is True (default: True = isolated).
     """
     if source.chat_type == "dm":
         return False
+    if source.session_scope_id:
+        return True
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
