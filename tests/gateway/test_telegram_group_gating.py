@@ -522,6 +522,120 @@ def test_bot_self_messages_are_ignored_in_dm_and_group():
     assert adapter._should_process_message(self_group) is False
 
 
+def test_team_route_gate_receives_current_message_routing_context_only():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    adapter.set_owner_profile("engineering")
+    contexts = []
+    adapter.set_team_route_gate(lambda context: contexts.append(context) or False)
+
+    current_text = "@Woz_Bot please handle this"
+    message = _group_message(
+        current_text,
+        chat_id=-100,
+        entities=[_mention_entity(current_text, "@Woz_Bot")],
+    )
+    message.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=321, username="Human_User"),
+        text="historical quote for @Ace_Bot and @Virgil_Bot",
+        caption=None,
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context.mentions == frozenset({"woz_bot"})
+    assert context.reply_author_username == "human_user"
+    assert context.chat_id == "-100"
+    assert context.owner_profile == "engineering"
+    assert context.owner_username == "hermes_bot"
+
+
+def test_team_route_gate_extracts_entityless_current_caption_mentions():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    contexts = []
+    adapter.set_team_route_gate(lambda context: contexts.append(context) or False)
+    message = _group_message(None, chat_id=-100, caption="photo for @Virgil_Bot")
+
+    assert adapter._should_process_message(message) is False
+    assert contexts[0].mentions == frozenset({"virgil_bot"})
+
+
+def test_team_route_gate_false_precedes_legacy_group_acceptance_fallbacks():
+    cases = [
+        (
+            _make_adapter(
+                require_mention=True,
+                allowed_chats=["-100"],
+                free_response_chats=["-100"],
+            ),
+            _group_message("unaddressed", chat_id=-100),
+        ),
+        (
+            _make_adapter(require_mention=True, allowed_chats=["-100"]),
+            _group_message("reply", chat_id=-100, reply_to_bot=True),
+        ),
+        (
+            _make_adapter(
+                require_mention=True,
+                allowed_chats=["-100"],
+                mention_patterns=[r"^chompy\\b"],
+            ),
+            _group_message("chompy status", chat_id=-100),
+        ),
+    ]
+
+    for adapter, message in cases:
+        adapter.set_team_route_gate(lambda context: False)
+        assert adapter._should_process_message(message) is False
+
+
+def test_team_route_gate_true_precedes_exclusive_foreign_bot_mention_fallback():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        exclusive_bot_mentions=True,
+        bot_username="ace_bot",
+    )
+    adapter.set_team_route_gate(lambda context: True)
+
+    assert adapter._should_process_message(
+        _group_message("@Foreign_Bot take this", chat_id=-100)
+    ) is True
+
+
+def test_team_route_gate_none_preserves_legacy_routing():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    adapter.set_team_route_gate(lambda context: None)
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-100)) is False
+    assert adapter._should_process_message(
+        _group_message("reply", chat_id=-100, reply_to_bot=True)
+    ) is True
+
+
+def test_team_route_gate_does_not_override_early_dm_topic_or_own_message_gates():
+    adapter = _make_adapter(
+        require_mention=False,
+        allowed_chats=["-100"],
+        allowed_topics=["8", "9"],
+        ignored_threads=[9],
+    )
+    gate = Mock(return_value=True)
+    adapter.set_team_route_gate(gate)
+
+    assert adapter._should_process_message(_dm_message("hello")) is True
+    assert adapter._should_process_message(
+        _group_message("wrong topic", chat_id=-100, thread_id=7)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("ignored", chat_id=-100, thread_id=9)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("self", chat_id=-100, thread_id=8, from_user_id=999)
+    ) is False
+    gate.assert_not_called()
+
+
 def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()

@@ -452,6 +452,7 @@ from gateway.platforms.helpers import (
     compile_mention_patterns,
     convert_table_to_bullets as _wrap_markdown_tables,
 )
+from gateway.telegram_team_routing import TelegramTeamRouteContext
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +673,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
+        self._team_route_gate: Optional[
+            Callable[[TelegramTeamRouteContext], Optional[bool]]
+        ] = None
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
@@ -8971,6 +8975,89 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
 
     @classmethod
+    def _extract_team_route_mentions(cls, message: Any) -> frozenset[str]:
+        """Extract current text/caption @usernames for deterministic team routing.
+
+        Telegram entities are authoritative. Raw scanning is used only for a
+        text/caption source with no entities, and quoted ``reply_to_message``
+        content is deliberately never inspected.
+        """
+        mentions: set[str] = set()
+
+        def _iter_sources():
+            yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
+            yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
+
+        for source_text, entities in _iter_sources():
+            for entity in entities:
+                entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+                if entity_type not in {"mention", "bot_command"}:
+                    continue
+                offset = int(getattr(entity, "offset", -1))
+                length = int(getattr(entity, "length", 0))
+                if offset < 0 or length <= 0:
+                    continue
+                entity_text = cls._telegram_entity_text(source_text, offset, length).strip()
+                if entity_type == "bot_command":
+                    at_index = entity_text.find("@")
+                    if at_index < 0:
+                        continue
+                    entity_text = entity_text[at_index:]
+                username = entity_text.lstrip("@").lower()
+                if re.fullmatch(r"[a-z0-9_]{5,32}", username):
+                    mentions.add(username)
+
+        for source_text, entities in _iter_sources():
+            if not source_text or entities:
+                continue
+            for match in re.finditer(
+                r"(?i)(?<![A-Za-z0-9_`/])@([A-Za-z0-9_]{5,32})\b",
+                source_text,
+            ):
+                mentions.add(match.group(1).lower())
+
+        return frozenset(mentions)
+
+    def set_team_route_gate(
+        self,
+        callback: Optional[Callable[[TelegramTeamRouteContext], Optional[bool]]],
+    ) -> None:
+        """Register a runner-owned deterministic Telegram team route gate."""
+        self._team_route_gate = callback
+
+    def _team_route_gate_decision(
+        self,
+        message: Any,
+        chat_id: str,
+    ) -> Optional[bool]:
+        callback = getattr(self, "_team_route_gate", None)
+        if callback is None:
+            return None
+        reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
+        reply_username = getattr(reply_user, "username", None)
+        if isinstance(reply_username, str):
+            reply_username = reply_username.lstrip("@").lower() or None
+        else:
+            reply_username = None
+        context = TelegramTeamRouteContext(
+            mentions=self._extract_team_route_mentions(message),
+            reply_author_username=reply_username,
+            chat_id=chat_id,
+            owner_profile=getattr(self, "_owner_profile", None) or "default",
+            owner_username=self._current_bot_username(),
+        )
+        try:
+            decision = callback(context)
+        except Exception:
+            logger.warning(
+                "[%s] Telegram team route gate raised; preserving legacy routing",
+                self.name,
+                exc_info=True,
+            )
+            return None
+        return decision if isinstance(decision, bool) else None
+
+    @classmethod
     def _extract_bot_mention_usernames(cls, message: Message, self_username: str = "") -> set[str]:
         """Extract explicit Telegram bot usernames mentioned in text/captions.
 
@@ -9602,9 +9689,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
-        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
-            return False
-
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.
         guest_mention = self._is_guest_mention(message)
@@ -9615,6 +9699,13 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
             return guest_mention
+
+        team_route_decision = self._team_route_gate_decision(message, chat_id_str)
+        if team_route_decision is not None:
+            return team_route_decision
+
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+            return False
 
         if guest_mention:
             return True
