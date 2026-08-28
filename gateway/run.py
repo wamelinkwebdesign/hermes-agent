@@ -16457,28 +16457,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 return True
             try:
-                routed_ownership = dispatcher.resolve_reply_owner(
+                routed_ownership_verified = dispatcher.verify_routed_ownership(
                     raw_chat_id,
                     root_message_id,
+                    profile,
+                    constituent_ids,
                 )
             except Exception:
                 return True
-            if (
-                routed_ownership is None
-                or routed_ownership.root_message_id != root_message_id
-                or routed_ownership.owner_profile != profile
-            ):
+            if not routed_ownership_verified:
                 return True
             return False
 
         try:
-            current_ownership = dispatcher.resolve_reply_owner(
+            constituent_ownership = dispatcher.inspect_constituent_ownership(
                 raw_chat_id,
-                context.message_id,
+                constituent_ids,
             )
         except Exception:
             return True
-        if current_ownership is not None:
+        if constituent_ownership.status != "none":
             return True
 
         reservation_attempt = dispatcher.reserve_ingress_batch(
@@ -16533,8 +16531,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 owner_profile = decision.owner_profile
                 route_reason = decision.reason
                 if route_reason == "unaddressed_ingress":
-                    from gateway.telegram_team_classifier import classify_new_root
-                    from gateway.telegram_team_context import collect_team_context
+                    from gateway.telegram_team_classifier import (
+                        ClassificationDecision,
+                        classify_new_root,
+                    )
+                    from gateway.telegram_team_context import (
+                        TeamContextSafety,
+                        collect_team_context,
+                        redact_team_classifier_text,
+                    )
 
                     classification_source = dataclasses.replace(
                         source,
@@ -16548,17 +16553,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         classification_source
                     )
                     with _profile_runtime_scope(profile_home):
-                        context_text = await asyncio.to_thread(
-                            collect_team_context,
-                            self.session_store,
-                            classification_source,
-                            root_message_id,
-                        )
-                        classification = await classify_new_root(
-                            event.text,
-                            context=context_text,
-                            config=team_config,
-                        )
+                        classifier_text = redact_team_classifier_text(event.text)
+                        if classifier_text is None:
+                            classification = ClassificationDecision(
+                                "clarify",
+                                reason="invalid_input",
+                            )
+                        else:
+                            context_safety = TeamContextSafety()
+                            context_text = await asyncio.to_thread(
+                                collect_team_context,
+                                self.session_store,
+                                classification_source,
+                                root_message_id,
+                                reply_to_message_id=event.reply_to_message_id,
+                                reply_to_text=event.reply_to_text,
+                                raw_reply_to_message_id=getattr(
+                                    getattr(raw_message, "reply_to_message", None),
+                                    "message_id",
+                                    None,
+                                ),
+                                safety=context_safety,
+                            )
+                            if context_safety.redaction_failed:
+                                classification = ClassificationDecision(
+                                    "clarify",
+                                    reason="invalid_input",
+                                )
+                            else:
+                                classification = await classify_new_root(
+                                    classifier_text,
+                                    context=context_text,
+                                    config=team_config,
+                                )
 
                     classification_kind = getattr(classification, "decision", None)
                     classified_profile = getattr(classification, "profile", None)
@@ -16589,6 +16616,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             else "semantic_clarify"
                         )
 
+                owner_profile = cast(str, owner_profile)
+                if semantic_target_adapter is None:
+                    # Prepare the local source before publishing durable ownership.
+                    # A hostile source setter must release cleanly without leaving
+                    # an undeliverable root that suppresses the valid retry.
+                    source.profile = owner_profile
+                    source.session_scope_id = (
+                        f"telegram-team:{raw_chat_id}:{root_message_id}"
+                    )
                 if not dispatcher.record_root_batch(
                     raw_chat_id,
                     root_message_id,
@@ -16598,6 +16634,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return True
 
             owner_profile = cast(str, owner_profile)
+            if semantic_target_adapter is None:
+                expected_scope = f"telegram-team:{raw_chat_id}:{root_message_id}"
+                if source.profile != owner_profile:
+                    source.profile = owner_profile
+                if source.session_scope_id != expected_scope:
+                    source.session_scope_id = expected_scope
             prepared_metadata = dict(metadata)
             prepared_metadata.update({
                 "telegram_team_root_message_id": root_message_id,
@@ -16644,8 +16686,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await semantic_target_adapter.handle_message(routed_event)
                 return True
 
-            source.profile = owner_profile
-            source.session_scope_id = f"telegram-team:{raw_chat_id}:{root_message_id}"
             setattr(event, "_telegram_team_ingress_dispatcher", dispatcher)
             setattr(event, "_telegram_team_ingress_reservation", reservation)
             reservation = None

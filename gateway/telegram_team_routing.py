@@ -8,7 +8,7 @@ from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import ClassVar, cast
+from typing import ClassVar, Literal, cast
 
 _PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _USERNAME_RE = re.compile(r"[A-Za-z0-9_]{5,32}\Z")
@@ -220,6 +220,14 @@ class RootOwnership:
     owner_profile: str
 
 
+@dataclass(frozen=True)
+class ConstituentOwnershipResult:
+    """Atomic ownership preflight result for one bounded ingress batch."""
+
+    status: Literal["invalid", "none", "same", "partial", "conflict"]
+    ownership: RootOwnership | None = None
+
+
 @dataclass
 class _RootFamily:
     ownership: RootOwnership
@@ -308,6 +316,22 @@ class TelegramTeamDispatcher:
         keys = tuple((normalized_chat_id, message_id) for message_id in normalized_ids)
         with self._lock:
             for key in keys:
+                bound_ownership = self._aliases.get(key)
+                if bound_ownership is not None:
+                    root_key = (normalized_chat_id, bound_ownership.root_message_id)
+                    family = self._families.get(root_key)
+                    if (
+                        self._aliases.get(root_key) != bound_ownership
+                        or family is None
+                        or family.ownership != bound_ownership
+                        or key not in family.aliases
+                    ):
+                        return rejected
+                    return IngressReservationResult(
+                        False,
+                        True,
+                        bound_ownership.owner_profile,
+                    )
                 committed_profile = self._claims.get(key)
                 if committed_profile is not None:
                     return IngressReservationResult(
@@ -401,6 +425,92 @@ class TelegramTeamDispatcher:
             claimed=False,
             duplicate=attempt.duplicate,
             adapter_profile=attempt.adapter_profile,
+        )
+
+    def inspect_constituent_ownership(
+        self,
+        chat_id: object,
+        message_ids: object,
+    ) -> ConstituentOwnershipResult:
+        """Atomically inspect every bounded constituent without mutating state."""
+        invalid = ConstituentOwnershipResult("invalid")
+        normalized_chat_id = _normalize_group_chat_id(chat_id)
+        if normalized_chat_id is None or isinstance(
+            message_ids, (str, bytes, bytearray, Mapping)
+        ):
+            return invalid
+        try:
+            iterator = iter(cast(Iterable[object], message_ids))
+        except Exception:
+            return invalid
+
+        normalized_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for attempt in range(MAX_TELEGRAM_BATCH_MESSAGE_IDS + 1):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                break
+            except Exception:
+                return invalid
+            if attempt == MAX_TELEGRAM_BATCH_MESSAGE_IDS:
+                return invalid
+            try:
+                normalized_id = _normalize_message_id(value)
+            except Exception:
+                return invalid
+            if normalized_id is None:
+                return invalid
+            if normalized_id not in seen_ids:
+                normalized_ids.append(normalized_id)
+                seen_ids.add(normalized_id)
+        if not normalized_ids:
+            return invalid
+
+        keys = tuple((normalized_chat_id, message_id) for message_id in normalized_ids)
+        with self._lock:
+            ownerships: list[RootOwnership] = []
+            for key in keys:
+                ownership = self._aliases.get(key)
+                if ownership is None:
+                    continue
+                root_key = (normalized_chat_id, ownership.root_message_id)
+                family = self._families.get(root_key)
+                if (
+                    self._aliases.get(root_key) != ownership
+                    or family is None
+                    or family.ownership != ownership
+                    or key not in family.aliases
+                ):
+                    return invalid
+                ownerships.append(ownership)
+
+            if not ownerships:
+                return ConstituentOwnershipResult("none")
+            first = ownerships[0]
+            if any(ownership != first for ownership in ownerships[1:]):
+                return ConstituentOwnershipResult("conflict")
+            status: Literal["same", "partial"] = (
+                "same" if len(ownerships) == len(keys) else "partial"
+            )
+            return ConstituentOwnershipResult(status, first)
+
+    def verify_routed_ownership(
+        self,
+        chat_id: object,
+        root_message_id: object,
+        owner_profile: object,
+        message_ids: object,
+    ) -> bool:
+        """Verify a routed event's complete constituent binding from one snapshot."""
+        normalized_root_id = _normalize_message_id(root_message_id)
+        normalized_profile = _normalize_profile(owner_profile)
+        if normalized_root_id is None or normalized_profile is None:
+            return False
+        result = self.inspect_constituent_ownership(chat_id, message_ids)
+        return result.status == "same" and result.ownership == RootOwnership(
+            normalized_root_id,
+            normalized_profile,
         )
 
     def record_root(

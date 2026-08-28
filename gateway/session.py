@@ -3713,6 +3713,23 @@ class SessionStore:
             self._ensure_loaded_locked()
             return self._entries.get(session_key)
 
+    def lookup_loaded_session_by_key(
+        self,
+        session_key: str,
+    ) -> Optional[SessionEntry]:
+        """Read one exact entry only when routing state is already loaded.
+
+        Unlike ``lookup_by_session_key``, this accessor is safe for auxiliary
+        read-only paths: it never initializes, reconciles, scans, recovers,
+        prunes, reopens, creates directories, or persists routing state.
+        """
+        if type(session_key) is not str or not session_key:
+            return None
+        with self._lock:
+            if self._loaded is not True:
+                return None
+            return self._entries.get(session_key)
+
     def peek_session_id(self, session_key: str) -> Optional[str]:
         """Return the persisted session_id currently bound to a session key.
 

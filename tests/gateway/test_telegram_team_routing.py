@@ -5,15 +5,17 @@ from __future__ import annotations
 import importlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+from types import ModuleType
 
 import pytest
 
 
-def _routing_module():
+def _routing_module() -> ModuleType:
     try:
         return importlib.import_module("gateway.telegram_team_routing")
     except ModuleNotFoundError:
         pytest.fail("gateway.telegram_team_routing is not implemented", pytrace=False)
+        raise AssertionError("unreachable")
 
 
 def _valid_raw() -> dict[str, object]:
@@ -479,6 +481,129 @@ def test_ingress_batch_reservation_blocks_duplicates_then_release_allows_retry()
     assert replay.reserved is False
     assert replay.duplicate is True
     assert replay.adapter_profile == "design-team"
+
+
+def test_constituent_ownership_preflight_distinguishes_none_same_partial_and_conflict():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+    assert dispatcher.record_root_batch(-1001, 100, "engineering", [100, 101])
+    assert dispatcher.record_root_batch(-1001, 200, "design-team", [200, 201])
+
+    assert dispatcher.inspect_constituent_ownership(-1001, [300, 301]) == (
+        module.ConstituentOwnershipResult("none")
+    )
+    assert dispatcher.inspect_constituent_ownership(-1001, [100, 101]) == (
+        module.ConstituentOwnershipResult(
+            "same",
+            module.RootOwnership("100", "engineering"),
+        )
+    )
+    assert dispatcher.inspect_constituent_ownership(-1001, [300, 101]) == (
+        module.ConstituentOwnershipResult(
+            "partial",
+            module.RootOwnership("100", "engineering"),
+        )
+    )
+    assert dispatcher.inspect_constituent_ownership(-1001, [101, 201]) == (
+        module.ConstituentOwnershipResult("conflict")
+    )
+
+
+def test_constituent_ownership_preflight_rejects_malformed_and_duplicate_heavy_ids():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+    assert dispatcher.record_root(-1001, 100, "engineering")
+    invalid = module.ConstituentOwnershipResult("invalid")
+
+    assert dispatcher.inspect_constituent_ownership(-1001, [100, 0]) == invalid
+    assert dispatcher.inspect_constituent_ownership(-1001, "100") == invalid
+    assert dispatcher.inspect_constituent_ownership("not-a-chat", [100]) == invalid
+
+    class DuplicateHeavy:
+        def __init__(self):
+            self.next_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self.next_calls > module.MAX_TELEGRAM_BATCH_MESSAGE_IDS + 1:
+                raise AssertionError("preflight over-consumed hostile iterable")
+            return 100
+
+    duplicate_heavy = DuplicateHeavy()
+    assert dispatcher.inspect_constituent_ownership(-1001, duplicate_heavy) == invalid
+    assert duplicate_heavy.next_calls == module.MAX_TELEGRAM_BATCH_MESSAGE_IDS + 1
+
+
+def test_ingress_reservation_rechecks_ownership_after_unbound_preflight():
+    module = _routing_module()
+    dispatcher = _dispatcher()
+    assert dispatcher.inspect_constituent_ownership(-1001, [300, 301]) == (
+        module.ConstituentOwnershipResult("none")
+    )
+    assert dispatcher.record_root_batch(-1001, 100, "engineering", [100, 301])
+
+    attempt = dispatcher.reserve_ingress_batch(-1001, [300, 301], "default")
+
+    assert attempt.reserved is False
+    assert attempt.duplicate is True
+    assert attempt.adapter_profile == "engineering"
+    assert attempt.reservation is None
+
+
+def test_routed_ownership_verification_requires_exact_complete_binding():
+    dispatcher = _dispatcher()
+    assert dispatcher.record_root_batch(-1001, 100, "engineering", [100, 101])
+    assert dispatcher.record_root_batch(-1001, 200, "design-team", [200, 201])
+
+    assert dispatcher.verify_routed_ownership(
+        -1001,
+        100,
+        "engineering",
+        [100, 101],
+    )
+    assert not dispatcher.verify_routed_ownership(
+        -1001,
+        100,
+        "engineering",
+        [100, 300],
+    )
+    assert not dispatcher.verify_routed_ownership(
+        -1001,
+        100,
+        "engineering",
+        [100, 201],
+    )
+    assert not dispatcher.verify_routed_ownership(
+        -1001,
+        200,
+        "engineering",
+        [100, 101],
+    )
+    assert not dispatcher.verify_routed_ownership(
+        -2002,
+        100,
+        "engineering",
+        [100, 101],
+    )
+
+
+@pytest.mark.parametrize(
+    "message_ids",
+    [[], "100", [100, 0], list(range(1, 66))],
+)
+def test_routed_ownership_verification_rejects_malformed_constituents(message_ids):
+    dispatcher = _dispatcher()
+    assert dispatcher.record_root(-1001, 100, "engineering")
+
+    assert not dispatcher.verify_routed_ownership(
+        -1001,
+        100,
+        "engineering",
+        message_ids,
+    )
 
 
 def test_ingress_reservation_requires_exact_opaque_identity_and_dispatcher():
