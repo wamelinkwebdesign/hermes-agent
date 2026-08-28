@@ -22,6 +22,7 @@ _MAX_MESSAGE_ID_LENGTH = len(str(_MAX_MESSAGE_ID))
 
 _DEFAULT_MAX_CLAIMS = 4096
 _DEFAULT_MAX_ALIASES = 8192
+_DEFAULT_MAX_ROUTED_GRANTS = 4096
 MAX_TELEGRAM_BATCH_MESSAGE_IDS = 64
 
 
@@ -212,6 +213,27 @@ class IngressReservationResult:
     )
 
 
+@dataclass(frozen=True, eq=False, repr=False)
+class RoutedAuthorizationGrant:
+    """Opaque single-use authority for one exact internally routed event."""
+
+    _dispatcher_identity: object
+    _nonce: object
+
+    def __repr__(self) -> str:
+        return "<RoutedAuthorizationGrant>"
+
+
+@dataclass(frozen=True)
+class _RoutedAuthorizationBinding:
+    chat_id: str
+    root_message_id: str
+    owner_profile: str
+    current_message_id: str
+    constituent_message_ids: tuple[str, ...]
+    target_adapter_capability: object = field(repr=False, compare=False)
+
+
 @dataclass(frozen=True)
 class RootOwnership:
     """Canonical Telegram root message and the profile that owns its replies."""
@@ -248,6 +270,7 @@ class TelegramTeamDispatcher:
         self,
         max_claims: int = _DEFAULT_MAX_CLAIMS,
         max_aliases: int = _DEFAULT_MAX_ALIASES,
+        max_routed_grants: int = _DEFAULT_MAX_ROUTED_GRANTS,
     ) -> None:
         if (
             isinstance(max_claims, bool)
@@ -261,13 +284,25 @@ class TelegramTeamDispatcher:
             or max_aliases <= 0
         ):
             raise ValueError("max_aliases must be a positive integer")
+        if (
+            isinstance(max_routed_grants, bool)
+            or not isinstance(max_routed_grants, int)
+            or max_routed_grants <= 0
+        ):
+            raise ValueError("max_routed_grants must be a positive integer")
 
         self._max_claims = max_claims
         self._max_aliases = max_aliases
+        self._max_routed_grants = max_routed_grants
         self._lock = threading.Lock()
         self._reservation_identity = object()
+        self._routed_grant_identity = object()
         self._claims: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._pending_reservations: dict[tuple[str, str], IngressReservation] = {}
+        self._routed_grants: OrderedDict[
+            RoutedAuthorizationGrant,
+            _RoutedAuthorizationBinding,
+        ] = OrderedDict()
         self._aliases: dict[tuple[str, str], RootOwnership] = {}
         self._families: OrderedDict[tuple[str, str], _RootFamily] = OrderedDict()
 
@@ -426,6 +461,148 @@ class TelegramTeamDispatcher:
             duplicate=attempt.duplicate,
             adapter_profile=attempt.adapter_profile,
         )
+
+    @staticmethod
+    def _normalize_routed_constituents(
+        message_ids: object,
+        current_message_id: str,
+    ) -> tuple[str, ...] | None:
+        if isinstance(message_ids, (str, bytes, bytearray, Mapping)):
+            return None
+        try:
+            iterator = iter(cast(Iterable[object], message_ids))
+        except Exception:
+            return None
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for attempt in range(MAX_TELEGRAM_BATCH_MESSAGE_IDS + 1):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                break
+            except Exception:
+                return None
+            if attempt == MAX_TELEGRAM_BATCH_MESSAGE_IDS:
+                return None
+            try:
+                message_id = _normalize_message_id(value)
+            except Exception:
+                return None
+            if message_id is None or message_id in seen:
+                return None
+            normalized.append(message_id)
+            seen.add(message_id)
+        if not normalized or normalized[0] != current_message_id:
+            return None
+        return tuple(normalized)
+
+    def _normalize_routed_binding(
+        self,
+        *,
+        chat_id: object,
+        root_message_id: object,
+        owner_profile: object,
+        current_message_id: object,
+        constituent_message_ids: object,
+        target_adapter_capability: object,
+    ) -> _RoutedAuthorizationBinding | None:
+        normalized_chat_id = _normalize_group_chat_id(chat_id)
+        normalized_root_id = _normalize_message_id(root_message_id)
+        normalized_profile = _normalize_profile(owner_profile)
+        normalized_current_id = _normalize_message_id(current_message_id)
+        if (
+            normalized_chat_id is None
+            or normalized_root_id is None
+            or normalized_profile is None
+            or normalized_current_id is None
+            or type(target_adapter_capability) is not object
+        ):
+            return None
+        normalized_constituents = self._normalize_routed_constituents(
+            constituent_message_ids,
+            normalized_current_id,
+        )
+        if normalized_constituents is None:
+            return None
+        return _RoutedAuthorizationBinding(
+            normalized_chat_id,
+            normalized_root_id,
+            normalized_profile,
+            normalized_current_id,
+            normalized_constituents,
+            target_adapter_capability,
+        )
+
+    def issue_routed_authorization(
+        self,
+        *,
+        chat_id: object,
+        root_message_id: object,
+        owner_profile: object,
+        current_message_id: object,
+        constituent_message_ids: object,
+        target_adapter_capability: object,
+    ) -> RoutedAuthorizationGrant | None:
+        """Issue one bounded opaque grant after fully validating its binding."""
+        binding = self._normalize_routed_binding(
+            chat_id=chat_id,
+            root_message_id=root_message_id,
+            owner_profile=owner_profile,
+            current_message_id=current_message_id,
+            constituent_message_ids=constituent_message_ids,
+            target_adapter_capability=target_adapter_capability,
+        )
+        if binding is None:
+            return None
+        grant = RoutedAuthorizationGrant(self._routed_grant_identity, object())
+        with self._lock:
+            self._routed_grants[grant] = binding
+            while len(self._routed_grants) > self._max_routed_grants:
+                self._routed_grants.popitem(last=False)
+        return grant
+
+    def consume_routed_authorization(
+        self,
+        grant: object,
+        *,
+        chat_id: object,
+        root_message_id: object,
+        owner_profile: object,
+        current_message_id: object,
+        constituent_message_ids: object,
+        target_adapter_capability: object,
+    ) -> bool:
+        """Atomically consume only an exact, live routed-event grant."""
+        if (
+            not isinstance(grant, RoutedAuthorizationGrant)
+            or grant._dispatcher_identity is not self._routed_grant_identity
+        ):
+            return False
+        binding = self._normalize_routed_binding(
+            chat_id=chat_id,
+            root_message_id=root_message_id,
+            owner_profile=owner_profile,
+            current_message_id=current_message_id,
+            constituent_message_ids=constituent_message_ids,
+            target_adapter_capability=target_adapter_capability,
+        )
+        if binding is None:
+            return False
+        with self._lock:
+            expected = self._routed_grants.get(grant)
+            if (
+                expected is None
+                or expected.chat_id != binding.chat_id
+                or expected.root_message_id != binding.root_message_id
+                or expected.owner_profile != binding.owner_profile
+                or expected.current_message_id != binding.current_message_id
+                or expected.constituent_message_ids != binding.constituent_message_ids
+                or expected.target_adapter_capability is not target_adapter_capability
+            ):
+                return False
+            del self._routed_grants[grant]
+            return True
 
     def inspect_constituent_ownership(
         self,

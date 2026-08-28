@@ -164,6 +164,10 @@ def _raw_message(
     reply_to_message_id: int | None = None,
     reply_author_username: str = "Human_User",
     reply_text: str = "quoted historical text with @Ace_Bot",
+    reply_chat_id: int | None = None,
+    reply_thread_id: int | None = 77,
+    reply_from_is_bot: bool = False,
+    external_reply: object = None,
 ) -> SimpleNamespace:
     reply = None
     if reply_to_message_id is not None:
@@ -173,9 +177,16 @@ def _raw_message(
                 id=999,
                 username=reply_author_username,
                 full_name="Reply Author",
+                is_bot=reply_from_is_bot,
             ),
             text=reply_text,
             caption=None,
+            chat=SimpleNamespace(
+                id=chat_id if reply_chat_id is None else reply_chat_id,
+                type=chat_type,
+            ),
+            message_thread_id=reply_thread_id,
+            external_reply=None,
         )
     return SimpleNamespace(
         message_id=message_id,
@@ -199,6 +210,7 @@ def _raw_message(
             is_bot=False,
         ),
         reply_to_message=reply,
+        external_reply=external_reply,
         date=datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
     )
 
@@ -214,6 +226,10 @@ def _event(
     reply_to_message_id: int | None = None,
     reply_author_username: str = "Human_User",
     reply_text: str = "quoted historical text",
+    reply_chat_id: int | None = None,
+    reply_thread_id: int | None = 77,
+    reply_from_is_bot: bool = False,
+    external_reply: object = None,
     message_type: MessageType = MessageType.TEXT,
     metadata: dict | None = None,
 ) -> MessageEvent:
@@ -226,6 +242,10 @@ def _event(
         reply_to_message_id=reply_to_message_id,
         reply_author_username=reply_author_username,
         reply_text=reply_text,
+        reply_chat_id=reply_chat_id,
+        reply_thread_id=reply_thread_id,
+        reply_from_is_bot=reply_from_is_bot,
+        external_reply=external_reply,
     )
     source = SessionSource(
         platform=Platform.TELEGRAM,
@@ -2004,6 +2024,79 @@ async def test_unaddressed_ingress_force_redacts_current_text_before_classifier(
 
 
 @pytest.mark.asyncio
+async def test_spaced_current_credentials_never_reach_classifier_or_logs(
+    monkeypatch,
+    caplog,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    runner.session_store = SessionStore.__new__(SessionStore)
+    secrets = (
+        "correct-horse-battery-staple",
+        "quoted api key value",
+        "mixed-case-secret",
+        "query-token-secret",
+        "authorization-secret",
+        "standalone-bearer-secret",
+    )
+    text = (
+        f"password = {secrets[0]}\n"
+        f'api_key : "{secrets[1]}"\n'
+        f"AcCeSs_ToKeN = {secrets[2]}\n"
+        f"https://example.test/cb?token={secrets[3]}&ok=1\n"
+        f"Authorization: Bearer {secrets[4]}\n"
+        f"Bearer {secrets[5]}"
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", Mock(return_value=""))
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    event = _event(roster["default"], 306, text=text)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    for secret in secrets:
+        assert secret not in captured
+        assert secret not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_strict_current_redaction_failure_clarifies_without_classifier(
+    monkeypatch,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    runner.session_store = SessionStore.__new__(SessionStore)
+    classify = AsyncMock(side_effect=AssertionError("unsafe text must not classify"))
+    collect = Mock(side_effect=AssertionError("unsafe text must not collect context"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", collect)
+    monkeypatch.setattr(
+        context_module,
+        "_strict_redact_credential_assignments",
+        Mock(side_effect=RuntimeError("strict redactor unavailable")),
+    )
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    event = _event(roster["default"], 307, text="password = never-forward-this")
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    collect.assert_not_called()
+    base.assert_awaited_once_with(event)
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+
+
+@pytest.mark.asyncio
 async def test_current_text_redaction_failure_clarifies_without_classifier_call(
     monkeypatch,
 ):
@@ -2136,6 +2229,185 @@ async def test_ordinary_human_reply_is_bounded_redacted_context_without_broad_lo
 
 
 @pytest.mark.asyncio
+async def test_spaced_transcript_and_reply_credentials_never_reach_classifier_or_logs(
+    monkeypatch,
+    caplog,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _event(
+        roster["default"],
+        308,
+        text="Please route this safely",
+        reply_to_message_id=299,
+        reply_author_username="Ordinary_Human",
+        reply_text='password = reply-secret\napi_key : "reply quoted secret"',
+    )
+    origin = dataclasses.replace(
+        event.source,
+        profile="default",
+        session_scope_id=f"telegram-team:{_ALLOWED_CHAT}:308",
+    )
+    entry = SimpleNamespace(session_id="shared-root", origin=origin)
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=Mock(return_value="exact-root"),
+        lookup_loaded_session_by_key=Mock(return_value=entry),
+        _db=SimpleNamespace(
+            get_messages=Mock(
+                return_value=[
+                    {
+                        "id": 1,
+                        "role": "user",
+                        "content": (
+                            "CLIENT_SECRET : transcript-secret\n"
+                            "https://example.test/?token=transcript-query-secret\n"
+                            "Authorization: Bearer transcript-auth-secret"
+                        ),
+                    }
+                ]
+            )
+        ),
+    )
+    secrets = (
+        "reply-secret",
+        "reply quoted secret",
+        "transcript-secret",
+        "transcript-query-secret",
+        "transcript-auth-secret",
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    for secret in secrets:
+        assert secret not in captured
+        assert secret not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_reply",
+    [
+        "partial-id",
+        "event-id-only",
+        "mismatched-id",
+        "malformed-event-id",
+        "mismatched-text",
+        "event-text-missing",
+        "raw-text-missing",
+        "non-string-text",
+        "wrong-chat",
+        "wrong-topic",
+        "external-reply",
+        "bot-origin",
+        "hostile-raw-text",
+        "oversized-text",
+    ],
+)
+async def test_unsafe_immediate_reply_provenance_clarifies_without_classifier(
+    monkeypatch,
+    unsafe_reply,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=Mock(return_value="cold-exact-root"),
+        lookup_loaded_session_by_key=Mock(return_value=None),
+    )
+    reply_text = "same-chat same-topic human reply"
+    event = _event(
+        roster["default"],
+        309,
+        text="Please route this",
+        reply_to_message_id=299,
+        reply_author_username="Ordinary_Human",
+        reply_text=reply_text,
+        reply_chat_id=(-1009999999999 if unsafe_reply == "wrong-chat" else None),
+        reply_thread_id=(88 if unsafe_reply == "wrong-topic" else 77),
+        reply_from_is_bot=unsafe_reply == "bot-origin",
+        external_reply=(object() if unsafe_reply == "external-reply" else None),
+    )
+    if unsafe_reply == "partial-id":
+        event.reply_to_message_id = None
+    elif unsafe_reply == "event-id-only":
+        event.raw_message.reply_to_message = None
+    elif unsafe_reply == "mismatched-id":
+        event.reply_to_message_id = "298"
+    elif unsafe_reply == "malformed-event-id":
+        event.reply_to_message_id = "0299"
+    elif unsafe_reply == "mismatched-text":
+        event.reply_to_text = "different event reply text"
+    elif unsafe_reply == "event-text-missing":
+        event.reply_to_text = None
+    elif unsafe_reply == "raw-text-missing":
+        event.raw_message.reply_to_message.text = None
+        event.raw_message.reply_to_message.caption = None
+    elif unsafe_reply == "non-string-text":
+        event.reply_to_text = object()
+    elif unsafe_reply == "hostile-raw-text":
+        event.raw_message.reply_to_message.text = ["hostile"]
+    elif unsafe_reply == "oversized-text":
+        oversized = "X" * 12_001
+        event.reply_to_text = oversized
+        event.raw_message.reply_to_message.text = oversized
+
+    classify = AsyncMock(side_effect=AssertionError("unsafe reply must not classify"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    base.assert_awaited_once_with(event)
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+
+
+@pytest.mark.asyncio
+async def test_safe_no_reply_and_valid_same_topic_human_reply_reach_classifier(
+    monkeypatch,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=Mock(return_value="cold-exact-root"),
+        lookup_loaded_session_by_key=Mock(return_value=None),
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    no_reply = _event(roster["default"], 310, text="safe no reply")
+    valid_reply = _event(
+        roster["default"],
+        311,
+        text="safe valid reply",
+        reply_to_message_id=299,
+        reply_author_username="Ordinary_Human",
+        reply_text="same-chat same-topic human reply",
+    )
+
+    await roster["default"].handle_message(no_reply)
+    await roster["default"].handle_message(valid_reply)
+
+    assert classify.await_count == 2
+    assert classify.await_args_list[0].kwargs["context"] == ""
+    valid_context = classify.await_args_list[1].kwargs["context"]
+    assert "[UNTRUSTED immediate reply id=299]" in valid_context
+    assert "same-chat same-topic human reply" in valid_context
+    assert base.await_args_list == [((no_reply,), {}), ((valid_reply,), {})]
+
+
+@pytest.mark.asyncio
 async def test_suspended_runtime_consumes_allowed_team_ingress_fail_closed():
     runner, roster = _runner()
     runner._disable_telegram_team_runtime("test", log=False)
@@ -2203,8 +2475,10 @@ def test_build_target_event_uses_fresh_target_provenance_scope_and_safe_copies()
     assert original.metadata == original_metadata
     assert original.source.profile == original_profile
     assert original.source.session_scope_id is None
-    assert "telegram_team_route_capability" not in routed.metadata
-    assert "telegram_team_route_capability" not in routed.source.to_dict()
+    serialized_route_state = repr(routed.metadata) + repr(routed.source.to_dict())
+    assert "telegram_team_route_capability" not in serialized_route_state
+    assert "routed_authorization_grant" not in serialized_route_state
+    assert "routed_adapter_capability" not in serialized_route_state
     target_handle.assert_not_awaited()
 
 
@@ -2279,6 +2553,115 @@ async def test_valid_fresh_routed_target_invokes_handler_once_without_reclassifi
     await roster["design"].handle_message(routed)
 
     classify.assert_not_awaited()
+    base.assert_awaited_once_with(routed)
+
+
+@pytest.mark.asyncio
+async def test_routed_authorization_replay_reaches_base_exactly_once(monkeypatch):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    original = _event(roster["default"], 612, text="fresh target")
+    routed = runner.build_target_event(
+        original,
+        roster["design"],
+        "design",
+        "612",
+        route_reason="semantic_specialist",
+    )
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, "612", "design")
+    classify = AsyncMock(side_effect=AssertionError("routed target must not classify"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["design"].handle_message(routed)
+    await roster["design"].handle_message(routed)
+
+    classify.assert_not_awaited()
+    base.assert_awaited_once_with(routed)
+
+
+@pytest.mark.asyncio
+async def test_copied_routed_event_with_reusable_capability_cannot_spend_grant(
+    monkeypatch,
+):
+    runner, roster = _runner()
+    original = _event(roster["default"], 613, text="fresh target")
+    routed = runner.build_target_event(
+        original,
+        roster["design"],
+        "design",
+        "613",
+        route_reason="semantic_specialist",
+    )
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, "613", "design")
+    copied = dataclasses.replace(routed, metadata=dict(routed.metadata))
+    setattr(
+        copied,
+        "_telegram_team_routed_adapter_capability",
+        getattr(routed, "_telegram_team_routed_adapter_capability"),
+    )
+    setattr(
+        copied,
+        "_telegram_team_constituent_message_ids",
+        getattr(routed, "_telegram_team_constituent_message_ids"),
+    )
+    setattr(
+        copied,
+        "_telegram_team_constituent_ids_capability",
+        getattr(routed, "_telegram_team_constituent_ids_capability"),
+    )
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["design"].handle_message(copied)
+    await roster["design"].handle_message(routed)
+
+    base.assert_awaited_once_with(routed)
+
+
+@pytest.mark.asyncio
+async def test_wrong_target_and_changed_constituents_do_not_consume_exact_grant(
+    monkeypatch,
+):
+    runner, roster = _runner()
+    original = _event(roster["default"], 614, text="fresh target")
+    routed = runner.build_target_event(
+        original,
+        roster["design"],
+        "design",
+        "614",
+        route_reason="semantic_specialist",
+    )
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, "614", "design")
+    original_constituents = getattr(
+        routed,
+        "_telegram_team_constituent_message_ids",
+    )
+    setattr(routed, "_telegram_team_constituent_message_ids", ("614", "615"))
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    assert (
+        await roster["design"]._team_ingress_handler(roster["design"], routed) is True
+    )
+    setattr(routed, "_telegram_team_constituent_message_ids", original_constituents)
+    assert (
+        await roster["engineering"]._team_ingress_handler(
+            roster["engineering"],
+            routed,
+        )
+        is True
+    )
+    await roster["design"].handle_message(routed)
+
     base.assert_awaited_once_with(routed)
 
 
@@ -2404,10 +2787,17 @@ async def test_new_unaddressed_root_classifies_once_and_dispatches_only_selected
         safety = kwargs.pop("safety")
         assert isinstance(safety, context_module.TeamContextSafety)
         assert safety.redaction_failed is False
+        assert safety.unsafe is False
         assert kwargs == {
             "reply_to_message_id": "799",
             "reply_to_text": "quoted historical text",
             "raw_reply_to_message_id": 799,
+            "raw_reply_to_text": "quoted historical text",
+            "raw_reply_chat_id": int(_ALLOWED_CHAT),
+            "raw_reply_thread_id": 77,
+            "raw_reply_author_is_bot": False,
+            "raw_external_reply_present": False,
+            "require_complete_reply_provenance": True,
         }
         collected_source = source
         return "[UNTRUSTED TELEGRAM TEAM CONTEXT]\n[UNTRUSTED user] earlier"

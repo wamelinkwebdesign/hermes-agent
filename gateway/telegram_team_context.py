@@ -18,12 +18,41 @@ MAX_TEAM_CONTEXT_MESSAGES = 12
 MAX_TEAM_CONTEXT_CHARS = 12_000
 _CONTEXT_HEADER = "[UNTRUSTED TELEGRAM TEAM CONTEXT]"
 _ALLOWED_ROLES = frozenset({"user", "assistant"})
+_STRICT_SECRET_NAME = (
+    r"(?:password|passwd|passphrase|secret|token|access[_-]?token|"
+    r"refresh[_-]?token|api[_-]?key|apikey|private[_-]?key|"
+    r"client[_-]?secret|credential|auth|pw)"
+)
+_STRICT_SECRET_KEY = (
+    rf"(?:{_STRICT_SECRET_NAME}|"
+    rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}{_STRICT_SECRET_NAME})"
+)
+_STRICT_SECRET_VALUE = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|[^\s&#;,?]+)'
+_STRICT_ASSIGNMENT_RE = re.compile(
+    rf"(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
+    rf"(?P<key>{_STRICT_SECRET_KEY})(?P=key_quote)\s*[:=]\s*)"
+    rf"(?P<value>{_STRICT_SECRET_VALUE})",
+    re.IGNORECASE,
+)
+_STRICT_AUTHORIZATION_RE = re.compile(
+    rf"(?P<prefix>(?<![A-Za-z0-9_.-])authorization\s*[:=]\s*"
+    rf"(?:(?:bearer|basic)\s+)?)"
+    rf"(?P<value>{_STRICT_SECRET_VALUE})",
+    re.IGNORECASE,
+)
+_STRICT_BEARER_RE = re.compile(
+    rf"(?P<prefix>(?<![A-Za-z0-9_-])bearer[ \t]+)"
+    rf"(?P<value>{_STRICT_SECRET_VALUE})",
+    re.IGNORECASE,
+)
+_STRICT_REDACTION = "[REDACTED]"
 
 
 @dataclass
 class TeamContextSafety:
     """Mutable per-call safety signal for the classifier routing boundary."""
 
+    unsafe: bool = False
     redaction_failed: bool = False
 
 
@@ -31,14 +60,25 @@ class _TeamContextRedactionError(Exception):
     pass
 
 
-def redact_team_classifier_text(text: object) -> str | None:
-    """Force-redact untrusted classifier text, returning ``None`` on failure.
+def _mask_strict_match(match: re.Match[str]) -> str:
+    """Replace one already-matched value without logging or retaining it."""
+    value = match.group("value")
+    if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0]:
+        replacement = f"{value[0]}{_STRICT_REDACTION}{value[0]}"
+    else:
+        replacement = _STRICT_REDACTION
+    return match.group("prefix") + replacement
 
-    The canonical redactor intentionally treats some inline assignment-shaped
-    prose conservatively. This safety boundary can be stricter, so each
-    whitespace-delimited token is passed through that same production redactor
-    after the whole-text pass. No local credential patterns are maintained.
-    """
+
+def _strict_redact_credential_assignments(text: str) -> str:
+    """Mask assignment/query and Authorization/Bearer credentials."""
+    redacted = _STRICT_AUTHORIZATION_RE.sub(_mask_strict_match, text)
+    redacted = _STRICT_BEARER_RE.sub(_mask_strict_match, redacted)
+    return _STRICT_ASSIGNMENT_RE.sub(_mask_strict_match, redacted)
+
+
+def redact_team_classifier_text(text: object) -> str | None:
+    """Apply canonical then stricter classifier-boundary secret redaction."""
     if type(text) is not str:
         return None
     try:
@@ -51,19 +91,8 @@ def redact_team_classifier_text(text: object) -> str | None:
         )
         if type(redacted) is not str:
             return None
-        parts = re.split(r"(\s+)", redacted)
-        for index in range(0, len(parts), 2):
-            if not parts[index]:
-                continue
-            token = redact_sensitive_text(
-                parts[index],
-                force=True,
-                redact_url_credentials=True,
-            )
-            if type(token) is not str:
-                return None
-            parts[index] = token
-        return "".join(parts)
+        strict_redacted = _strict_redact_credential_assignments(redacted)
+        return strict_redacted if type(strict_redacted) is str else None
     except Exception:
         return None
 
@@ -110,9 +139,17 @@ def _render_message(role: str, content: str) -> str:
 
 
 def _render_immediate_reply(
+    source: SessionSource,
     reply_to_message_id: object,
     reply_to_text: object,
     raw_reply_to_message_id: object,
+    *,
+    raw_reply_to_text: object,
+    raw_reply_chat_id: object,
+    raw_reply_thread_id: object,
+    raw_reply_author_is_bot: object,
+    raw_external_reply_present: object,
+    require_complete_reply_provenance: object,
 ) -> tuple[bool, str | None]:
     """Render one validated immediate Telegram reply as explicitly untrusted."""
     if (
@@ -120,6 +157,14 @@ def _render_immediate_reply(
         and reply_to_text is None
         and raw_reply_to_message_id is None
     ):
+        if require_complete_reply_provenance is True and (
+            raw_reply_to_text is not None
+            or raw_reply_chat_id is not None
+            or raw_reply_thread_id is not None
+            or raw_reply_author_is_bot is not None
+            or raw_external_reply_present is not False
+        ):
+            return False, None
         return True, None
     normalized_event_id = _normalize_message_id(reply_to_message_id)
     normalized_raw_id = _normalize_message_id(raw_reply_to_message_id)
@@ -128,9 +173,37 @@ def _render_immediate_reply(
         or normalized_raw_id is None
         or normalized_event_id != normalized_raw_id
         or type(reply_to_text) is not str
+        or len(reply_to_text) > MAX_TEAM_CONTEXT_CHARS
     ):
-        return True, None
-    redacted = redact_team_classifier_text(reply_to_text[:MAX_TEAM_CONTEXT_CHARS])
+        return False, None
+
+    if require_complete_reply_provenance is True:
+        normalized_raw_chat_id = _normalize_group_chat_id(raw_reply_chat_id)
+        expected_thread_id = (
+            _normalize_message_id(source.thread_id)
+            if source.thread_id is not None
+            else None
+        )
+        normalized_raw_thread_id = (
+            _normalize_message_id(raw_reply_thread_id)
+            if raw_reply_thread_id is not None
+            else None
+        )
+        if (
+            type(raw_external_reply_present) is not bool
+            or raw_external_reply_present
+            or type(raw_reply_to_text) is not str
+            or raw_reply_to_text != reply_to_text
+            or len(raw_reply_to_text) > MAX_TEAM_CONTEXT_CHARS
+            or normalized_raw_chat_id != source.chat_id
+            or normalized_raw_thread_id != expected_thread_id
+            or raw_reply_author_is_bot is not False
+        ):
+            return False, None
+    elif require_complete_reply_provenance is not False:
+        return False, None
+
+    redacted = redact_team_classifier_text(reply_to_text)
     if redacted is None:
         raise _TeamContextRedactionError
     normalized = " ".join(redacted.split())
@@ -207,6 +280,12 @@ def collect_team_context(
     reply_to_message_id: object = None,
     reply_to_text: object = None,
     raw_reply_to_message_id: object = None,
+    raw_reply_to_text: object = None,
+    raw_reply_chat_id: object = None,
+    raw_reply_thread_id: object = None,
+    raw_reply_author_is_bot: object = None,
+    raw_external_reply_present: object = False,
+    require_complete_reply_provenance: object = False,
     safety: TeamContextSafety | None = None,
 ) -> str:
     """Return bounded untrusted context from one exact Ace-owned root session.
@@ -232,11 +311,20 @@ def collect_team_context(
 
     try:
         reply_safe, immediate_reply = _render_immediate_reply(
+            safe_source,
             reply_to_message_id,
             reply_to_text,
             raw_reply_to_message_id,
+            raw_reply_to_text=raw_reply_to_text,
+            raw_reply_chat_id=raw_reply_chat_id,
+            raw_reply_thread_id=raw_reply_thread_id,
+            raw_reply_author_is_bot=raw_reply_author_is_bot,
+            raw_external_reply_present=raw_external_reply_present,
+            require_complete_reply_provenance=require_complete_reply_provenance,
         )
         if not reply_safe:
+            if safety is not None:
+                safety.unsafe = True
             return ""
         key_builder = getattr(session_store, "_generate_session_key", None)
         lookup = getattr(session_store, "lookup_loaded_session_by_key", None)
@@ -288,6 +376,7 @@ def collect_team_context(
         return _bounded_render(rows, max_chars, immediate_reply)
     except _TeamContextRedactionError:
         if safety is not None:
+            safety.unsafe = True
             safety.redaction_failed = True
         return ""
     except BaseException as exc:

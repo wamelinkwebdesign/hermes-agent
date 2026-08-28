@@ -312,6 +312,95 @@ def _dispatcher(**kwargs):
     return _routing_module().TelegramTeamDispatcher(**kwargs)
 
 
+def _grant_arguments(adapter_capability):
+    return {
+        "chat_id": -1001,
+        "root_message_id": 100,
+        "owner_profile": "engineering",
+        "current_message_id": 101,
+        "constituent_message_ids": (101, 102),
+        "target_adapter_capability": adapter_capability,
+    }
+
+
+def test_routed_authorization_grant_is_exact_and_single_use():
+    dispatcher = _dispatcher()
+    adapter_capability = object()
+    arguments = _grant_arguments(adapter_capability)
+
+    grant = dispatcher.issue_routed_authorization(**arguments)
+
+    assert grant is not None
+    assert "100" not in repr(grant)
+    assert dispatcher.consume_routed_authorization(grant, **arguments) is True
+    assert dispatcher.consume_routed_authorization(grant, **arguments) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("chat_id", -2002),
+        ("root_message_id", 200),
+        ("owner_profile", "design-team"),
+        ("current_message_id", 103),
+        ("constituent_message_ids", (101, 103)),
+        ("target_adapter_capability", object()),
+    ],
+)
+def test_wrong_routed_authorization_binding_does_not_consume_valid_grant(
+    field,
+    wrong_value,
+):
+    dispatcher = _dispatcher()
+    adapter_capability = object()
+    arguments = _grant_arguments(adapter_capability)
+    grant = dispatcher.issue_routed_authorization(**arguments)
+    assert grant is not None
+    wrong_arguments = {**arguments, field: wrong_value}
+
+    assert dispatcher.consume_routed_authorization(grant, **wrong_arguments) is False
+    assert dispatcher.consume_routed_authorization(grant, **arguments) is True
+
+
+def test_routed_authorization_grants_are_bounded_and_invalid_issue_does_not_evict():
+    dispatcher = _dispatcher(max_routed_grants=2)
+    capability = object()
+    first_args = _grant_arguments(capability)
+    second_args = {
+        **first_args,
+        "current_message_id": 103,
+        "constituent_message_ids": (103,),
+    }
+    third_args = {
+        **first_args,
+        "current_message_id": 104,
+        "constituent_message_ids": (104,),
+    }
+    first = dispatcher.issue_routed_authorization(**first_args)
+    second = dispatcher.issue_routed_authorization(**second_args)
+    assert first is not None
+    assert second is not None
+
+    assert (
+        dispatcher.issue_routed_authorization(**{
+            **third_args,
+            "constituent_message_ids": (104, 0),
+        })
+        is None
+    )
+    assert dispatcher.consume_routed_authorization(first, **first_args) is True
+
+    replacement_first = dispatcher.issue_routed_authorization(**first_args)
+    third = dispatcher.issue_routed_authorization(**third_args)
+    assert replacement_first is not None
+    assert third is not None
+    assert dispatcher.consume_routed_authorization(second, **second_args) is False
+    assert (
+        dispatcher.consume_routed_authorization(replacement_first, **first_args) is True
+    )
+    assert dispatcher.consume_routed_authorization(third, **third_args) is True
+
+
 def test_ingress_claim_is_process_local_and_reports_the_first_adapter():
     module = _routing_module()
     dispatcher = _dispatcher()

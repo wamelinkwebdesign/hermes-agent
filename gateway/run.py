@@ -7091,9 +7091,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._telegram_team_dispatcher = None
         self._telegram_team_route_gate_callback = None
         self._telegram_team_ingress_callback = None
-        # Process-local object identities authorize runner-built routed events
-        # and validated, internal-only ingress batch state.
-        self._telegram_team_route_capability = object()
+        # Process-local object identities authorize exact target adapters and
+        # validated, internal-only ingress batch state.
+        self._telegram_team_routed_adapter_capabilities = {}
         self._telegram_team_constituent_ids_capability = object()
         self._telegram_team_gate_adapters: Dict[str, BasePlatformAdapter] = {}
         self._telegram_team_routing_enabled = False
@@ -15991,6 +15991,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._telegram_team_routing_enabled = False
         self._telegram_team_profiles = ()
         self._telegram_team_gate_adapters = {}
+        self._telegram_team_routed_adapter_capabilities = {}
         self._telegram_team_coordinator_profile = None
 
         telegram_config = getattr(self, "config", None)
@@ -16175,6 +16176,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profiles = [profile for profile, current in installed.items() if current is adapter]
         return profiles[0] if len(profiles) == 1 else None
 
+    def _telegram_team_routed_adapter_capability(
+        self,
+        adapter: Any,
+        profile: str,
+    ) -> Optional[object]:
+        """Return the runner-owned opaque identity for one installed adapter."""
+        capabilities = self.__dict__.get("_telegram_team_routed_adapter_capabilities")
+        if not isinstance(capabilities, dict):
+            return None
+        entry = capabilities.get(profile)
+        if (
+            not isinstance(entry, tuple)
+            or len(entry) != 2
+            or entry[0] is not adapter
+            or type(entry[1]) is not object
+        ):
+            return None
+        return entry[1]
+
     async def _handle_telegram_team_ingress(
         self,
         dispatcher: Any,
@@ -16272,13 +16292,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id = _normalize_message_id(event.message_id)
         source_message_id = _normalize_message_id(getattr(source, "message_id", None))
         event_reply_id = _normalize_message_id(event.reply_to_message_id)
+        reply_provenance_mismatch = context.reply_to_message_id != event_reply_id
         if (
             context.chat_id != raw_chat_id
             or context.owner_profile != profile
             or context.message_id is None
             or context.message_id != event_message_id
             or context.message_id != source_message_id
-            or context.reply_to_message_id != event_reply_id
         ):
             return True
 
@@ -16287,6 +16307,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not routed_marker_present and (
             event.message_type is MessageType.COMMAND or event.is_command()
         ):
+            if reply_provenance_mismatch:
+                return True
             try:
                 command_ownership = dispatcher.resolve_reply_owner(
                     raw_chat_id,
@@ -16343,6 +16365,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "_telegram_team_constituent_ids_capability",
             "_telegram_team_ingress_reservation",
             "_telegram_team_ingress_dispatcher",
+            "_telegram_team_routed_authorization_grant",
+            "_telegram_team_routed_adapter_capability",
         )
         if any(key in metadata for key in forbidden_batch_metadata):
             return True
@@ -16432,7 +16456,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return True
 
         if routed_marker_present:
-            capability = self.__dict__.get("_telegram_team_route_capability")
+            if reply_provenance_mismatch:
+                return True
             root_message_id = _normalize_message_id(
                 metadata.get("telegram_team_root_message_id")
             )
@@ -16442,10 +16467,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if root_message_id is not None
                 else None
             )
+            target_adapter_capability = self._telegram_team_routed_adapter_capability(
+                adapter, profile
+            )
+            routed_grant = getattr(
+                event,
+                "_telegram_team_routed_authorization_grant",
+                None,
+            )
             if (
-                capability is None
-                or getattr(event, "_telegram_team_route_capability", None)
-                is not capability
+                target_adapter_capability is None
+                or getattr(event, "_telegram_team_routed_adapter_capability", None)
+                is not target_adapter_capability
+                or routed_grant is None
                 or metadata.get("telegram_team_owner_profile") != profile
                 or metadata.get("telegram_team_ingress_claimed") is not True
                 or root_message_id is None
@@ -16467,6 +16501,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             if not routed_ownership_verified:
                 return True
+            try:
+                grant_consumed = dispatcher.consume_routed_authorization(
+                    routed_grant,
+                    chat_id=raw_chat_id,
+                    root_message_id=root_message_id,
+                    owner_profile=profile,
+                    current_message_id=context.message_id,
+                    constituent_message_ids=constituent_ids,
+                    target_adapter_capability=target_adapter_capability,
+                )
+            except Exception:
+                return True
+            if not grant_consumed:
+                return True
+            for attribute in (
+                "_telegram_team_routed_authorization_grant",
+                "_telegram_team_routed_adapter_capability",
+            ):
+                try:
+                    delattr(event, attribute)
+                except AttributeError:
+                    pass
             return False
 
         try:
@@ -16504,6 +16560,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             semantic_target_adapter: Optional[BasePlatformAdapter] = None
             if ownership is not None:
+                if reply_provenance_mismatch:
+                    return True
                 if (
                     ownership.owner_profile != profile
                     or context.reply_to_message_id is None
@@ -16526,6 +16584,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=raw_chat_id,
                 )
                 if not decision.accepted or decision.owner_profile != profile:
+                    return True
+                if (
+                    reply_provenance_mismatch
+                    and decision.reason != "unaddressed_ingress"
+                ):
                     return True
                 root_message_id = context.message_id
                 owner_profile = decision.owner_profile
@@ -16561,6 +16624,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         else:
                             context_safety = TeamContextSafety()
+                            raw_reply = getattr(raw_message, "reply_to_message", None)
+                            raw_quote = getattr(raw_message, "quote", None)
+                            raw_quote_text = (
+                                getattr(raw_quote, "text", None)
+                                if raw_quote is not None
+                                else None
+                            )
+                            if raw_quote_text is not None:
+                                raw_reply_text = raw_quote_text
+                            else:
+                                raw_reply_text = getattr(raw_reply, "text", None)
+                                if raw_reply_text is None or (
+                                    type(raw_reply_text) is str and raw_reply_text == ""
+                                ):
+                                    raw_reply_text = getattr(raw_reply, "caption", None)
+                            raw_reply_chat = getattr(raw_reply, "chat", None)
+                            raw_reply_author = getattr(raw_reply, "from_user", None)
                             context_text = await asyncio.to_thread(
                                 collect_team_context,
                                 self.session_store,
@@ -16569,13 +16649,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 reply_to_message_id=event.reply_to_message_id,
                                 reply_to_text=event.reply_to_text,
                                 raw_reply_to_message_id=getattr(
-                                    getattr(raw_message, "reply_to_message", None),
+                                    raw_reply,
                                     "message_id",
                                     None,
                                 ),
+                                raw_reply_to_text=raw_reply_text,
+                                raw_reply_chat_id=getattr(
+                                    raw_reply_chat,
+                                    "id",
+                                    None,
+                                ),
+                                raw_reply_thread_id=getattr(
+                                    raw_reply,
+                                    "message_thread_id",
+                                    None,
+                                ),
+                                raw_reply_author_is_bot=getattr(
+                                    raw_reply_author,
+                                    "is_bot",
+                                    None,
+                                ),
+                                raw_external_reply_present=(
+                                    getattr(raw_message, "external_reply", None)
+                                    is not None
+                                    or getattr(raw_reply, "external_reply", None)
+                                    is not None
+                                ),
+                                require_complete_reply_provenance=True,
                                 safety=context_safety,
                             )
-                            if context_safety.redaction_failed:
+                            if context_safety.unsafe:
                                 classification = ClassificationDecision(
                                     "clarify",
                                     reason="invalid_input",
@@ -16786,11 +16889,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             media_types=list(original.media_types),
             metadata=metadata,
         )
-        capability = self.__dict__.get("_telegram_team_route_capability")
-        if capability is None:
-            capability = object()
-            self._telegram_team_route_capability = capability
-        setattr(routed, "_telegram_team_route_capability", capability)
         ingress_capability = self.__dict__.get(
             "_telegram_team_constituent_ids_capability"
         )
@@ -16818,6 +16916,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             routed,
             "_telegram_team_constituent_ids_capability",
             ingress_capability,
+        )
+        target_adapter_capability = self._telegram_team_routed_adapter_capability(
+            target_adapter,
+            owner_profile,
+        )
+        dispatcher = self.__dict__.get("_telegram_team_dispatcher")
+        grant_issuer = getattr(dispatcher, "issue_routed_authorization", None)
+        if target_adapter_capability is None or not callable(grant_issuer):
+            raise RuntimeError("target routed authorization is unavailable")
+        routed_grant = grant_issuer(
+            chat_id=chat_id,
+            root_message_id=root_id,
+            owner_profile=owner_profile,
+            current_message_id=message_id,
+            constituent_message_ids=constituent_ids,
+            target_adapter_capability=target_adapter_capability,
+        )
+        if routed_grant is None:
+            raise RuntimeError("target routed authorization could not be issued")
+        setattr(
+            routed,
+            "_telegram_team_routed_authorization_grant",
+            routed_grant,
+        )
+        setattr(
+            routed,
+            "_telegram_team_routed_adapter_capability",
+            target_adapter_capability,
         )
         return routed
 
@@ -16908,6 +17034,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not isinstance(installed, dict):
             installed = {}
             self._telegram_team_gate_adapters = installed
+        capabilities = self.__dict__.get("_telegram_team_routed_adapter_capabilities")
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+            self._telegram_team_routed_adapter_capabilities = capabilities
         previous = installed.get(profile)
         gate_callback = self.__dict__.get("_telegram_team_route_gate_callback")
         ingress_callback = self.__dict__.get("_telegram_team_ingress_callback")
@@ -16916,6 +17046,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and getattr(adapter, "_team_route_gate", None) is gate_callback
             and getattr(adapter, "_team_ingress_handler", None) is ingress_callback
         ):
+            capability_entry = capabilities.get(profile)
+            if (
+                not isinstance(capability_entry, tuple)
+                or len(capability_entry) != 2
+                or capability_entry[0] is not adapter
+                or type(capability_entry[1]) is not object
+            ):
+                capabilities[profile] = (adapter, object())
             return True
 
         if previous is not None or self.telegram_team_routing_enabled:
@@ -16943,6 +17081,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._clear_telegram_team_gate(adapter)
             if previous is adapter:
                 installed.pop(profile, None)
+                capabilities.pop(profile, None)
             logger.warning(
                 "Telegram team callback installation failed for profile '%s'",
                 profile,
@@ -16952,6 +17091,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if previous is not None and previous is not adapter:
             self._clear_telegram_team_gate(previous)
         installed[profile] = adapter
+        capabilities[profile] = (adapter, object())
         return True
 
     def _install_telegram_team_gate(
@@ -17020,8 +17160,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         was_enabled = self.telegram_team_routing_enabled
         self._clear_telegram_team_gate(adapter)
+        capabilities = self.__dict__.get("_telegram_team_routed_adapter_capabilities")
         for profile in owned_profiles:
             installed.pop(profile, None)
+            if isinstance(capabilities, dict):
+                capabilities.pop(profile, None)
         if was_enabled:
             self._disable_telegram_team_runtime(
                 "configured adapter removed for profile(s): "
