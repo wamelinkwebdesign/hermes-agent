@@ -585,7 +585,10 @@ def test_member_outage_suspends_all_gates_and_valid_replacement_can_reactivate()
     assert roster["default"]._team_route_gate is shared_callback
     assert roster["design"]._team_route_gate is shared_callback
     assert callable(roster["default"]._team_ingress_handler)
-    assert roster["default"]._team_ingress_handler is roster["design"]._team_ingress_handler
+    assert (
+        roster["default"]._team_ingress_handler
+        is roster["design"]._team_ingress_handler
+    )
     assert shared_callback(_context("default")) is False
     assert shared_callback(_context("design")) is False
 

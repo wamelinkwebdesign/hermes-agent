@@ -362,7 +362,9 @@ async def test_base_submission_failure_releases_reservation_and_retry_dispatches
     dispatcher.commit_ingress = commit
 
     first = _event(adapter, 91, text="@Woz_Bot investigate")
-    expected_error = asyncio.CancelledError if failure == "cancellation" else RuntimeError
+    expected_error = (
+        asyncio.CancelledError if failure == "cancellation" else RuntimeError
+    )
     with pytest.raises(expected_error):
         await adapter.handle_message(first)
 
@@ -521,12 +523,8 @@ async def test_real_telegram_batch_paths_reserve_and_bind_every_constituent_id(
     expected = RootOwnership("900", "engineering")
     dispatcher = runner._telegram_team_dispatcher
     assert dispatcher is not None
-    assert dispatcher.resolve_reply_owner(
-        _ALLOWED_CHAT, 900
-    ) == expected
-    assert dispatcher.resolve_reply_owner(
-        _ALLOWED_CHAT, 901
-    ) == expected
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 900) == expected
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 901) == expected
 
     await adapter.handle_message(
         _event(
@@ -635,12 +633,13 @@ async def test_team_batch_paths_keep_different_immediate_parents_in_separate_roo
         getattr(event, "_telegram_batch_message_ids")[0]: event
         for event in pending.values()
     }
-    assert getattr(
-        batches_by_first_id["900"], "_telegram_batch_message_ids"
-    ) == ("900", "902")
-    assert getattr(
-        batches_by_first_id["901"], "_telegram_batch_message_ids"
-    ) == ("901",)
+    assert getattr(batches_by_first_id["900"], "_telegram_batch_message_ids") == (
+        "900",
+        "902",
+    )
+    assert getattr(batches_by_first_id["901"], "_telegram_batch_message_ids") == (
+        "901",
+    )
 
     if batch_kind == "text":
         adapter._text_batch_delay_seconds = 0
@@ -680,9 +679,15 @@ async def test_buffered_duplicate_replay_does_not_duplicate_payload_or_dispatch(
     base_handle = AsyncMock()
     monkeypatch.setattr(BasePlatformAdapter, "handle_message", base_handle)
     message_type = MessageType.TEXT if batch_kind == "text" else MessageType.PHOTO
-    first = _event(adapter, 950, text="@Woz_Bot first payload", message_type=message_type)
-    replay = _event(adapter, 950, text="@Woz_Bot replay payload", message_type=message_type)
-    second = _event(adapter, 951, text="@Woz_Bot second payload", message_type=message_type)
+    first = _event(
+        adapter, 950, text="@Woz_Bot first payload", message_type=message_type
+    )
+    replay = _event(
+        adapter, 950, text="@Woz_Bot replay payload", message_type=message_type
+    )
+    second = _event(
+        adapter, 951, text="@Woz_Bot second payload", message_type=message_type
+    )
     first.media_urls = ["/tmp/first.png"]
     replay.media_urls = ["/tmp/replay.png"]
     second.media_urls = ["/tmp/second.png"]
@@ -812,19 +817,14 @@ async def test_unaddressed_batch_carries_validated_ids_only_in_runner_capability
 
     base_handle.assert_awaited_once_with(first)
     assert getattr(first, "_telegram_team_constituent_message_ids") == ("900", "901")
-    assert (
-        getattr(first, "_telegram_team_constituent_ids_capability")
-        is getattr(runner, "_telegram_team_constituent_ids_capability")
+    assert getattr(first, "_telegram_team_constituent_ids_capability") is getattr(
+        runner, "_telegram_team_constituent_ids_capability"
     )
     assert "constituent" not in repr(first.metadata).lower()
     dispatcher = runner._telegram_team_dispatcher
     assert dispatcher is not None
-    assert dispatcher.resolve_reply_owner(
-        _ALLOWED_CHAT, 900
-    ) is None
-    assert dispatcher.resolve_reply_owner(
-        _ALLOWED_CHAT, 901
-    ) is None
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 900) is None
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 901) is None
 
 
 @pytest.mark.asyncio
@@ -835,15 +835,11 @@ async def test_interleaved_team_owners_do_not_coalesce_across_adapters():
     _prepare_batching(engineering)
     _prepare_batching(design)
 
-    engineering._enqueue_text_event(
-        _event(engineering, 910, text="@Woz_Bot first")
-    )
+    engineering._enqueue_text_event(_event(engineering, 910, text="@Woz_Bot first"))
     engineering_task_1 = next(iter(engineering._pending_text_batch_tasks.values()))
     design._enqueue_text_event(_event(design, 920, text="@Virgil_Bot first"))
     design_task_1 = next(iter(design._pending_text_batch_tasks.values()))
-    engineering._enqueue_text_event(
-        _event(engineering, 911, text="@Woz_Bot second")
-    )
+    engineering._enqueue_text_event(_event(engineering, 911, text="@Woz_Bot second"))
     engineering_task_2 = next(iter(engineering._pending_text_batch_tasks.values()))
     design._enqueue_text_event(_event(design, 921, text="@Virgil_Bot second"))
     design_task_2 = next(iter(design._pending_text_batch_tasks.values()))
@@ -1001,9 +997,10 @@ async def test_overflow_isolated_replay_reuses_pending_batch_without_payload_or_
             await _flush_pending_batch(adapter, batch_kind, key)
 
         assert base_handle.await_count == 2
-        assert [
-            call.args[0].message_id for call in base_handle.await_args_list
-        ] == ["1", "65"]
+        assert [call.args[0].message_id for call in base_handle.await_args_list] == [
+            "1",
+            "65",
+        ]
         if batch_kind == "command":
             assert all(
                 call.args[0].message_type == MessageType.COMMAND
@@ -1157,9 +1154,7 @@ async def test_overflow_pending_identity_cleanup_allows_key_reuse_after_flush_an
             ),
         )
         assert isolated_key in pending
-        assert getattr(
-            pending[isolated_key], "_telegram_batch_message_ids"
-        ) == ("65",)
+        assert getattr(pending[isolated_key], "_telegram_batch_message_ids") == ("65",)
 
         adapter._drop_delayed_deliveries = True
         await adapter._cancel_pending_delivery_tasks()
@@ -1182,9 +1177,7 @@ async def test_overflow_pending_identity_cleanup_allows_key_reuse_after_flush_an
                 later,
             )
         else:
-            base_key = (
-                f"{adapter._text_batch_key(later)}:album:overflow-album"
-            )
+            base_key = f"{adapter._text_batch_key(later)}:album:overflow-album"
         await _enqueue_batch_event(adapter, batch_kind, later)
         assert list(pending) == [base_key]
         assert pending[base_key] is later
@@ -1339,8 +1332,7 @@ async def test_cancelled_team_command_retries_same_held_event_without_replay_pig
     assert "submission" not in repr(original.metadata).lower()
     assert "submission" not in repr(replay.metadata).lower()
     assert (
-        getattr(original, "_telegram_team_command_submission_token")
-        is original_token
+        getattr(original, "_telegram_team_command_submission_token") is original_token
     )
 
 
@@ -1360,6 +1352,7 @@ async def test_pre_acceptance_team_command_failure_releases_exact_token_for_retr
     base_attempts = []
 
     if failure_stage.startswith("ingress"):
+
         async def _failed_ingress(_adapter, _event):
             if failure_stage == "ingress-error":
                 raise RuntimeError("ingress failed")
@@ -1399,7 +1392,9 @@ async def test_pre_acceptance_team_command_failure_releases_exact_token_for_retr
         )
     )
 
-    expected_attempts = [original, original] if failure_stage == "base-error" else [original]
+    expected_attempts = (
+        [original, original] if failure_stage == "base-error" else [original]
+    )
     assert base_attempts == expected_attempts
     assert getattr(original, "_telegram_team_command_submission_token") is token
 
@@ -1518,9 +1513,7 @@ async def test_invalid_overflow_team_command_does_not_mutate_or_evict_dedupe(
         message_type=MessageType.COMMAND,
     )
     await adapter.handle_message(valid)
-    committed_before = list(
-        getattr(adapter, "_telegram_team_command_committed", {})
-    )
+    committed_before = list(getattr(adapter, "_telegram_team_command_committed", {}))
 
     overflow = _event(
         adapter,
@@ -1784,7 +1777,9 @@ async def test_every_post_reservation_ingress_failure_releases_atomically(
     batch_api_mock = None
 
     if failure_branch == "resolve-owner-raises":
-        dispatcher.resolve_reply_owner = Mock(side_effect=RuntimeError("resolve failed"))
+        dispatcher.resolve_reply_owner = Mock(
+            side_effect=RuntimeError("resolve failed")
+        )
     elif failure_branch == "wrong-parent-owner":
         event = _event(adapter, 730, reply_to_message_id=700)
         dispatcher.resolve_reply_owner = Mock(
@@ -1891,17 +1886,11 @@ async def test_structural_ingress_records_three_hop_human_chain_with_interleaved
     runner, roster = _runner()
     dispatcher = runner._telegram_team_dispatcher
 
-    engineering_root = _event(
-        roster["engineering"], 100, text="@Woz_Bot own this"
-    )
+    engineering_root = _event(roster["engineering"], 100, text="@Woz_Bot own this")
     design_root = _event(roster["design"], 200, text="@Virgil_Bot own this")
-    engineering_reply_1 = _event(
-        roster["engineering"], 101, reply_to_message_id=100
-    )
+    engineering_reply_1 = _event(roster["engineering"], 101, reply_to_message_id=100)
     design_reply_1 = _event(roster["design"], 201, reply_to_message_id=200)
-    engineering_reply_2 = _event(
-        roster["engineering"], 102, reply_to_message_id=101
-    )
+    engineering_reply_2 = _event(roster["engineering"], 102, reply_to_message_id=101)
 
     for adapter, event in (
         (roster["engineering"], engineering_root),
@@ -1932,13 +1921,13 @@ async def test_unaddressed_ingress_defers_immutable_root_binding():
     runner, roster = _runner()
     event = _event(roster["default"], 300, text="please investigate this")
 
-    assert await roster["default"]._team_ingress_handler(
-        roster["default"], event
-    ) is False
+    assert (
+        await roster["default"]._team_ingress_handler(roster["default"], event) is False
+    )
 
-    assert runner._telegram_team_dispatcher.resolve_reply_owner(
-        _ALLOWED_CHAT, 300
-    ) is None
+    assert (
+        runner._telegram_team_dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 300) is None
+    )
     assert event.metadata == {
         "existing": "value",
         "telegram_team_root_message_id": "300",
@@ -2059,9 +2048,7 @@ async def test_valid_internal_routed_event_bypasses_second_claim_and_classificat
     claim = Mock(side_effect=AssertionError("routed target must not claim again"))
     runner._telegram_team_dispatcher.claim_ingress = claim
 
-    consumed = await roster["design"]._team_ingress_handler(
-        roster["design"], routed
-    )
+    consumed = await roster["design"]._team_ingress_handler(roster["design"], routed)
 
     assert consumed is False
     claim.assert_not_called()
@@ -2082,7 +2069,8 @@ async def test_internal_routed_event_with_mismatched_owner_is_consumed():
     claim = Mock(side_effect=AssertionError("malformed target must not claim"))
     runner._telegram_team_dispatcher.claim_ingress = claim
 
-    assert await roster["engineering"]._team_ingress_handler(
-        roster["engineering"], routed
-    ) is True
+    assert (
+        await roster["engineering"]._team_ingress_handler(roster["engineering"], routed)
+        is True
+    )
     claim.assert_not_called()

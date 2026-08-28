@@ -78,9 +78,12 @@ class TelegramTeamConfig:
     members: Mapping[str, str]
     allowed_chats: frozenset[str]
 
-    _FIELDS: ClassVar[frozenset[str]] = frozenset(
-        {"coordinator_profile", "coordinator_username", "members", "allowed_chats"}
-    )
+    _FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "coordinator_profile",
+        "coordinator_username",
+        "members",
+        "allowed_chats",
+    })
 
     @classmethod
     def from_raw(cls, raw: object) -> TelegramTeamConfig | None:
@@ -89,7 +92,9 @@ class TelegramTeamConfig:
             return None
 
         coordinator_profile = raw.get("coordinator_profile")
-        if not isinstance(coordinator_profile, str) or not _PROFILE_RE.fullmatch(coordinator_profile):
+        if not isinstance(coordinator_profile, str) or not _PROFILE_RE.fullmatch(
+            coordinator_profile
+        ):
             return None
 
         coordinator_username = _normalize_username(raw.get("coordinator_username"))
@@ -254,9 +259,7 @@ class TelegramTeamDispatcher:
         self._lock = threading.Lock()
         self._reservation_identity = object()
         self._claims: OrderedDict[tuple[str, str], str] = OrderedDict()
-        self._pending_reservations: dict[
-            tuple[str, str], IngressReservation
-        ] = {}
+        self._pending_reservations: dict[tuple[str, str], IngressReservation] = {}
         self._aliases: dict[tuple[str, str], RootOwnership] = {}
         self._families: OrderedDict[tuple[str, str], _RootFamily] = OrderedDict()
 
@@ -604,7 +607,9 @@ class TelegramTeamDispatcher:
         if not normalized_ids:
             return False
 
-        message_keys = [(normalized_chat_id, message_id) for message_id in normalized_ids]
+        message_keys = [
+            (normalized_chat_id, message_id) for message_id in normalized_ids
+        ]
         with self._lock:
             if (
                 self._aliases.get(root_key) != ownership
@@ -704,7 +709,9 @@ def resolve_addressed_owner(
     if normalized_chat_id not in config.allowed_chats:
         return TeamRouteDecision(None, "chat_not_allowed", False)
 
-    profiles_by_username = {username: profile for profile, username in config.members.items()}
+    profiles_by_username = {
+        username: profile for profile, username in config.members.items()
+    }
 
     reply_username = _normalize_username(reply_author_username)
     if reply_username in profiles_by_username:

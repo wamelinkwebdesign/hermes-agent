@@ -62,8 +62,16 @@ def test_team_config_normalizes_valid_values_and_is_immutable():
         None,
         [],
         {**_valid_raw(), "unknown": True},
-        {key: value for key, value in _valid_raw().items() if key != "coordinator_profile"},
-        {key: value for key, value in _valid_raw().items() if key != "coordinator_username"},
+        {
+            key: value
+            for key, value in _valid_raw().items()
+            if key != "coordinator_profile"
+        },
+        {
+            key: value
+            for key, value in _valid_raw().items()
+            if key != "coordinator_username"
+        },
         {key: value for key, value in _valid_raw().items() if key != "members"},
         {key: value for key, value in _valid_raw().items() if key != "allowed_chats"},
         {**_valid_raw(), "members": []},
@@ -262,7 +270,9 @@ def test_outside_allowed_chats_is_not_accepted():
     )
 
 
-def test_nested_team_routing_bridges_into_telegram_platform_extra(monkeypatch, tmp_path):
+def test_nested_team_routing_bridges_into_telegram_platform_extra(
+    monkeypatch, tmp_path
+):
     from gateway.config import Platform, load_gateway_config
 
     hermes_home = tmp_path / ".hermes"
@@ -629,10 +639,7 @@ def test_inbound_alias_batch_late_conflict_is_atomic_and_valid_retry_succeeds():
     assert dispatcher.record_root(-1001, 200, "design-team") is True
     assert dispatcher.record_inbound_alias(-1001, 400, 200) is True
 
-    assert (
-        dispatcher.record_inbound_alias_batch(-1001, [301, 400, 302], 100)
-        is False
-    )
+    assert dispatcher.record_inbound_alias_batch(-1001, [301, 400, 302], 100) is False
 
     assert dispatcher.resolve_reply_owner(-1001, 301) is None
     assert dispatcher.resolve_reply_owner(-1001, 302) is None
