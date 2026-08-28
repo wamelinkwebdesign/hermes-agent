@@ -138,6 +138,20 @@ def _pending_batch_state(adapter: TelegramAdapter, batch_kind: str):
     return adapter._media_group_events, adapter._media_group_tasks
 
 
+class _RaisesOnAttribute:
+    """Delegate every attribute except one hostile property access."""
+
+    def __init__(self, original: object, attribute: str, marker: str):
+        self._original = original
+        self._attribute = attribute
+        self._marker = marker
+
+    def __getattr__(self, name: str):
+        if name == self._attribute:
+            raise RuntimeError(self._marker)
+        return getattr(self._original, name)
+
+
 async def _flush_pending_batch(
     adapter: TelegramAdapter,
     batch_kind: str,
@@ -2372,10 +2386,171 @@ async def test_unsafe_immediate_reply_provenance_clarifies_without_classifier(
 
 
 @pytest.mark.asyncio
-async def test_safe_no_reply_and_valid_same_topic_human_reply_reach_classifier(
+async def test_present_empty_raw_reply_clarifies_without_classifier(
     monkeypatch,
+    caplog,
 ):
     import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=Mock(return_value="cold-exact-root"),
+        lookup_loaded_session_by_key=Mock(return_value=None),
+    )
+    classify = AsyncMock(
+        side_effect=AssertionError("malformed reply must not classify")
+    )
+    collect = Mock(wraps=context_module.collect_team_context)
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", collect)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    event = _event(roster["default"], 310, text="malformed present reply")
+    event.raw_message.reply_to_message = SimpleNamespace()
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    collect.assert_called_once()
+    assert collect.call_args.kwargs["raw_reply_present"] is True
+    assert collect.call_args.kwargs["raw_reply_provenance_safe"] is True
+    base.assert_awaited_once_with(event)
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    assert "malformed present reply" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_raising_raw_reply_presence_clarifies_without_classifier_or_logging(
+    monkeypatch,
+    caplog,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=Mock(return_value="cold-exact-root"),
+        lookup_loaded_session_by_key=Mock(return_value=None),
+    )
+    marker = "raw-reply-presence-private-value"
+    classify = AsyncMock(side_effect=AssertionError("hostile reply must not classify"))
+    collect = Mock(wraps=context_module.collect_team_context)
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", collect)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    event = _event(roster["default"], 311, text="raising reply presence")
+    event.raw_message = _RaisesOnAttribute(
+        event.raw_message,
+        "reply_to_message",
+        marker,
+    )
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    collect.assert_called_once()
+    assert collect.call_args.kwargs["raw_reply_present"] is False
+    assert collect.call_args.kwargs["raw_reply_provenance_safe"] is False
+    base.assert_awaited_once_with(event)
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "critical_property",
+    [
+        "message-id",
+        "text",
+        "caption",
+        "chat",
+        "chat-id",
+        "topic-id",
+        "author",
+        "author-username",
+        "author-is-bot",
+        "external-marker",
+    ],
+)
+async def test_raising_critical_raw_reply_property_clarifies_without_raw_forwarding(
+    monkeypatch,
+    caplog,
+    critical_property,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=Mock(return_value="cold-exact-root"),
+        lookup_loaded_session_by_key=Mock(return_value=None),
+    )
+    marker = f"raw-{critical_property}-private-value"
+    classify = AsyncMock(side_effect=AssertionError("hostile reply must not classify"))
+    collect = Mock(wraps=context_module.collect_team_context)
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", collect)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    event = _event(
+        roster["default"],
+        312,
+        text="raising critical reply property",
+        reply_to_message_id=299,
+        reply_author_username="Ordinary_Human",
+        reply_text="same-chat same-topic human reply",
+    )
+    reply = event.raw_message.reply_to_message
+    if critical_property == "message-id":
+        event.raw_message.reply_to_message = _RaisesOnAttribute(
+            reply, "message_id", marker
+        )
+    elif critical_property == "text":
+        event.raw_message.reply_to_message = _RaisesOnAttribute(reply, "text", marker)
+    elif critical_property == "caption":
+        reply.text = None
+        event.raw_message.reply_to_message = _RaisesOnAttribute(
+            reply, "caption", marker
+        )
+    elif critical_property == "chat":
+        event.raw_message.reply_to_message = _RaisesOnAttribute(reply, "chat", marker)
+    elif critical_property == "chat-id":
+        reply.chat = _RaisesOnAttribute(reply.chat, "id", marker)
+    elif critical_property == "topic-id":
+        event.raw_message.reply_to_message = _RaisesOnAttribute(
+            reply, "message_thread_id", marker
+        )
+    elif critical_property == "author":
+        event.raw_message.reply_to_message = _RaisesOnAttribute(
+            reply, "from_user", marker
+        )
+    elif critical_property == "author-username":
+        reply.from_user = _RaisesOnAttribute(reply.from_user, "username", marker)
+    elif critical_property == "author-is-bot":
+        reply.from_user = _RaisesOnAttribute(reply.from_user, "is_bot", marker)
+    else:
+        event.raw_message.reply_to_message = _RaisesOnAttribute(
+            reply, "external_reply", marker
+        )
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    collect.assert_called_once()
+    assert collect.call_args.kwargs["raw_reply_present"] is True
+    assert collect.call_args.kwargs["raw_reply_provenance_safe"] is False
+    base.assert_awaited_once_with(event)
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    assert marker not in caplog.text
+    assert marker not in repr(collect.call_args)
+
+
+@pytest.mark.asyncio
+async def test_safe_true_no_reply_remains_classifier_eligible(monkeypatch):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
 
     runner, roster = _runner()
     runner.__dict__["session_store"] = SimpleNamespace(
@@ -2383,28 +2558,60 @@ async def test_safe_no_reply_and_valid_same_topic_human_reply_reach_classifier(
         lookup_loaded_session_by_key=Mock(return_value=None),
     )
     classify = AsyncMock(return_value=ClassificationDecision("self"))
+    collect = Mock(wraps=context_module.collect_team_context)
     monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", collect)
     base = AsyncMock()
     monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
-    no_reply = _event(roster["default"], 310, text="safe no reply")
-    valid_reply = _event(
+    event = _event(roster["default"], 313, text="safe true no reply")
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    collect.assert_called_once()
+    assert collect.call_args.kwargs["raw_reply_present"] is False
+    assert collect.call_args.kwargs["raw_reply_provenance_safe"] is True
+    assert classify.await_args is not None
+    assert classify.await_args.kwargs["context"] == ""
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_fully_valid_present_reply_remains_in_classifier_context(monkeypatch):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=Mock(return_value="cold-exact-root"),
+        lookup_loaded_session_by_key=Mock(return_value=None),
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    collect = Mock(wraps=context_module.collect_team_context)
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", collect)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    event = _event(
         roster["default"],
-        311,
+        314,
         text="safe valid reply",
         reply_to_message_id=299,
         reply_author_username="Ordinary_Human",
         reply_text="same-chat same-topic human reply",
     )
 
-    await roster["default"].handle_message(no_reply)
-    await roster["default"].handle_message(valid_reply)
+    await roster["default"].handle_message(event)
 
-    assert classify.await_count == 2
-    assert classify.await_args_list[0].kwargs["context"] == ""
-    valid_context = classify.await_args_list[1].kwargs["context"]
+    classify.assert_awaited_once()
+    collect.assert_called_once()
+    assert collect.call_args.kwargs["raw_reply_present"] is True
+    assert collect.call_args.kwargs["raw_reply_provenance_safe"] is True
+    assert classify.await_args is not None
+    valid_context = classify.await_args.kwargs["context"]
     assert "[UNTRUSTED immediate reply id=299]" in valid_context
     assert "same-chat same-topic human reply" in valid_context
-    assert base.await_args_list == [((no_reply,), {}), ((valid_reply,), {})]
+    base.assert_awaited_once_with(event)
 
 
 @pytest.mark.asyncio
@@ -2792,6 +2999,8 @@ async def test_new_unaddressed_root_classifies_once_and_dispatches_only_selected
             "reply_to_message_id": "799",
             "reply_to_text": "quoted historical text",
             "raw_reply_to_message_id": 799,
+            "raw_reply_present": True,
+            "raw_reply_provenance_safe": True,
             "raw_reply_to_text": "quoted historical text",
             "raw_reply_chat_id": int(_ALLOWED_CHAT),
             "raw_reply_thread_id": 77,

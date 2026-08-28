@@ -128,6 +128,141 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+@dataclasses.dataclass(frozen=True)
+class _TelegramRawReplyProvenance:
+    """Sanitized raw Telegram reply fields plus fail-closed extraction state."""
+
+    present: bool
+    safe: bool
+    message_id: object = None
+    text: str | None = None
+    chat_id: object = None
+    thread_id: object = None
+    author_username: str | None = None
+    author_is_bot: bool | None = None
+    external_present: bool = False
+
+
+def _extract_telegram_raw_reply_provenance(
+    raw_message: object,
+) -> _TelegramRawReplyProvenance:
+    """Read one raw reply once without retaining or exposing hostile values."""
+
+    raw_reply_present = False
+
+    def _unsafe() -> _TelegramRawReplyProvenance:
+        return _TelegramRawReplyProvenance(raw_reply_present, False)
+
+    try:
+        raw_reply = getattr(raw_message, "reply_to_message", None)
+        raw_reply_present = raw_reply is not None
+        raw_quote = getattr(raw_message, "quote", None)
+        raw_message_external = getattr(raw_message, "external_reply", None)
+
+        if raw_quote is not None and isinstance(
+            raw_quote,
+            (str, bytes, bytearray, int, float, bool, list, tuple, set, dict),
+        ):
+            return _unsafe()
+        raw_quote_text = (
+            getattr(raw_quote, "text", None) if raw_quote is not None else None
+        )
+        if raw_quote_text is not None and type(raw_quote_text) is not str:
+            return _unsafe()
+
+        if raw_reply is None:
+            return _TelegramRawReplyProvenance(
+                False,
+                True,
+                text=raw_quote_text,
+                external_present=raw_message_external is not None,
+            )
+        if isinstance(
+            raw_reply,
+            (str, bytes, bytearray, int, float, bool, list, tuple, set, dict),
+        ):
+            return _unsafe()
+
+        raw_reply_id = getattr(raw_reply, "message_id", None)
+        raw_reply_text = getattr(raw_reply, "text", None)
+        raw_reply_caption = getattr(raw_reply, "caption", None)
+        raw_reply_chat = getattr(raw_reply, "chat", None)
+        raw_reply_thread_id = getattr(raw_reply, "message_thread_id", None)
+        raw_reply_author = getattr(raw_reply, "from_user", None)
+        raw_reply_external = getattr(raw_reply, "external_reply", None)
+
+        if (
+            raw_reply_chat is not None
+            and isinstance(
+                raw_reply_chat,
+                (str, bytes, bytearray, int, float, bool, list, tuple, set, dict),
+            )
+        ) or (
+            raw_reply_author is not None
+            and isinstance(
+                raw_reply_author,
+                (str, bytes, bytearray, int, float, bool, list, tuple, set, dict),
+            )
+        ):
+            return _unsafe()
+
+        raw_reply_chat_id = (
+            getattr(raw_reply_chat, "id", None) if raw_reply_chat is not None else None
+        )
+        raw_reply_author_username = (
+            getattr(raw_reply_author, "username", None)
+            if raw_reply_author is not None
+            else None
+        )
+        raw_reply_author_is_bot = (
+            getattr(raw_reply_author, "is_bot", None)
+            if raw_reply_author is not None
+            else None
+        )
+    except BaseException:
+        return _unsafe()
+
+    if (
+        (raw_reply_id is not None and type(raw_reply_id) not in (int, str))
+        or (raw_reply_text is not None and type(raw_reply_text) is not str)
+        or (raw_reply_caption is not None and type(raw_reply_caption) is not str)
+        or (raw_reply_chat_id is not None and type(raw_reply_chat_id) not in (int, str))
+        or (
+            raw_reply_thread_id is not None
+            and type(raw_reply_thread_id) not in (int, str)
+        )
+        or (
+            raw_reply_author_username is not None
+            and type(raw_reply_author_username) is not str
+        )
+        or (
+            raw_reply_author_is_bot is not None
+            and type(raw_reply_author_is_bot) is not bool
+        )
+    ):
+        return _unsafe()
+
+    selected_text = raw_quote_text
+    if selected_text is None:
+        selected_text = raw_reply_text
+        if selected_text is None or selected_text == "":
+            selected_text = raw_reply_caption
+    return _TelegramRawReplyProvenance(
+        True,
+        True,
+        message_id=raw_reply_id,
+        text=selected_text,
+        chat_id=raw_reply_chat_id,
+        thread_id=raw_reply_thread_id,
+        author_username=raw_reply_author_username,
+        author_is_bot=raw_reply_author_is_bot,
+        external_present=(
+            raw_message_external is not None or raw_reply_external is not None
+        ),
+    )
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -16278,10 +16413,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context_builder = getattr(adapter, "_team_route_context", None)
         if not callable(context_builder):
             return True
+        raw_reply_provenance = _extract_telegram_raw_reply_provenance(raw_message)
         try:
             context = cast(
                 TelegramTeamRouteContext,
-                context_builder(raw_message, raw_chat_id),
+                context_builder(
+                    raw_message,
+                    raw_chat_id,
+                    reply_values_supplied=True,
+                    reply_author_username=raw_reply_provenance.author_username,
+                    reply_to_message_id=raw_reply_provenance.message_id,
+                ),
             )
         except Exception:
             logger.warning(
@@ -16624,23 +16766,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         else:
                             context_safety = TeamContextSafety()
-                            raw_reply = getattr(raw_message, "reply_to_message", None)
-                            raw_quote = getattr(raw_message, "quote", None)
-                            raw_quote_text = (
-                                getattr(raw_quote, "text", None)
-                                if raw_quote is not None
-                                else None
-                            )
-                            if raw_quote_text is not None:
-                                raw_reply_text = raw_quote_text
-                            else:
-                                raw_reply_text = getattr(raw_reply, "text", None)
-                                if raw_reply_text is None or (
-                                    type(raw_reply_text) is str and raw_reply_text == ""
-                                ):
-                                    raw_reply_text = getattr(raw_reply, "caption", None)
-                            raw_reply_chat = getattr(raw_reply, "chat", None)
-                            raw_reply_author = getattr(raw_reply, "from_user", None)
                             context_text = await asyncio.to_thread(
                                 collect_team_context,
                                 self.session_store,
@@ -16648,32 +16773,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 root_message_id,
                                 reply_to_message_id=event.reply_to_message_id,
                                 reply_to_text=event.reply_to_text,
-                                raw_reply_to_message_id=getattr(
-                                    raw_reply,
-                                    "message_id",
-                                    None,
-                                ),
-                                raw_reply_to_text=raw_reply_text,
-                                raw_reply_chat_id=getattr(
-                                    raw_reply_chat,
-                                    "id",
-                                    None,
-                                ),
-                                raw_reply_thread_id=getattr(
-                                    raw_reply,
-                                    "message_thread_id",
-                                    None,
-                                ),
-                                raw_reply_author_is_bot=getattr(
-                                    raw_reply_author,
-                                    "is_bot",
-                                    None,
+                                raw_reply_to_message_id=raw_reply_provenance.message_id,
+                                raw_reply_present=raw_reply_provenance.present,
+                                raw_reply_provenance_safe=raw_reply_provenance.safe,
+                                raw_reply_to_text=raw_reply_provenance.text,
+                                raw_reply_chat_id=raw_reply_provenance.chat_id,
+                                raw_reply_thread_id=raw_reply_provenance.thread_id,
+                                raw_reply_author_is_bot=(
+                                    raw_reply_provenance.author_is_bot
                                 ),
                                 raw_external_reply_present=(
-                                    getattr(raw_message, "external_reply", None)
-                                    is not None
-                                    or getattr(raw_reply, "external_reply", None)
-                                    is not None
+                                    raw_reply_provenance.external_present
                                 ),
                                 require_complete_reply_provenance=True,
                                 safety=context_safety,

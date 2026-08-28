@@ -144,6 +144,8 @@ def _render_immediate_reply(
     reply_to_text: object,
     raw_reply_to_message_id: object,
     *,
+    raw_reply_present: object,
+    raw_reply_provenance_safe: object,
     raw_reply_to_text: object,
     raw_reply_chat_id: object,
     raw_reply_thread_id: object,
@@ -158,7 +160,9 @@ def _render_immediate_reply(
         and raw_reply_to_message_id is None
     ):
         if require_complete_reply_provenance is True and (
-            raw_reply_to_text is not None
+            raw_reply_provenance_safe is not True
+            or raw_reply_present is not False
+            or raw_reply_to_text is not None
             or raw_reply_chat_id is not None
             or raw_reply_thread_id is not None
             or raw_reply_author_is_bot is not None
@@ -190,7 +194,9 @@ def _render_immediate_reply(
             else None
         )
         if (
-            type(raw_external_reply_present) is not bool
+            raw_reply_provenance_safe is not True
+            or raw_reply_present is not True
+            or type(raw_external_reply_present) is not bool
             or raw_external_reply_present
             or type(raw_reply_to_text) is not str
             or raw_reply_to_text != reply_to_text
@@ -280,6 +286,8 @@ def collect_team_context(
     reply_to_message_id: object = None,
     reply_to_text: object = None,
     raw_reply_to_message_id: object = None,
+    raw_reply_present: object = False,
+    raw_reply_provenance_safe: object = True,
     raw_reply_to_text: object = None,
     raw_reply_chat_id: object = None,
     raw_reply_thread_id: object = None,
@@ -315,6 +323,8 @@ def collect_team_context(
             reply_to_message_id,
             reply_to_text,
             raw_reply_to_message_id,
+            raw_reply_present=raw_reply_present,
+            raw_reply_provenance_safe=raw_reply_provenance_safe,
             raw_reply_to_text=raw_reply_to_text,
             raw_reply_chat_id=raw_reply_chat_id,
             raw_reply_thread_id=raw_reply_thread_id,

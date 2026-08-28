@@ -9398,11 +9398,20 @@ class TelegramAdapter(BasePlatformAdapter):
         self,
         message: Any,
         chat_id: str,
+        *,
+        reply_values_supplied: bool = False,
+        reply_author_username: Any = None,
+        reply_to_message_id: Any = None,
     ) -> TelegramTeamRouteContext:
         """Build routing context from only the current message structure."""
-        reply_message = getattr(message, "reply_to_message", None)
-        reply_user = getattr(reply_message, "from_user", None)
-        reply_username = getattr(reply_user, "username", None)
+        if reply_values_supplied:
+            reply_username = reply_author_username
+            reply_message_id = reply_to_message_id
+        else:
+            reply_message = getattr(message, "reply_to_message", None)
+            reply_user = getattr(reply_message, "from_user", None)
+            reply_username = getattr(reply_user, "username", None)
+            reply_message_id = getattr(reply_message, "message_id", None)
         if isinstance(reply_username, str):
             reply_username = reply_username.lstrip("@").lower() or None
         else:
@@ -9414,7 +9423,7 @@ class TelegramAdapter(BasePlatformAdapter):
             owner_profile=getattr(self, "_owner_profile", None) or "default",
             owner_username=self._current_bot_username(),
             message_id=getattr(message, "message_id", None),
-            reply_to_message_id=getattr(reply_message, "message_id", None),
+            reply_to_message_id=reply_message_id,
         )
 
     def _team_route_gate_decision(
