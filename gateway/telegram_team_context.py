@@ -201,6 +201,8 @@ def _render_immediate_reply(
             or type(raw_reply_to_text) is not str
             or raw_reply_to_text != reply_to_text
             or len(raw_reply_to_text) > MAX_TEAM_CONTEXT_CHARS
+            or not reply_to_text.strip()
+            or not raw_reply_to_text.strip()
             or normalized_raw_chat_id != source.chat_id
             or normalized_raw_thread_id != expected_thread_id
             or raw_reply_author_is_bot is not False

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import time
 import weakref
 from contextlib import contextmanager
@@ -2383,6 +2384,58 @@ async def test_unsafe_immediate_reply_provenance_clarifies_without_classifier(
     classify.assert_not_awaited()
     base.assert_awaited_once_with(event)
     assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply_text",
+    ["", "   \n\t"],
+    ids=["exact-empty", "whitespace-only"],
+)
+async def test_present_blank_complete_reply_clarifies_without_classifier(
+    monkeypatch,
+    caplog,
+    reply_text,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    caplog.set_level(logging.DEBUG)
+    runner, roster = _runner()
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=Mock(return_value="cold-exact-root"),
+        lookup_loaded_session_by_key=Mock(return_value=None),
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    collect = Mock(wraps=context_module.collect_team_context)
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", collect)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    event = _event(
+        roster["default"],
+        315,
+        text="route a reply with blank canonical text",
+        reply_to_message_id=299,
+        reply_author_username="Ordinary_Human",
+        reply_text=reply_text,
+    )
+    if reply_text == "":
+        event.raw_message.reply_to_message.caption = ""
+    caplog.clear()
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    assert classify.await_args_list == []
+    collect.assert_called_once()
+    assert collect.call_args.kwargs["raw_reply_present"] is True
+    assert collect.call_args.kwargs["raw_reply_provenance_safe"] is True
+    assert collect.call_args.kwargs["reply_to_text"] == reply_text
+    assert collect.call_args.kwargs["raw_reply_to_text"] == reply_text
+    base.assert_awaited_once_with(event)
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    assert caplog.records == []
 
 
 @pytest.mark.asyncio
