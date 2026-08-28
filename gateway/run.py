@@ -16181,11 +16181,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: BasePlatformAdapter,
         event: MessageEvent,
     ) -> bool:
-        """Claim and prepare one structurally routed Telegram team event.
+        """Classify and route one Telegram team event after structural ingress checks.
 
         ``True`` means fail-closed/consumed. ``False`` leaves the normalized
-        event on Telegram's existing BasePlatformAdapter path. This seam does
-        no model routing, context retrieval, specialist dispatch, or delivery.
+        event on Telegram's existing BasePlatformAdapter path. Structural
+        replies/mentions never reach the bounded classifier path below.
         """
         from gateway.telegram_team_routing import (
             MAX_TELEGRAM_BATCH_MESSAGE_IDS,
@@ -16456,7 +16456,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or getattr(source, "session_scope_id", None) != expected_scope
             ):
                 return True
+            try:
+                routed_ownership = dispatcher.resolve_reply_owner(
+                    raw_chat_id,
+                    root_message_id,
+                )
+            except Exception:
+                return True
+            if (
+                routed_ownership is None
+                or routed_ownership.root_message_id != root_message_id
+                or routed_ownership.owner_profile != profile
+            ):
+                return True
             return False
+
+        try:
+            current_ownership = dispatcher.resolve_reply_owner(
+                raw_chat_id,
+                context.message_id,
+            )
+        except Exception:
+            return True
+        if current_ownership is not None:
+            return True
 
         reservation_attempt = dispatcher.reserve_ingress_batch(
             raw_chat_id,
@@ -16481,7 +16504,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raw_chat_id,
                 context.reply_to_message_id,
             )
-            deferred_root_binding = False
+            semantic_target_adapter: Optional[BasePlatformAdapter] = None
             if ownership is not None:
                 if (
                     ownership.owner_profile != profile
@@ -16510,33 +16533,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 owner_profile = decision.owner_profile
                 route_reason = decision.reason
                 if route_reason == "unaddressed_ingress":
-                    deferred_root_binding = True
-                else:
-                    if not dispatcher.record_root_batch(
-                        raw_chat_id,
-                        root_message_id,
-                        owner_profile,
-                        constituent_ids,
-                    ):
-                        return True
+                    from gateway.telegram_team_classifier import classify_new_root
+                    from gateway.telegram_team_context import collect_team_context
 
-            source.profile = owner_profile
-            source.session_scope_id = (
-                f"telegram-team:{raw_chat_id}:{root_message_id}"
-            )
+                    classification_source = dataclasses.replace(
+                        source,
+                        profile=team_config.coordinator_profile,
+                        profile_route_rejected=False,
+                        session_scope_id=(
+                            f"telegram-team:{raw_chat_id}:{root_message_id}"
+                        ),
+                    )
+                    profile_home = self._resolve_profile_home_for_source(
+                        classification_source
+                    )
+                    with _profile_runtime_scope(profile_home):
+                        context_text = await asyncio.to_thread(
+                            collect_team_context,
+                            self.session_store,
+                            classification_source,
+                            root_message_id,
+                        )
+                        classification = await classify_new_root(
+                            event.text,
+                            context=context_text,
+                            config=team_config,
+                        )
+
+                    classification_kind = getattr(classification, "decision", None)
+                    classified_profile = getattr(classification, "profile", None)
+                    if (
+                        classification_kind == "owner"
+                        and isinstance(classified_profile, str)
+                        and classified_profile in team_config.members
+                        and classified_profile != team_config.coordinator_profile
+                    ):
+                        owner_profile = classified_profile
+                        route_reason = "semantic_specialist"
+                        semantic_target_adapter = (
+                            self._telegram_team_adapter_for_profile(owner_profile)
+                        )
+                        if (
+                            semantic_target_adapter is None
+                            or self._telegram_team_profile_for_adapter(
+                                semantic_target_adapter
+                            )
+                            != owner_profile
+                        ):
+                            return True
+                    else:
+                        owner_profile = team_config.coordinator_profile
+                        route_reason = (
+                            "semantic_self"
+                            if classification_kind == "self"
+                            else "semantic_clarify"
+                        )
+
+                if not dispatcher.record_root_batch(
+                    raw_chat_id,
+                    root_message_id,
+                    owner_profile,
+                    constituent_ids,
+                ):
+                    return True
+
+            owner_profile = cast(str, owner_profile)
             prepared_metadata = dict(metadata)
-            prepared_metadata.update(
-                {
-                    "telegram_team_root_message_id": root_message_id,
-                    "telegram_team_owner_profile": owner_profile,
-                    "telegram_team_route_reason": route_reason,
-                    "telegram_team_ingress_claimed": True,
-                }
-            )
-            if deferred_root_binding:
-                prepared_metadata["telegram_team_root_binding_deferred"] = True
-            else:
-                prepared_metadata.pop("telegram_team_root_binding_deferred", None)
+            prepared_metadata.update({
+                "telegram_team_root_message_id": root_message_id,
+                "telegram_team_owner_profile": owner_profile,
+                "telegram_team_route_reason": route_reason,
+                "telegram_team_ingress_claimed": True,
+            })
+            prepared_metadata.pop("telegram_team_root_binding_deferred", None)
             event.metadata = prepared_metadata
 
             ingress_capability = self.__dict__.get(
@@ -16555,6 +16624,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "_telegram_team_constituent_ids_capability",
                 ingress_capability,
             )
+
+            if semantic_target_adapter is not None:
+                routed_event = self.build_target_event(
+                    event,
+                    semantic_target_adapter,
+                    owner_profile,
+                    root_message_id,
+                    route_reason=route_reason,
+                )
+                if (
+                    self._adapter_for_source(routed_event.source)
+                    is not semantic_target_adapter
+                ):
+                    return True
+                setattr(routed_event, "_telegram_team_ingress_dispatcher", dispatcher)
+                setattr(routed_event, "_telegram_team_ingress_reservation", reservation)
+                reservation = None
+                await semantic_target_adapter.handle_message(routed_event)
+                return True
+
+            source.profile = owner_profile
+            source.session_scope_id = f"telegram-team:{raw_chat_id}:{root_message_id}"
             setattr(event, "_telegram_team_ingress_dispatcher", dispatcher)
             setattr(event, "_telegram_team_ingress_reservation", reservation)
             reservation = None

@@ -6,7 +6,9 @@ import asyncio
 import dataclasses
 import time
 import weakref
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -15,7 +17,11 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, SessionStore, build_session_key
+from gateway.telegram_team_classifier import (
+    ClassificationDecision,
+    parse_classification_output,
+)
 from gateway.telegram_team_routing import RootOwnership
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -337,7 +343,7 @@ async def test_pending_reservation_consumes_duplicate_then_commit_consumes_repla
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "cancellation"])
-async def test_base_submission_failure_releases_reservation_and_retry_dispatches(
+async def test_base_submission_failure_releases_reservation_but_bound_replay_is_consumed(
     monkeypatch,
     failure,
 ):
@@ -370,8 +376,8 @@ async def test_base_submission_failure_releases_reservation_and_retry_dispatches
 
     release.assert_called_once()
     commit.assert_not_called()
-    # Root/alias preparation is intentionally idempotent and may remain after
-    # Base rejects submission; the released reservation must not suppress retry.
+    # The durable root binding means a duplicate copy stays consumed even when
+    # the adapter releases its now-redundant pending reservation.
     assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 91) == RootOwnership(
         "91",
         "engineering",
@@ -379,8 +385,8 @@ async def test_base_submission_failure_releases_reservation_and_retry_dispatches
 
     retry = _event(adapter, 91, text="@Woz_Bot investigate again")
     await adapter.handle_message(retry)
-    assert calls == 2
-    commit.assert_called_once()
+    assert calls == 1
+    commit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -392,7 +398,7 @@ async def test_base_submission_failure_releases_reservation_and_retry_dispatches
         ("invalid-decision", None),
     ],
 )
-async def test_ingress_callback_failure_after_attachment_releases_before_consuming(
+async def test_ingress_callback_failure_after_binding_releases_but_consumes_replay(
     monkeypatch,
     callback_failure,
     expected_error,
@@ -430,7 +436,7 @@ async def test_ingress_callback_failure_after_attachment_releases_before_consumi
     base_handle.assert_not_awaited()
     adapter.set_team_ingress_handler(original_handler)
     await adapter.handle_message(_event(adapter, 92, text="@Woz_Bot retry"))
-    base_handle.assert_awaited_once()
+    base_handle.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -796,7 +802,14 @@ async def test_incompatible_internal_constituent_parents_fail_closed_before_rese
 async def test_unaddressed_batch_carries_validated_ids_only_in_runner_capability(
     monkeypatch,
 ):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
     runner, roster = _runner()
+    runner.session_store = SessionStore.__new__(SessionStore)
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", Mock(return_value=""))
     adapter = roster["default"]
     _prepare_batching(adapter)
     base_handle = AsyncMock()
@@ -823,8 +836,13 @@ async def test_unaddressed_batch_carries_validated_ids_only_in_runner_capability
     assert "constituent" not in repr(first.metadata).lower()
     dispatcher = runner._telegram_team_dispatcher
     assert dispatcher is not None
-    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 900) is None
-    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 901) is None
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 900) == RootOwnership(
+        "900", "default"
+    )
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 901) == RootOwnership(
+        "900", "default"
+    )
+    classify.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1917,26 +1935,35 @@ async def test_structural_ingress_records_three_hop_human_chain_with_interleaved
 
 
 @pytest.mark.asyncio
-async def test_unaddressed_ingress_defers_immutable_root_binding():
+async def test_unaddressed_ingress_classifies_and_binds_coordinator_root(monkeypatch):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
     runner, roster = _runner()
+    runner.session_store = SessionStore.__new__(SessionStore)
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", Mock(return_value=""))
     event = _event(roster["default"], 300, text="please investigate this")
 
     assert (
         await roster["default"]._team_ingress_handler(roster["default"], event) is False
     )
 
-    assert (
-        runner._telegram_team_dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 300) is None
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 300) == RootOwnership(
+        "300", "default"
     )
     assert event.metadata == {
         "existing": "value",
         "telegram_team_root_message_id": "300",
         "telegram_team_owner_profile": "default",
-        "telegram_team_route_reason": "unaddressed_ingress",
+        "telegram_team_route_reason": "semantic_self",
         "telegram_team_ingress_claimed": True,
-        "telegram_team_root_binding_deferred": True,
     }
     assert event.source.session_scope_id == f"telegram-team:{_ALLOWED_CHAT}:300"
+    classify.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2045,8 +2072,11 @@ async def test_valid_internal_routed_event_bypasses_second_claim_and_classificat
         "600",
         route_reason="semantic_specialist",
     )
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.record_root(_ALLOWED_CHAT, "600", "design")
     claim = Mock(side_effect=AssertionError("routed target must not claim again"))
-    runner._telegram_team_dispatcher.claim_ingress = claim
+    dispatcher.claim_ingress = claim
 
     consumed = await roster["design"]._team_ingress_handler(roster["design"], routed)
 
@@ -2074,3 +2104,351 @@ async def test_internal_routed_event_with_mismatched_owner_is_consumed():
         is True
     )
     claim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_unaddressed_root_classifies_once_and_dispatches_only_selected_adapter(
+    monkeypatch,
+):
+    import gateway.run as run_module
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    team_config = runner._telegram_team_config
+    assert team_config is not None
+    runner.session_store = SessionStore.__new__(SessionStore)
+    original = _event(
+        roster["default"],
+        800,
+        text="Please design the new checkout",
+        reply_to_message_id=799,
+        reply_author_username="outside_user",
+        message_type=MessageType.PHOTO,
+    )
+    original.platform_update_id = 4242
+    collected_source = None
+    scope_active = False
+
+    def _collect(store, source, root_message_id, **kwargs):
+        nonlocal collected_source
+        assert scope_active is True
+        assert store is runner.session_store
+        assert root_message_id == "800"
+        assert kwargs == {}
+        collected_source = source
+        return "[UNTRUSTED TELEGRAM TEAM CONTEXT]\n[UNTRUSTED user] earlier"
+
+    classify = AsyncMock(
+        return_value=parse_classification_output(
+            '{"decision":"owner","profile":"design"}',
+            config=team_config,
+        )
+    )
+
+    @contextmanager
+    def _scope(home):
+        nonlocal scope_active
+        assert home == Path("/safe/default")
+        assert scope_active is False
+        scope_active = True
+        try:
+            yield
+        finally:
+            scope_active = False
+
+    runner._resolve_profile_home_for_source = Mock(return_value=Path("/safe/default"))
+    monkeypatch.setattr(run_module, "_profile_runtime_scope", _scope)
+    monkeypatch.setattr(context_module, "collect_team_context", _collect)
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+
+    normal_calls = []
+
+    async def _base(current_adapter, event):
+        normal_calls.append((current_adapter, event))
+        assert runner._adapter_for_source(event.source) is current_adapter
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+
+    await roster["default"].handle_message(original)
+    await roster["default"].handle_message(
+        _event(roster["default"], 800, text="duplicate replay")
+    )
+
+    classify.assert_awaited_once_with(
+        original.text,
+        context="[UNTRUSTED TELEGRAM TEAM CONTEXT]\n[UNTRUSTED user] earlier",
+        config=runner._telegram_team_config,
+    )
+    assert collected_source is not None
+    assert collected_source is not original.source
+    assert collected_source.profile == "default"
+    assert collected_source.session_scope_id == (f"telegram-team:{_ALLOWED_CHAT}:800")
+    assert normal_calls and len(normal_calls) == 1
+    selected_adapter, routed = normal_calls[0]
+    assert selected_adapter is roster["design"]
+    assert routed is not original
+    assert routed.text == original.text
+    assert routed.user_id == original.user_id
+    assert routed.user_name == original.user_name
+    assert routed.message_type is MessageType.PHOTO
+    assert routed.message_id == original.message_id
+    assert routed.platform_update_id == 4242
+    assert routed.source.thread_id == original.source.thread_id
+    assert routed.reply_to_message_id == original.reply_to_message_id
+    assert routed.reply_to_text == original.reply_to_text
+    assert routed.reply_to_author_id == original.reply_to_author_id
+    assert routed.reply_to_author_name == original.reply_to_author_name
+    assert routed.media_urls == original.media_urls
+    assert routed.media_urls is not original.media_urls
+    assert routed.media_types == original.media_types
+    assert routed.media_types is not original.media_types
+    assert routed.source.profile == "design"
+    assert routed.source.session_scope_id == f"telegram-team:{_ALLOWED_CHAT}:800"
+    assert runner._adapter_for_source(routed.source) is roster["design"]
+    assert routed.metadata["telegram_team_route_reason"] == "semantic_specialist"
+    assert runner._telegram_team_dispatcher.resolve_reply_owner(
+        _ALLOWED_CHAT, 800
+    ) == RootOwnership("800", "design")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["self", "clarify"])
+async def test_self_or_clarify_runs_only_coordinator_normal_handler(
+    monkeypatch,
+    decision,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    runner.session_store = SessionStore.__new__(SessionStore)
+    event = _event(roster["default"], 810, text="new unaddressed root")
+    original_source = event.source
+    classify = AsyncMock(return_value=ClassificationDecision(decision))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", Mock(return_value=""))
+
+    normal_calls = []
+
+    async def _base(current_adapter, current_event):
+        normal_calls.append((current_adapter, current_event))
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", _base)
+
+    await roster["default"].handle_message(event)
+    await roster["default"].handle_message(
+        _event(roster["default"], 810, text="replay")
+    )
+
+    classify.assert_awaited_once()
+    assert normal_calls == [(roster["default"], event)]
+    assert event.source is original_source
+    assert runner._adapter_for_source(event.source) is roster["default"]
+    assert event.source.profile == "default"
+    assert event.source.session_scope_id == f"telegram-team:{_ALLOWED_CHAT}:810"
+    assert event.metadata["telegram_team_route_reason"] == f"semantic_{decision}"
+    assert "telegram_team_root_binding_deferred" not in event.metadata
+    assert runner._telegram_team_dispatcher.resolve_reply_owner(
+        _ALLOWED_CHAT, 810
+    ) == RootOwnership("810", "default")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route_kind",
+    ["mention", "known-root", "reply-author"],
+)
+async def test_structural_routes_never_collect_context_or_classify(
+    monkeypatch,
+    route_kind,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    classifier = AsyncMock(side_effect=AssertionError("must not classify"))
+    collector = Mock(side_effect=AssertionError("must not collect context"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classifier)
+    monkeypatch.setattr(context_module, "collect_team_context", collector)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    if route_kind == "mention":
+        adapter = roster["design"]
+        event = _event(adapter, 820, text="@Virgil_Bot please help")
+    elif route_kind == "known-root":
+        adapter = roster["engineering"]
+        assert runner._telegram_team_dispatcher.record_root(
+            _ALLOWED_CHAT, 700, "engineering"
+        )
+        event = _event(adapter, 821, reply_to_message_id=700)
+    else:
+        adapter = roster["engineering"]
+        event = _event(
+            adapter,
+            822,
+            reply_to_message_id=699,
+            reply_author_username="Woz_Bot",
+        )
+
+    await adapter.handle_message(event)
+
+    base.assert_awaited_once_with(event)
+    classifier.assert_not_awaited()
+    collector.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pending_duplicate_and_replay_do_not_reclassify_or_reinvoke(
+    monkeypatch,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    team_config = runner._telegram_team_config
+    assert team_config is not None
+    runner.session_store = SessionStore.__new__(SessionStore)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def _classify(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return parse_classification_output(
+            '{"decision":"owner","profile":"engineering"}',
+            config=team_config,
+        )
+
+    monkeypatch.setattr(classifier_module, "classify_new_root", _classify)
+    monkeypatch.setattr(context_module, "collect_team_context", Mock(return_value=""))
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    first = _event(roster["default"], 830, text="route this")
+
+    task = asyncio.create_task(roster["default"].handle_message(first))
+    await entered.wait()
+    await roster["default"].handle_message(
+        _event(roster["default"], 830, text="pending duplicate")
+    )
+    release.set()
+    await task
+    await roster["default"].handle_message(
+        _event(roster["default"], 830, text="committed replay")
+    )
+
+    assert calls == 1
+    base.assert_awaited_once()
+    assert (
+        runner._adapter_for_source(base.await_args.args[0].source)
+        is roster["engineering"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_classifier_cancellation_releases_without_binding_and_retry_succeeds(
+    monkeypatch,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    runner.session_store = SessionStore.__new__(SessionStore)
+    classify = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", Mock(return_value=""))
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    with pytest.raises(asyncio.CancelledError):
+        await roster["default"].handle_message(
+            _event(roster["default"], 840, text="cancel this classification")
+        )
+
+    assert (
+        runner._telegram_team_dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 840) is None
+    )
+    base.assert_not_awaited()
+    retry_reservation = runner._telegram_team_dispatcher.reserve_ingress_batch(
+        _ALLOWED_CHAT, [840], "default"
+    )
+    assert retry_reservation.reserved is True
+    assert retry_reservation.reservation is not None
+    assert runner._telegram_team_dispatcher.release_ingress(
+        retry_reservation.reservation
+    )
+
+    classify.side_effect = None
+    classify.return_value = ClassificationDecision("clarify", reason="provider_error")
+    retry = _event(roster["default"], 840, text="retry")
+    await roster["default"].handle_message(retry)
+
+    assert classify.await_count == 2
+    base.assert_awaited_once_with(retry)
+    assert runner._telegram_team_dispatcher.resolve_reply_owner(
+        _ALLOWED_CHAT, 840
+    ) == RootOwnership("840", "default")
+
+
+@pytest.mark.asyncio
+async def test_bound_specialist_cancellation_propagates_and_replay_stays_consumed(
+    monkeypatch,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    team_config = runner._telegram_team_config
+    assert team_config is not None
+    runner.session_store = SessionStore.__new__(SessionStore)
+    classify = AsyncMock(
+        return_value=parse_classification_output(
+            '{"decision":"owner","profile":"engineering"}',
+            config=team_config,
+        )
+    )
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    monkeypatch.setattr(context_module, "collect_team_context", Mock(return_value=""))
+    base = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+    first = _event(roster["default"], 841, text="engineering should own this")
+
+    with pytest.raises(asyncio.CancelledError):
+        await roster["default"].handle_message(first)
+
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 841) == RootOwnership(
+        "841", "engineering"
+    )
+    await roster["default"].handle_message(
+        _event(roster["default"], 841, text="replayed after cancellation")
+    )
+
+    classify.assert_awaited_once()
+    base.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_internal_routed_event_requires_matching_bound_root_owner():
+    runner, roster = _runner()
+    original = _event(roster["default"], 850)
+    routed = runner.build_target_event(
+        original,
+        roster["engineering"],
+        "engineering",
+        "850",
+        route_reason="semantic_specialist",
+    )
+    reserve = Mock(side_effect=AssertionError("internal route must not reserve"))
+    runner._telegram_team_dispatcher.reserve_ingress_batch = reserve
+
+    assert (
+        await roster["engineering"]._team_ingress_handler(roster["engineering"], routed)
+        is True
+    )
+    reserve.assert_not_called()
