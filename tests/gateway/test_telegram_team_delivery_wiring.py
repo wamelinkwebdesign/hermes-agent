@@ -16,8 +16,6 @@ as it was.
 
 from __future__ import annotations
 
-import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -206,7 +204,7 @@ class TestTurnSettlesTheDebt:
     @pytest.mark.asyncio
     async def test_delivered_turn_closes_as_answered(self):
         adapter = _adapter("default")
-        oid = self._record()
+        self._record()
         send = AsyncMock()
         adapter.send = send
 
@@ -589,7 +587,7 @@ class TestBootSweepSpeaksForDeadProcesses:
     @pytest.mark.asyncio
     async def test_missing_owner_adapter_releases_the_claim(self):
         runner, roster = _runner()
-        oid = self._record_dead(runner, owner="engineering")
+        self._record_dead(runner, owner="engineering")
         claimed = await runner._claim_team_fallback_obligations()
         assert len(claimed) == 1
         # The adapter disappears between claim and send (reconnect churn).
