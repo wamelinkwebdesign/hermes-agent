@@ -89,6 +89,62 @@ def _runner() -> tuple[GatewayRunner, dict[str, TelegramAdapter]]:
     return runner, roster
 
 
+def _named_coordinator_runner() -> tuple[GatewayRunner, dict[str, TelegramAdapter]]:
+    usernames = {
+        "ops": "Ace_Bot",
+        "engineering": "Woz_Bot",
+        "design": "Virgil_Bot",
+    }
+    bot_ids = {"ops": 11, "engineering": 20, "design": 30}
+    roster: dict[str, TelegramAdapter] = {}
+    for profile, username in usernames.items():
+        adapter = object.__new__(TelegramAdapter)
+        adapter.platform = Platform.TELEGRAM
+        adapter.config = PlatformConfig(
+            enabled=True,
+            token=f"token-{profile}",
+            extra={},
+        )
+        adapter._team_route_gate = None
+        adapter._team_ingress_handler = None
+        adapter._bot_username_observed = username.lower()
+        adapter._bot = SimpleNamespace(id=bot_ids[profile], username=username)
+        adapter._bot_identity_checked_at = time.monotonic()
+        adapter.set_owner_profile(profile)
+        roster[profile] = adapter
+
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=["engineering", "design"],
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="token-ops",
+                extra={
+                    "team_routing": {
+                        "coordinator_profile": "ops",
+                        "coordinator_username": "Ace_Bot",
+                        "members": usernames,
+                        "allowed_chats": [_ALLOWED_CHAT],
+                    }
+                },
+            )
+        },
+    )
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = config
+    runner.adapters = {Platform.TELEGRAM: roster["ops"]}
+    runner._profile_adapters = {
+        profile: {Platform.TELEGRAM: roster[profile]}
+        for profile in ("engineering", "design")
+    }
+    runner._active_profile_name = lambda: "ops"
+    for adapter in roster.values():
+        adapter.gateway_runner = runner
+    assert runner._validate_and_install_telegram_team_runtime() is True
+    return runner, roster
+
+
 def _prepare_batching(adapter: TelegramAdapter) -> None:
     adapter._drop_delayed_deliveries = False
     adapter._pending_text_batches = {}
@@ -2005,6 +2061,62 @@ async def test_unaddressed_ingress_classifies_and_binds_coordinator_root(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_named_coordinator_loaded_root_context_reaches_classifier_exactly(
+    monkeypatch,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _named_coordinator_runner()
+    event = _event(roster["ops"], 320, text="please route with loaded context")
+    origin = dataclasses.replace(
+        event.source,
+        profile="ops",
+        session_scope_id=f"telegram-team:{_ALLOWED_CHAT}:320",
+    )
+    entry = SimpleNamespace(session_id="ops-shared-root", origin=origin)
+    key_builder = Mock(return_value="ops-exact-root")
+    exact_lookup = Mock(return_value=entry)
+    get_messages = Mock(
+        return_value=[
+            {
+                "id": 1,
+                "role": "user",
+                "content": "exact loaded ops root context",
+            }
+        ]
+    )
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _generate_session_key=key_builder,
+        lookup_loaded_session_by_key=exact_lookup,
+        _db=SimpleNamespace(get_messages=get_messages),
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["ops"].handle_message(event)
+
+    classify.assert_awaited_once()
+    assert classify.await_args is not None
+    classifier_context = classify.await_args.kwargs["context"]
+    assert "[UNTRUSTED user] exact loaded ops root context" in classifier_context
+    assert classify.await_args.kwargs["config"].coordinator_profile == "ops"
+    key_builder.assert_called_once()
+    requested_source = key_builder.call_args.args[0]
+    assert requested_source.profile == "ops"
+    assert requested_source.session_scope_id == f"telegram-team:{_ALLOWED_CHAT}:320"
+    exact_lookup.assert_called_once_with("ops-exact-root")
+    get_messages.assert_called_once_with("ops-shared-root", limit=12, latest=True)
+    base.assert_awaited_once_with(event)
+    dispatcher = runner._telegram_team_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.resolve_reply_owner(_ALLOWED_CHAT, 320) == RootOwnership(
+        "320", "ops"
+    )
+
+
+@pytest.mark.asyncio
 async def test_unaddressed_ingress_force_redacts_current_text_before_classifier(
     monkeypatch,
     caplog,
@@ -2079,6 +2191,199 @@ async def test_spaced_current_credentials_never_reach_classifier_or_logs(
         assert secret not in captured
         assert secret not in caplog.text
     base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "surface",
+    ["current", "transcript", "immediate-reply"],
+)
+async def test_adversarial_credentials_leave_no_fragments_at_classifier_boundary(
+    monkeypatch,
+    caplog,
+    surface,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    current_token = "sk-" + "CURRENTKNOWNPREFIXBODYCURRENTTAIL"
+    transcript_token = "ghp_" + "TRANSCRIPTKNOWNPREFIXBODYTRANSCRIPTAIL"
+    reply_token = "xoxb-" + "REPLYKNOWNPREFIXBODYREPLYTAIL"
+    materials = {
+        "current": (
+            'password = "CURRENTFIRSTLINE\nCURRENTESCAPED\\"QUOTE\\"CURRENTSECRETAIL"\n'
+            'Authorization: Digest username="CURRENTDIGESTUSER", '
+            'response="CURRENTDIGESTRESPONSE"\n'
+            f"standalone {current_token}"
+        ),
+        "transcript": (
+            'client_secret = "TRANSCRIPTFIRSTLINE\n'
+            'TRANSCRIPTESCAPED\\"QUOTE\\"TRANSCRIPTSECRETAIL"\n'
+            "Authorization: AWS4-HMAC-SHA256 Credential=TRANSCRIPTAWSACCESS/date, "
+            "SignedHeaders=host, Signature=TRANSCRIPTAWSSIGNATURE\n"
+            f"standalone {transcript_token}"
+        ),
+        "immediate-reply": (
+            'token = "REPLYFIRSTLINE\nREPLYESCAPED\\"QUOTE\\"REPLYSECRETAIL"\n'
+            "Authorization: Basic REPLYBASICOPAQUEVALUE\n"
+            f"standalone {reply_token}"
+        ),
+    }
+    fragments = {
+        "current": (
+            "CURRENTFIRSTLINE",
+            "CURRENTESCAPED",
+            "CURRENTSECRETAIL",
+            "CURRENTDIGESTUSER",
+            "CURRENTDIGESTRESPONSE",
+            "sk-",
+            "CURRENTKNOWNPREFIXBODY",
+            "CURRENTTAIL",
+        ),
+        "transcript": (
+            "TRANSCRIPTFIRSTLINE",
+            "TRANSCRIPTESCAPED",
+            "TRANSCRIPTSECRETAIL",
+            "TRANSCRIPTAWSACCESS",
+            "TRANSCRIPTAWSSIGNATURE",
+            "ghp_",
+            "TRANSCRIPTKNOWNPREFIXBODY",
+            "TRANSCRIPTAIL",
+        ),
+        "immediate-reply": (
+            "REPLYFIRSTLINE",
+            "REPLYESCAPED",
+            "REPLYSECRETAIL",
+            "REPLYBASICOPAQUEVALUE",
+            "xoxb-",
+            "REPLYKNOWNPREFIXBODY",
+            "REPLYTAIL",
+        ),
+    }
+    if surface == "current":
+        event = _event(roster["default"], 321, text=materials[surface])
+    elif surface == "immediate-reply":
+        event = _event(
+            roster["default"],
+            321,
+            text="route using the immediate reply",
+            reply_to_message_id=299,
+            reply_author_username="Ordinary_Human",
+            reply_text=materials[surface],
+        )
+    else:
+        event = _event(
+            roster["default"],
+            321,
+            text="route using the loaded transcript",
+        )
+
+    if surface == "transcript":
+        origin = dataclasses.replace(
+            event.source,
+            profile="default",
+            session_scope_id=f"telegram-team:{_ALLOWED_CHAT}:321",
+        )
+        entry = SimpleNamespace(session_id="adversarial-root", origin=origin)
+        runner.__dict__["session_store"] = SimpleNamespace(
+            _generate_session_key=Mock(return_value="adversarial-exact-root"),
+            lookup_loaded_session_by_key=Mock(return_value=entry),
+            _db=SimpleNamespace(
+                get_messages=Mock(
+                    return_value=[
+                        {"id": 1, "role": "user", "content": materials[surface]}
+                    ]
+                )
+            ),
+        )
+    else:
+        runner.__dict__["session_store"] = SimpleNamespace(
+            _generate_session_key=Mock(return_value="adversarial-cold-root"),
+            lookup_loaded_session_by_key=Mock(return_value=None),
+        )
+
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    assert classify.await_args is not None
+    captured = repr(classify.await_args)
+    for fragment in fragments[surface]:
+        assert fragment not in captured
+        assert fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "surface",
+    ["current", "transcript", "immediate-reply"],
+)
+async def test_ambiguous_quoted_credentials_clarify_without_classifier(
+    monkeypatch,
+    caplog,
+    surface,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    ambiguous = 'password = "AMBIGUOUSSECRETFIRST\nAMBIGUOUSSECRETTAIL\\'
+    if surface == "current":
+        event = _event(roster["default"], 322, text=ambiguous)
+    elif surface == "immediate-reply":
+        event = _event(
+            roster["default"],
+            322,
+            text="route ambiguous reply safely",
+            reply_to_message_id=299,
+            reply_author_username="Ordinary_Human",
+            reply_text=ambiguous,
+        )
+    else:
+        event = _event(
+            roster["default"],
+            322,
+            text="route ambiguous transcript safely",
+        )
+
+    if surface == "transcript":
+        origin = dataclasses.replace(
+            event.source,
+            profile="default",
+            session_scope_id=f"telegram-team:{_ALLOWED_CHAT}:322",
+        )
+        entry = SimpleNamespace(session_id="ambiguous-root", origin=origin)
+        runner.__dict__["session_store"] = SimpleNamespace(
+            _generate_session_key=Mock(return_value="ambiguous-exact-root"),
+            lookup_loaded_session_by_key=Mock(return_value=entry),
+            _db=SimpleNamespace(
+                get_messages=Mock(
+                    return_value=[{"id": 1, "role": "user", "content": ambiguous}]
+                )
+            ),
+        )
+    else:
+        runner.__dict__["session_store"] = SimpleNamespace(
+            _generate_session_key=Mock(return_value="ambiguous-cold-root"),
+            lookup_loaded_session_by_key=Mock(return_value=None),
+        )
+
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    base.assert_awaited_once_with(event)
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    assert "AMBIGUOUSSECRETFIRST" not in caplog.text
+    assert "AMBIGUOUSSECRETTAIL" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3049,6 +3354,7 @@ async def test_new_unaddressed_root_classifies_once_and_dispatches_only_selected
         assert safety.redaction_failed is False
         assert safety.unsafe is False
         assert kwargs == {
+            "coordinator_profile": "default",
             "reply_to_message_id": "799",
             "reply_to_text": "quoted historical text",
             "raw_reply_to_message_id": 799,

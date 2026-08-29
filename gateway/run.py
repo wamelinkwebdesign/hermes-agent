@@ -16771,6 +16771,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 self.session_store,
                                 classification_source,
                                 root_message_id,
+                                coordinator_profile=team_config.coordinator_profile,
                                 reply_to_message_id=event.reply_to_message_id,
                                 reply_to_text=event.reply_to_text,
                                 raw_reply_to_message_id=raw_reply_provenance.message_id,

@@ -12,6 +12,7 @@ from gateway.session import SessionSource
 from gateway.telegram_team_routing import (
     _normalize_group_chat_id,
     _normalize_message_id,
+    _normalize_profile,
 )
 
 MAX_TEAM_CONTEXT_MESSAGES = 12
@@ -27,25 +28,39 @@ _STRICT_SECRET_KEY = (
     rf"(?:{_STRICT_SECRET_NAME}|"
     rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}{_STRICT_SECRET_NAME})"
 )
-_STRICT_SECRET_VALUE = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|[^\s&#;,?]+)'
-_STRICT_ASSIGNMENT_RE = re.compile(
-    rf"(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
-    rf"(?P<key>{_STRICT_SECRET_KEY})(?P=key_quote)\s*[:=]\s*)"
-    rf"(?P<value>{_STRICT_SECRET_VALUE})",
+_STRICT_ASSIGNMENT_START_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
+    rf"(?P<key>{_STRICT_SECRET_KEY})(?P=key_quote)[ \t]*[:=][ \t]*",
     re.IGNORECASE,
 )
-_STRICT_AUTHORIZATION_RE = re.compile(
-    rf"(?P<prefix>(?<![A-Za-z0-9_.-])authorization\s*[:=]\s*"
-    rf"(?:(?:bearer|basic)\s+)?)"
-    rf"(?P<value>{_STRICT_SECRET_VALUE})",
+_AMBIGUOUS_OPEN_SECRET_KEY_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.-])[\"']{_STRICT_SECRET_KEY}[ \t]*[:=]",
     re.IGNORECASE,
 )
-_STRICT_BEARER_RE = re.compile(
-    rf"(?P<prefix>(?<![A-Za-z0-9_-])bearer[ \t]+)"
-    rf"(?P<value>{_STRICT_SECRET_VALUE})",
+_AMBIGUOUS_CLOSE_SECRET_KEY_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.\-\"']){_STRICT_SECRET_KEY}[\"'][ \t]*[:=]",
     re.IGNORECASE,
+)
+_STRICT_AUTHORIZATION_START_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:Proxy-)?Authorization[ \t]*[:=][ \t]*",
+    re.IGNORECASE,
+)
+_STRICT_BEARER_START_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])Bearer[ \t]+",
+    re.IGNORECASE,
+)
+_CANONICAL_REDACTION_SENTINEL_RE = re.compile(
+    r"«redacted(?:-secret|:[^»]*)?»",
+    re.IGNORECASE,
+)
+_CANONICAL_MASK_ARTIFACT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
+    r"eyJ[A-Za-z0-9_-]{3}\.\.\.[A-Za-z0-9_=-]{4}|"
+    r"(?:bot)?[0-9]{8,}:\*{3}"
+    r")(?![A-Za-z0-9_-])"
 )
 _STRICT_REDACTION = "[REDACTED]"
+_MAX_STRICT_PARSE_CHARS = MAX_TEAM_CONTEXT_CHARS
 
 
 @dataclass
@@ -60,26 +75,111 @@ class _TeamContextRedactionError(Exception):
     pass
 
 
-def _mask_strict_match(match: re.Match[str]) -> str:
-    """Replace one already-matched value without logging or retaining it."""
-    value = match.group("value")
-    if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0]:
-        replacement = f"{value[0]}{_STRICT_REDACTION}{value[0]}"
-    else:
-        replacement = _STRICT_REDACTION
-    return match.group("prefix") + replacement
+def _bounded_field_end(text: str, start: int) -> int:
+    """Return the end of one physical field and folded continuations."""
+    field_end = text.find("\n", start)
+    if field_end < 0:
+        return len(text)
+    while field_end < len(text):
+        continuation_start = field_end + 1
+        if continuation_start >= len(text) or text[continuation_start] not in " \t":
+            break
+        next_end = text.find("\n", continuation_start)
+        field_end = len(text) if next_end < 0 else next_end
+    return field_end
+
+
+def _redact_bounded_fields(text: str, start_pattern: re.Pattern[str]) -> str:
+    """Mask complete physical fields, including folded continuation lines."""
+    rendered: list[str] = []
+    cursor = 0
+    while match := start_pattern.search(text, cursor):
+        rendered.append(text[cursor : match.end()])
+        rendered.append(_STRICT_REDACTION)
+        cursor = _bounded_field_end(text, match.end())
+    rendered.append(text[cursor:])
+    return "".join(rendered)
+
+
+def _redact_authorization_fields(text: str) -> str:
+    """Mask Authorization values for every authentication scheme."""
+    return _redact_bounded_fields(text, _STRICT_AUTHORIZATION_START_RE)
+
+
+def _quoted_value_end(text: str, start: int, quote: str) -> int:
+    """Return the end of one escaped, possibly multiline quoted value."""
+    escaped = False
+    for index in range(start + 1, len(text)):
+        character = text[index]
+        if character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n"):
+            raise _TeamContextRedactionError
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character == quote:
+            end = index + 1
+            if end < len(text) and (text[end].isalnum() or text[end] in "_.-\\\"'"):
+                raise _TeamContextRedactionError
+            return end
+    raise _TeamContextRedactionError
 
 
 def _strict_redact_credential_assignments(text: str) -> str:
-    """Mask assignment/query and Authorization/Bearer credentials."""
-    redacted = _STRICT_AUTHORIZATION_RE.sub(_mask_strict_match, text)
-    redacted = _STRICT_BEARER_RE.sub(_mask_strict_match, redacted)
-    return _STRICT_ASSIGNMENT_RE.sub(_mask_strict_match, redacted)
+    """Parse and completely mask bounded sensitive assignments and headers."""
+    if len(text) > _MAX_STRICT_PARSE_CHARS:
+        raise _TeamContextRedactionError
+    text.encode("utf-8", errors="strict")
+    redacted = _redact_authorization_fields(text)
+    redacted = _redact_bounded_fields(redacted, _STRICT_BEARER_START_RE)
+    rendered: list[str] = []
+    cursor = 0
+    while match := _STRICT_ASSIGNMENT_START_RE.search(redacted, cursor):
+        if (
+            not match.group("key_quote")
+            and match.start() > 0
+            and redacted[match.start() - 1] in {'"', "'"}
+        ):
+            raise _TeamContextRedactionError
+        rendered.append(redacted[cursor : match.end()])
+        value_start = match.end()
+        if value_start >= len(redacted):
+            raise _TeamContextRedactionError
+        opening = redacted[value_start]
+        if opening in {'"', "'"}:
+            value_end = _quoted_value_end(redacted, value_start, opening)
+        else:
+            value_end = value_start
+            while (
+                value_end < len(redacted)
+                and not redacted[value_end].isspace()
+                and redacted[value_end] not in "&#;,?"
+            ):
+                if redacted[value_end] == "\x00":
+                    raise _TeamContextRedactionError
+                value_end += 1
+            if value_end == value_start:
+                raise _TeamContextRedactionError
+        rendered.append(_STRICT_REDACTION)
+        cursor = _bounded_field_end(redacted, value_end)
+    rendered.append(redacted[cursor:])
+    joined = "".join(rendered)
+    if _AMBIGUOUS_OPEN_SECRET_KEY_RE.search(
+        joined
+    ) or _AMBIGUOUS_CLOSE_SECRET_KEY_RE.search(joined):
+        raise _TeamContextRedactionError
+    without_sentinels = _CANONICAL_REDACTION_SENTINEL_RE.sub(
+        _STRICT_REDACTION,
+        joined,
+    )
+    return _CANONICAL_MASK_ARTIFACT_RE.sub(_STRICT_REDACTION, without_sentinels)
 
 
 def redact_team_classifier_text(text: object) -> str | None:
-    """Apply canonical then stricter classifier-boundary secret redaction."""
-    if type(text) is not str:
+    """Apply canonical then strict, fragment-free classifier redaction."""
+    if type(text) is not str or len(text) > _MAX_STRICT_PARSE_CHARS:
         return None
     try:
         from agent.redact import redact_sensitive_text
@@ -87,6 +187,7 @@ def redact_team_classifier_text(text: object) -> str | None:
         redacted = redact_sensitive_text(
             text,
             force=True,
+            file_read=True,
             redact_url_credentials=True,
         )
         if type(redacted) is not str:
@@ -97,7 +198,11 @@ def redact_team_classifier_text(text: object) -> str | None:
         return None
 
 
-def _is_exact_shared_root_source(source: object, root_message_id: str) -> bool:
+def _is_exact_shared_root_source(
+    source: object,
+    root_message_id: str,
+    coordinator_profile: str,
+) -> bool:
     if not isinstance(source, SessionSource):
         return False
     chat_id = _normalize_group_chat_id(source.chat_id)
@@ -107,12 +212,16 @@ def _is_exact_shared_root_source(source: object, root_message_id: str) -> bool:
         and source.chat_type == "group"
         and chat_id is not None
         and chat_id == source.chat_id
-        and source.profile == "default"
+        and source.profile == coordinator_profile
         and source.session_scope_id == expected_scope
     )
 
 
-def _same_shared_root(left: SessionSource, right: object) -> bool:
+def _same_shared_root(
+    left: SessionSource,
+    right: object,
+    coordinator_profile: str,
+) -> bool:
     if not isinstance(right, SessionSource):
         return False
     return bool(
@@ -121,7 +230,7 @@ def _same_shared_root(left: SessionSource, right: object) -> bool:
         and right.chat_id == left.chat_id
         and right.thread_id == left.thread_id
         and right.scope_id == left.scope_id
-        and right.profile == left.profile == "default"
+        and right.profile == left.profile == coordinator_profile
         and right.session_scope_id == left.session_scope_id
     )
 
@@ -285,6 +394,7 @@ def collect_team_context(
     max_messages: int = MAX_TEAM_CONTEXT_MESSAGES,
     max_chars: int = MAX_TEAM_CONTEXT_CHARS,
     *,
+    coordinator_profile: object = "default",
     reply_to_message_id: object = None,
     reply_to_text: object = None,
     raw_reply_to_message_id: object = None,
@@ -298,7 +408,7 @@ def collect_team_context(
     require_complete_reply_provenance: object = False,
     safety: TeamContextSafety | None = None,
 ) -> str:
-    """Return bounded untrusted context from one exact Ace-owned root session.
+    """Return bounded untrusted context from one exact coordinator root session.
 
     The lookup is read-only and exact-keyed. It never creates a session, scans
     other entries, reads a specialist profile, or loads system/tool payloads.
@@ -314,8 +424,24 @@ def collect_team_context(
         return ""
     if safety is not None and type(safety) is not TeamContextSafety:
         return ""
+    if (
+        type(coordinator_profile) is not str
+        or _normalize_profile(coordinator_profile) != coordinator_profile
+    ):
+        if safety is not None:
+            safety.unsafe = True
+        return ""
+    safe_coordinator_profile = cast(str, coordinator_profile)
     root_id = _normalize_message_id(root_message_id)
-    if root_id is None or not _is_exact_shared_root_source(source, root_id):
+    if root_id is None:
+        return ""
+    if not _is_exact_shared_root_source(
+        source,
+        root_id,
+        safe_coordinator_profile,
+    ):
+        if safety is not None:
+            safety.unsafe = True
         return ""
     safe_source = cast(SessionSource, source)
 
@@ -349,7 +475,13 @@ def collect_team_context(
         transcript_limit = max_messages - (1 if immediate_reply else 0)
         raw_rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] = []
         if entry is not None:
-            if not _same_shared_root(safe_source, getattr(entry, "origin", None)):
+            if not _same_shared_root(
+                safe_source,
+                getattr(entry, "origin", None),
+                safe_coordinator_profile,
+            ):
+                if safety is not None:
+                    safety.unsafe = True
                 return ""
             session_id = getattr(entry, "session_id", None)
             if type(session_id) is not str or not session_id:

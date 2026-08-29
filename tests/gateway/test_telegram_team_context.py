@@ -269,6 +269,138 @@ def test_classifier_boundary_strict_redaction_failure_returns_none(monkeypatch):
     assert redact_team_classifier_text("password = never-forward-this") is None
 
 
+@pytest.mark.parametrize(
+    ("material", "secret_fragments"),
+    [
+        (
+            'password = "FIRSTLINESECRET\nSECONDLINESECRET"',
+            ("FIRSTLINESECRET", "SECONDLINESECRET"),
+        ),
+        (
+            'client_secret = "ESCAPEDSTART\\"ESCAPEDMIDDLE\\"ESCAPEDTAIL"',
+            ("ESCAPEDSTART", "ESCAPEDMIDDLE", "ESCAPEDTAIL"),
+        ),
+    ],
+    ids=["multiline-quoted", "escaped-quotes"],
+)
+def test_classifier_boundary_redacts_complete_quoted_assignment_values(
+    material,
+    secret_fragments,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    for fragment in secret_fragments:
+        assert fragment not in redacted
+
+
+@pytest.mark.parametrize(
+    ("material", "secret_fragments"),
+    [
+        (
+            "password = UNQUOTEDFIRST UNQUOTEDTAIL",
+            ("UNQUOTEDFIRST", "UNQUOTEDTAIL"),
+        ),
+        (
+            'api_key = "QUOTEDVALUE" QUOTEDTAIL',
+            ("QUOTEDVALUE", "QUOTEDTAIL"),
+        ),
+    ],
+    ids=["unquoted-spaces", "quoted-trailing-field"],
+)
+def test_classifier_boundary_redacts_complete_sensitive_fields(
+    material,
+    secret_fragments,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    for fragment in secret_fragments:
+        assert fragment not in redacted
+
+
+@pytest.mark.parametrize(
+    ("scheme_value", "secret_fragments"),
+    [
+        (
+            'Digest username="DIGESTUSER", response="DIGESTRESPONSE"',
+            ("DIGESTUSER", "DIGESTRESPONSE"),
+        ),
+        (
+            "AWS4-HMAC-SHA256 Credential=AWSACCESS/date, "
+            "SignedHeaders=host, Signature=AWSSIGNATURE",
+            ("AWSACCESS", "AWSSIGNATURE"),
+        ),
+        ("Basic BASICOPAQUEVALUE", ("BASICOPAQUEVALUE",)),
+        (
+            "Custom CUSTOMOPAQUEVALUE extra=CUSTOMTAIL",
+            ("CUSTOMOPAQUEVALUE", "CUSTOMTAIL"),
+        ),
+    ],
+    ids=["digest", "aws", "basic", "custom"],
+)
+def test_classifier_boundary_redacts_complete_authorization_header_value(
+    scheme_value,
+    secret_fragments,
+):
+    redacted = redact_team_classifier_text(
+        f"before\nAuthorization: {scheme_value}\nafter"
+    )
+
+    assert redacted is not None
+    assert "before" in redacted
+    assert "after" in redacted
+    for fragment in secret_fragments:
+        assert fragment not in redacted
+
+
+@pytest.mark.parametrize(
+    ("prefix", "body"),
+    [
+        ("sk-", "STANDALONEOPENAITOKENTAIL"),
+        ("ghp_", "STANDALONEGITHUBTOKENTAIL"),
+        ("xoxb-", "STANDALONESLACKTOKENTAIL"),
+        ("eyJ", "STANDALONEJWTHEADERBODYTAIL"),
+        ("bot12345678:", "STANDALONETELEGRAMTOKENBODY1234567890"),
+    ],
+    ids=["sk", "github", "slack", "jwt", "telegram"],
+)
+def test_classifier_boundary_masks_complete_standalone_known_tokens(prefix, body):
+    redacted = redact_team_classifier_text(f"before {prefix}{body} after")
+
+    assert redacted is not None
+    assert prefix not in redacted
+    assert body[:10] not in redacted
+    assert body[-8:] not in redacted
+
+
+@pytest.mark.parametrize(
+    "material",
+    [
+        'password = "UNTERMINATEDSECRET',
+        'password = "ESCAPEDTRAILINGSECRET\\',
+        'password = "CLOSEDSECRET"HOSTILETAIL',
+        '"password: AMBIGUOUSKEYQUOTESECRET',
+        'password" = AMBIGUOUSKEYTAILSECRET',
+    ],
+    ids=[
+        "unterminated",
+        "escaped-trailing",
+        "hostile-tail",
+        "unterminated-key-quote",
+        "unexpected-key-quote",
+    ],
+)
+def test_classifier_boundary_rejects_ambiguous_quoted_assignments(material):
+    assert redact_team_classifier_text(material) is None
+
+
+def test_classifier_boundary_accepts_ordinary_quoted_sensitive_words():
+    material = 'Compare "password manager" UX with the phrase "secret sauce".'
+
+    assert redact_team_classifier_text(material) == material
+
+
 def test_collect_team_context_keeps_newest_material_within_character_bound():
     store = _Store([
         {"id": 12, "role": "assistant", "content": "N" * 300},
@@ -311,6 +443,81 @@ def test_collect_team_context_rejects_private_or_cross_root_session(origin):
 
     assert collect_team_context(store, _source(), _ROOT_ID) == ""
     store._db.get_messages.assert_not_called()
+
+
+def test_collect_team_context_accepts_exact_named_coordinator_source_and_origin():
+    source = replace(_source(), profile="ops")
+    store = _Store(
+        [{"id": 1, "role": "user", "content": "named coordinator context"}],
+        origin=source,
+    )
+
+    context = collect_team_context(
+        store,
+        source,
+        _ROOT_ID,
+        coordinator_profile="ops",
+    )
+
+    assert "[UNTRUSTED user] named coordinator context" in context
+    store._db.get_messages.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("requested_profile", "stored_profile"),
+    [
+        ("engineering", "ops"),
+        ("ops", "engineering"),
+        ("ops", "default"),
+    ],
+    ids=["specialist-request", "specialist-origin", "mismatched-origin"],
+)
+def test_collect_team_context_rejects_noncoordinator_or_mismatched_named_profile(
+    requested_profile,
+    stored_profile,
+):
+    source = replace(_source(), profile=requested_profile)
+    origin = replace(_source(), profile=stored_profile)
+    store = _Store(
+        [{"id": 1, "role": "user", "content": "must not leak"}],
+        origin=origin,
+    )
+
+    assert (
+        collect_team_context(
+            store,
+            source,
+            _ROOT_ID,
+            coordinator_profile="ops",
+        )
+        == ""
+    )
+    store._db.get_messages.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "coordinator_profile",
+    ["", "ops/private", " ops", "ops ", "x" * 65, object()],
+    ids=["empty", "slash", "leading-space", "trailing-space", "oversize", "object"],
+)
+def test_collect_team_context_invalid_coordinator_profile_is_unsafe_without_lookup(
+    coordinator_profile,
+):
+    store = _Store([{"id": 1, "role": "user", "content": "must not leak"}])
+    safety = TeamContextSafety()
+
+    context = collect_team_context(
+        store,
+        _source(),
+        _ROOT_ID,
+        coordinator_profile=coordinator_profile,
+        safety=safety,
+    )
+
+    assert context == ""
+    assert safety.unsafe is True
+    store._generate_session_key.assert_not_called()
+    store.lookup_loaded_session_by_key.assert_not_called()
 
 
 def test_collect_team_context_rejects_malformed_group_provenance_before_lookup():
