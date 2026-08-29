@@ -793,6 +793,63 @@ class TelegramTeamDispatcher:
             self._families[root_key] = _RootFamily(ownership, set(message_keys))
             return True
 
+    def transfer_root_ownership(
+        self,
+        chat_id: object,
+        root_message_id: object,
+        new_owner_profile: object,
+    ) -> bool:
+        """Atomically hand one whole root family to a different owner.
+
+        Ownership is otherwise immutable for the life of a root, which is what
+        keeps a chain from drifting between bots. An explicit handover is the
+        single sanctioned exception, so it moves the *entire* family at once:
+        the root, every constituent of the original batch and every alias
+        recorded since. A partial move would leave two bots each believing
+        they own part of one conversation.
+
+        Fails closed on any inconsistency rather than repairing it — a family
+        whose aliases do not all agree on the current owner is already corrupt
+        and must not be rewritten on top of.
+        """
+        normalized_chat_id = _normalize_group_chat_id(chat_id)
+        normalized_root_id = _normalize_message_id(root_message_id)
+        normalized_profile = _normalize_profile(new_owner_profile)
+        if (
+            normalized_chat_id is None
+            or normalized_root_id is None
+            or normalized_profile is None
+        ):
+            return False
+
+        root_key = (normalized_chat_id, normalized_root_id)
+        with self._lock:
+            family = self._families.get(root_key)
+            existing = self._aliases.get(root_key)
+            if (
+                family is None
+                or existing is None
+                or family.ownership != existing
+                or existing.root_message_id != normalized_root_id
+                or root_key not in family.aliases
+            ):
+                return False
+            if existing.owner_profile == normalized_profile:
+                # Already there. Idempotent so a replayed handover is a no-op
+                # rather than a failure the caller has to distinguish.
+                return True
+
+            for alias_key in family.aliases:
+                if self._aliases.get(alias_key) != existing:
+                    return False
+
+            ownership = RootOwnership(normalized_root_id, normalized_profile)
+            for alias_key in family.aliases:
+                self._aliases[alias_key] = ownership
+            family.ownership = ownership
+            self._families.move_to_end(root_key)
+            return True
+
     def record_inbound_alias(
         self,
         chat_id: object,
@@ -982,6 +1039,41 @@ class TelegramTeamDispatcher:
             family = self._families.pop(root_key)
             for alias_key in family.aliases:
                 self._aliases.pop(alias_key, None)
+
+
+def resolve_mention_handover(
+    *,
+    mentions: set[str],
+    config: TelegramTeamConfig,
+    current_owner_profile: str,
+) -> str | None:
+    """Return the member an existing chain should be handed to, or ``None``.
+
+    The natural way to bring a second operator into a conversation is to reply
+    to the last answer and name them. Reply-chain ownership alone would ignore
+    that, leaving the mention silently unhonoured.
+
+    Deliberately narrow: a handover happens only when **exactly one** team
+    member is named and it is not the current owner. Naming nobody is an
+    ordinary follow-up; naming the current owner is emphasis, not a move; and
+    naming several is ambiguous between "hand this to them" and "all of you
+    look at this", which cannot be told apart from mentions alone. Ambiguity
+    keeps the thread where it is rather than guessing — a wrongly moved
+    conversation is much harder for a human to notice than one that did not
+    move.
+    """
+    profiles_by_username = {username: profile for profile, username in config.members.items()}
+    mentioned_profiles = {
+        profiles_by_username[username]
+        for value in mentions
+        if (username := _normalize_username(value)) in profiles_by_username
+    }
+    if len(mentioned_profiles) != 1:
+        return None
+    target = next(iter(mentioned_profiles))
+    if target == current_owner_profile:
+        return None
+    return target
 
 
 def resolve_addressed_owner(

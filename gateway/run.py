@@ -16514,6 +16514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _normalize_group_chat_id,
             _normalize_message_id,
             resolve_addressed_owner,
+            resolve_mention_handover,
         )
 
         metadata = event.metadata if isinstance(event.metadata, dict) else {}
@@ -16884,6 +16885,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 root_message_id = ownership.root_message_id
                 owner_profile = ownership.owner_profile
                 route_reason = "reply_to_root_chain"
+
+                # An explicit mention of a different member hands the whole
+                # thread over (WAM-46). Without this, the reply half of
+                # "mentions and replies determine the owner when they are
+                # explicit" is enforced and the mention half is silently
+                # dropped, so a live conversation can never be passed on.
+                handover_profile = resolve_mention_handover(
+                    mentions=set(context.mentions),
+                    config=team_config,
+                    current_owner_profile=owner_profile,
+                )
+                if handover_profile is not None:
+                    handover_adapter = self._telegram_team_adapter_for_profile(
+                        handover_profile
+                    )
+                    if (
+                        handover_adapter is None
+                        or self._telegram_team_profile_for_adapter(handover_adapter)
+                        != handover_profile
+                    ):
+                        return True
+                    # Move the family before publishing the routed event: the
+                    # new owner's own ingress pass re-verifies ownership, so a
+                    # failed transfer must not produce an event it will reject.
+                    if not dispatcher.transfer_root_ownership(
+                        raw_chat_id,
+                        root_message_id,
+                        handover_profile,
+                    ):
+                        return True
+                    owner_profile = handover_profile
+                    route_reason = "mention_handover"
+                    semantic_target_adapter = handover_adapter
             else:
                 decision = resolve_addressed_owner(
                     mentions=set(context.mentions),

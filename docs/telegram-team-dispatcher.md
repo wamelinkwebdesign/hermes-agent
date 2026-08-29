@@ -77,13 +77,14 @@ Precedence, highest first. The first rule that matches decides, and the rest are
 
 | # | Rule | `route_reason` | Owner |
 | --- | --- | --- | --- |
-| 1 | The message replies into an already-owned root chain | `reply_to_root_chain` | The root's owner |
-| 2 | The message replies to a team bot's message | `reply_to_team_bot` | That bot |
-| 3 | Exactly one team member is @-mentioned | `single_team_mention` | That member |
-| 4 | Two or more team members are @-mentioned | `multiple_team_mentions` | Coordinator |
-| 5 | Nobody was addressed | `unaddressed_ingress` → classifier | See below |
+| 1 | Inside an owned chain, exactly one *other* member is @-mentioned | `mention_handover` | That member (thread moves) |
+| 2 | The message replies into an already-owned root chain | `reply_to_root_chain` | The root's owner |
+| 3 | The message replies to a team bot's message | `reply_to_team_bot` | That bot |
+| 4 | Exactly one team member is @-mentioned | `single_team_mention` | That member |
+| 5 | Two or more team members are @-mentioned | `multiple_team_mentions` | Coordinator |
+| 6 | Nobody was addressed | `unaddressed_ingress` → classifier | See below |
 
-Only rule 5 reaches the classifier. Explicit addressing is never re-decided by a model — that
+Only rule 6 reaches the classifier. Explicit addressing is never re-decided by a model — that
 would both cost tokens and risk disagreeing with the human. After classification the reason
 becomes `semantic_specialist` (redispatched to a specialist), `semantic_self` (coordinator
 answers), or `semantic_clarify` (coordinator asks).
@@ -92,9 +93,32 @@ Mentions are read from Telegram entities where present, and from raw text only w
 message carries no entities at all. Quoted `reply_to_message` text is **never** scanned — a
 quote must not be able to address a bot on the human's behalf.
 
-> **Known deviation.** An explicit mention of a *different* team member inside an existing
-> reply chain does not currently transfer ownership: rule 1 wins and the mentioned bot
-> declines. Tracked as WAM-46.
+### Handing a thread over
+
+Replying to an answer and naming somebody else is how a human passes a conversation on, so
+rule 1 moves the whole root family to that member: the root, every constituent of the
+original batch, and every alias recorded since. The new owner inherits the root scope, so the
+conversation continues in the same session rather than forking, and later plain follow-ups
+belong to them.
+
+The rule is deliberately narrow. A handover needs **exactly one** named member who is not the
+current owner:
+
+| Message inside an owned chain | Result |
+| --- | --- |
+| `@Virgil_Bot what do you think?` | Hands over to design |
+| `and also this` | Ordinary follow-up, stays put |
+| `@Woz_Bot and also this` (current owner) | Emphasis, not a move — stays put |
+| `@Virgil_Bot @Ace_Bot who owns this?` | Ambiguous — stays put |
+| `@Woz_Bot thanks, @Virgil_Bot thoughts?` | Ambiguous — stays put |
+
+The last two cases cannot be told apart from "hand this over" and "all of you look at this"
+using mentions alone, so the thread stays where it is. A wrongly moved conversation is much
+harder for a human to notice than one that did not move.
+
+Ownership is otherwise immutable for the life of a root — that immutability is what stops a
+chain drifting between bots. An explicit handover is the only sanctioned exception, it moves
+the entire family atomically, and it fails closed rather than leaving a thread half-moved.
 
 ## Context given to the classifier
 
