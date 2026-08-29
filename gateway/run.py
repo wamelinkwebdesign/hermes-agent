@@ -12385,6 +12385,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         (duplicate delivery + re-paid turn).
         """
         claimed = await self._claim_pending_obligations()
+        # Same inline-claim / background-send split as above: claiming is
+        # pure DB work, and it must not be stranded behind a flood-limited
+        # send. A claim whose send never happens stays owned by this boot's
+        # pid, so the next boot's sweep reclaims it (WAM-31).
+        claimed_team_fallbacks = await self._claim_team_fallback_obligations()
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
@@ -12396,6 +12401,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 finally:
                     _clear_planned_restart_notification()
             await self._redeliver_claimed_obligations(claimed)
+            await self._deliver_team_fallbacks(claimed_team_fallbacks)
 
         boot_task = asyncio.create_task(_boot_sends())
         timeout = _startup_restore_drain_timeout_secs()
@@ -16330,6 +16336,166 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return entry[1]
 
+    async def _claim_team_fallback_obligations(self) -> list:
+        """Claim team obligations left undischarged by a dead process.
+
+        Runs INLINE at startup (pure DB work, no network). Only rows whose
+        owning process is gone are claimed — a live owner may still be
+        mid-turn, and speaking beside a working agent is exactly the
+        duplicate public reply this dispatcher exists to prevent.
+
+        Claiming is restricted to owner profiles whose adapter is actually
+        installed this boot. ``attempts`` is the bounded fallback budget, so
+        a profile that failed to connect must not burn one attempt per boot
+        and abandon having never spoken.
+        """
+        try:
+            from gateway.telegram_team_delivery import (
+                ledger_enabled,
+                sweep_recoverable,
+            )
+
+            if not await asyncio.to_thread(ledger_enabled):
+                return []
+            if self.__dict__.get("_telegram_team_routing_enabled") is not True:
+                # Routing is off (config change, stale identity). Leave the
+                # rows for a boot that can honour them; the stale cutoff
+                # still bounds how long they wait.
+                return []
+            gate_adapters = self.__dict__.get("_telegram_team_gate_adapters") or {}
+            deliverable = {
+                profile
+                for profile in gate_adapters
+                if self._telegram_team_adapter_for_profile(profile) is not None
+            }
+            if not deliverable:
+                return []
+            return await asyncio.to_thread(
+                sweep_recoverable,
+                None,
+                deliverable_profiles=deliverable,
+            )
+        except Exception:
+            logger.debug("Telegram team fallback sweep failed", exc_info=True)
+            return []
+
+    async def _deliver_team_fallbacks(self, claimed: list) -> int:
+        """Speak the recovered-fallback notice for each claimed row.
+
+        Network half of the split, so a flood-limited send cannot hold the
+        inbound gate. Every row ends either delivered or released back to
+        ``pending`` — a claim that failed to send must never be recorded as
+        a discharged debt.
+        """
+        if not claimed:
+            return 0
+        try:
+            from gateway.telegram_team_delivery import (
+                mark_fallback_delivered,
+                release_fallback_claim,
+            )
+        except Exception:
+            logger.debug("Telegram team fallback import failed", exc_info=True)
+            return 0
+
+        delivered = 0
+        for row in claimed:
+            obligation_id = row.get("obligation_id")
+            owner_profile = row.get("owner_profile")
+            chat_id = row.get("chat_id")
+            head_message_id = row.get("head_message_id")
+            adapter = self._telegram_team_adapter_for_profile(owner_profile)
+            if adapter is None or not obligation_id:
+                try:
+                    await asyncio.to_thread(
+                        release_fallback_claim,
+                        obligation_id,
+                        "owner adapter unavailable",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Telegram team fallback release failed", exc_info=True
+                    )
+                continue
+            error = ""
+            try:
+                result = await adapter.send(
+                    chat_id=chat_id,
+                    content=row.get("notice", ""),
+                    reply_to=head_message_id,
+                )
+                succeeded = bool(getattr(result, "success", False))
+                if not succeeded:
+                    error = str(getattr(result, "error", "") or "send failed")
+            except Exception as exc:
+                succeeded = False
+                error = type(exc).__name__
+            try:
+                if succeeded:
+                    await asyncio.to_thread(mark_fallback_delivered, obligation_id)
+                    delivered += 1
+                else:
+                    await asyncio.to_thread(
+                        release_fallback_claim, obligation_id, error
+                    )
+                    logger.warning(
+                        "Telegram team recovered fallback could not be "
+                        "delivered for chat %s (owner '%s'): %s",
+                        chat_id,
+                        owner_profile,
+                        error,
+                    )
+            except Exception:
+                logger.debug(
+                    "Telegram team fallback bookkeeping failed", exc_info=True
+                )
+        return delivered
+
+    async def _record_telegram_team_obligation(
+        self,
+        *,
+        chat_id: str,
+        root_message_id: str,
+        head_message_id: str,
+        constituent_ids: Tuple[str, ...],
+        owner_profile: str,
+        route_reason: str,
+    ) -> None:
+        """Durably record that this accepted message owes a public outcome.
+
+        Best-effort by contract (WAM-31): routing has already accepted the
+        message and bound its ownership, so a ledger that is disabled,
+        locked or broken must not turn an accepted message into a consumed
+        one. The cost of failing here is a lost safety net, never a lost
+        message.
+        """
+        try:
+            from gateway.telegram_team_delivery import (
+                compute_obligation_id,
+                ledger_enabled,
+                record_obligation,
+            )
+
+            if not await asyncio.to_thread(ledger_enabled):
+                return
+            await asyncio.to_thread(
+                record_obligation,
+                obligation_id=compute_obligation_id(
+                    chat_id, root_message_id, head_message_id
+                ),
+                chat_id=chat_id,
+                root_message_id=root_message_id,
+                head_message_id=head_message_id,
+                constituent_ids=constituent_ids,
+                owner_profile=owner_profile,
+                route_reason=route_reason,
+            )
+        except Exception:
+            logger.debug(
+                "Telegram team obligation record failed",
+                exc_info=True,
+            )
+
     async def _handle_telegram_team_ingress(
         self,
         dispatcher: Any,
@@ -16856,6 +17022,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source.profile = owner_profile
                 if source.session_scope_id != expected_scope:
                     source.session_scope_id = expected_scope
+
+            # The group is now owed exactly one public terminal outcome
+            # (WAM-31). Recorded here — after ownership is durable and before
+            # the event leaves this function down either the local or the
+            # redispatch path — so a crash anywhere downstream still leaves
+            # the debt visible to the next boot's sweep. Strictly
+            # best-effort: an unavailable ledger must never consume or delay
+            # a message that routing already accepted.
+            await self._record_telegram_team_obligation(
+                chat_id=raw_chat_id,
+                root_message_id=root_message_id,
+                head_message_id=context.message_id,
+                constituent_ids=constituent_ids,
+                owner_profile=owner_profile,
+                route_reason=route_reason,
+            )
+
             prepared_metadata = dict(metadata)
             prepared_metadata.update({
                 "telegram_team_root_message_id": root_message_id,

@@ -5574,6 +5574,27 @@ class BasePlatformAdapter(ABC):
                 await add(chat_id, message_id, self._FAIL_EMOJI)
         # CANCELLED: leave the message unreacted.
 
+    async def _settle_turn_delivery_obligation(
+        self,
+        event: MessageEvent,
+        *,
+        delivered: bool,
+    ) -> None:
+        """Hook: a turn has ended; discharge any durable outcome it owed.
+
+        Distinct from ``on_processing_complete``, which cannot express the
+        failure this exists for. That hook receives a ``ProcessingOutcome``
+        derived from ``delivery_succeeded if delivery_attempted else not
+        response`` — so a turn that attempted no send and produced no
+        response reports SUCCESS while the user got nothing at all. This hook
+        instead receives the fact that matters to an inbound obligation:
+        whether the turn actually put a public message in front of the user.
+
+        Called from the ``finally`` of every turn, so it runs on the normal,
+        cancelled and failed paths alike. Default: adapters owe nothing.
+        """
+        return None
+
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)
@@ -6415,6 +6436,11 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        # The user-facing error notice below is a public terminal outcome
+        # even though it never reaches _record_delivery. Tracked separately
+        # so _settle_turn_delivery_obligation does not post a fallback on
+        # top of an error the user has already been shown.
+        error_notice_sent = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -7044,6 +7070,7 @@ class BasePlatformAdapter(ABC):
                     ),
                     metadata=_thread_metadata,
                 )
+                error_notice_sent = True
             except Exception as notify_err:
                 logger.error(
                     "[%s] Failed to send error notification to user: %s",
@@ -7058,6 +7085,22 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            # Discharge any durable inbound obligation FIRST, before the
+            # cleanup awaits below. Those awaits perform platform I/O and can
+            # raise or hang; settling after them would leave an accepted
+            # message owing an outcome for a reason unrelated to the turn.
+            # Never let this break the unwind (WAM-31).
+            try:
+                await self._settle_turn_delivery_obligation(
+                    event,
+                    delivered=bool(delivery_succeeded or error_notice_sent),
+                )
+            except Exception:
+                logger.debug(
+                    "[%s] Turn delivery obligation settle failed",
+                    self.name,
+                    exc_info=True,
+                )
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

@@ -21,7 +21,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -9334,6 +9334,131 @@ class TelegramAdapter(BasePlatformAdapter):
                     delattr(event, attribute)
                 except AttributeError:
                     pass
+
+    @staticmethod
+    def _team_obligation_scope(event: MessageEvent) -> Optional[Tuple[str, str, str]]:
+        """Return ``(chat_id, root_message_id, head_message_id)`` for a
+        team-scoped event, or ``None`` when this event owes nothing.
+
+        The scope id is written by central ingress
+        (``telegram-team:<chat>:<root>``) and is the only marker trusted
+        here. Everything is re-normalized rather than parsed loosely: a
+        malformed scope must fail closed to "owes nothing" instead of
+        producing an obligation id that no ingress ever recorded.
+        """
+        from gateway.telegram_team_routing import (
+            _normalize_group_chat_id,
+            _normalize_message_id,
+        )
+
+        source = getattr(event, "source", None)
+        scope = getattr(source, "session_scope_id", None)
+        if not isinstance(scope, str) or not scope.startswith("telegram-team:"):
+            return None
+        parts = scope.split(":")
+        if len(parts) != 3:
+            return None
+        chat_id = _normalize_group_chat_id(parts[1])
+        root_message_id = _normalize_message_id(parts[2])
+        head_message_id = _normalize_message_id(getattr(event, "message_id", None))
+        if chat_id is None or root_message_id is None or head_message_id is None:
+            return None
+        if _normalize_group_chat_id(getattr(source, "chat_id", None)) != chat_id:
+            # The scope and the transport disagree about the chat. Never
+            # discharge (or speak into) an obligation on that basis.
+            return None
+        return chat_id, root_message_id, head_message_id
+
+    async def _settle_turn_delivery_obligation(
+        self,
+        event: MessageEvent,
+        *,
+        delivered: bool,
+    ) -> None:
+        """Close this message's team obligation, speaking a fallback if the
+        turn ended without putting anything in front of the group (WAM-31).
+
+        A turn that produced no public message is the silent drop the
+        dispatcher exists to eliminate: the human asked, exactly one owner
+        accepted, and nothing came back. The obligation is claimed *before*
+        the fallback is sent so a crash between claim and send cannot yield a
+        second fallback on the next boot, and a failed send is released
+        rather than marked delivered so it never becomes a silent success.
+        """
+        scope = self._team_obligation_scope(event)
+        if scope is None:
+            return
+        chat_id, root_message_id, head_message_id = scope
+        try:
+            from gateway.telegram_team_delivery import (
+                FALLBACK_NOTICE,
+                claim_fallback,
+                compute_obligation_id,
+                ledger_enabled,
+                mark_fallback_delivered,
+                release_fallback_claim,
+                close_obligation,
+            )
+
+            if not await asyncio.to_thread(ledger_enabled):
+                return
+            obligation_id = compute_obligation_id(
+                chat_id, root_message_id, head_message_id
+            )
+            if delivered:
+                await asyncio.to_thread(
+                    close_obligation, obligation_id, outcome="answered"
+                )
+                return
+            if not await asyncio.to_thread(claim_fallback, obligation_id):
+                # Already discharged, or another path owns the fallback.
+                return
+        except Exception:
+            logger.debug(
+                "[%s] Telegram team obligation bookkeeping failed",
+                self.name,
+                exc_info=True,
+            )
+            return
+
+        error = ""
+        try:
+            result = await self.send(
+                chat_id=chat_id,
+                content=FALLBACK_NOTICE,
+                reply_to=head_message_id,
+            )
+            succeeded = bool(getattr(result, "success", False))
+            if not succeeded:
+                error = str(getattr(result, "error", "") or "send failed")
+        except Exception as exc:
+            succeeded = False
+            error = f"{type(exc).__name__}"
+
+        try:
+            if succeeded:
+                await asyncio.to_thread(mark_fallback_delivered, obligation_id)
+            else:
+                # Leave the debt open. A later boot's sweep can still speak
+                # for it; marking it delivered here would convert a failed
+                # send into a silent success.
+                await asyncio.to_thread(
+                    release_fallback_claim, obligation_id, error
+                )
+                logger.warning(
+                    "[%s] Telegram team fallback could not be delivered for "
+                    "chat %s root %s: %s",
+                    self.name,
+                    chat_id,
+                    root_message_id,
+                    error,
+                )
+        except Exception:
+            logger.debug(
+                "[%s] Telegram team fallback bookkeeping failed",
+                self.name,
+                exc_info=True,
+            )
 
     async def handle_message(self, event: MessageEvent) -> None:
         """Run every normalized Telegram event through central team ingress."""
