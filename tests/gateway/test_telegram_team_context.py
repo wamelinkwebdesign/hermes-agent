@@ -475,6 +475,9 @@ def test_classifier_boundary_redacts_concatenated_authorization_shell_word(
 ):
     redacted = redact_team_classifier_text(material)
 
+    if any(form in material for form in ("${", "$(", "`")):
+        assert redacted is None
+        return
     assert redacted is not None
     assert secret_fragment not in redacted
 
@@ -528,6 +531,9 @@ def test_classifier_boundary_redacts_authorization_field_through_line_tail(
 ):
     redacted = redact_team_classifier_text(material)
 
+    if any(form in material for form in ("${", "$(", "`")):
+        assert redacted is None
+        return
     assert redacted == "safe routing prefix\ncurl -H [REDACTED]"
     for fragment in secret_fragments:
         assert fragment not in redacted
@@ -586,6 +592,9 @@ def test_classifier_boundary_redacts_multiline_authorization_continuations(
 ):
     redacted = redact_team_classifier_text(material)
 
+    if any(form in material for form in ("${", "$(", "`")):
+        assert redacted is None
+        return
     assert redacted is not None
     assert redacted == expected_redacted
     for fragment in secret_fragments:
@@ -654,17 +663,13 @@ def test_classifier_boundary_redacts_multiline_authorization_continuations(
         "nested-expansion-adjacent-shell-segments",
     ],
 )
-def test_classifier_boundary_tracks_nested_authorization_shell_contexts(
+def test_classifier_boundary_fails_closed_on_nested_authorization_shell_contexts(
     material,
     secret_fragments,
     expected_redacted,
 ):
-    redacted = redact_team_classifier_text(material)
-
-    assert redacted is not None
-    assert redacted == expected_redacted
-    for fragment in secret_fragments:
-        assert fragment not in redacted
+    del secret_fragments, expected_redacted
+    assert redact_team_classifier_text(material) is None
 
 
 @pytest.mark.parametrize(
@@ -687,6 +692,51 @@ def test_classifier_boundary_tracks_nested_authorization_shell_contexts(
 def test_classifier_boundary_fails_closed_on_ambiguous_authorization_expansion(
     material,
 ):
+    assert redact_team_classifier_text(material) is None
+
+
+@pytest.mark.parametrize(
+    "material",
+    [
+        "Authorization: Bearer ${SIMPLE_PARAMETER_SECRET}",
+        "Proxy-Authorization: Basic $(printf SIMPLE_COMMAND_SECRET)",
+        "Authorization: Bearer ${TOKEN:-$(printf NESTED_SUBSTITUTION_SECRET)}",
+        "Authorization: Bearer `printf BACKTICK_SUBSTITUTION_SECRET`",
+        "curl -H 'Authorization: Bearer ${SINGLE_QUOTED_SUBSTITUTION_SECRET}' endpoint",
+        'curl -H "Authorization: Bearer ${DOUBLE_QUOTED_SUBSTITUTION_SECRET}" endpoint',
+    ],
+    ids=[
+        "simple-parameter-substitution",
+        "simple-command-substitution",
+        "nested-parameter-command-substitution",
+        "simple-backtick-substitution",
+        "potential-substitution-inside-single-quotes",
+        "substitution-inside-double-quotes",
+    ],
+)
+def test_classifier_boundary_fails_closed_on_authorization_shell_substitutions(
+    material,
+):
+    assert redact_team_classifier_text(material) is None
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    "material_template",
+    [
+        'header=Authorization:Bearer"$(case x in x) : "CASE_SECRET_ONE\n'
+        'CASE_SECRET_TWO"\n;; esac)"',
+        "header=Proxy-Authorization:Bearer$(printf COMMENT_ONE # )\n"
+        "printf COMMENT_TWO\n)",
+    ],
+    ids=["case-pattern-parenthesis", "shell-comment-parenthesis"],
+)
+def test_classifier_boundary_fails_closed_on_valid_posix_substitution_grammar(
+    material_template,
+    line_ending,
+):
+    material = material_template.replace("\n", line_ending)
+
     assert redact_team_classifier_text(material) is None
 
 

@@ -150,33 +150,16 @@ def _redact_bounded_fields(text: str, start_pattern: re.Pattern[str]) -> str:
     return "".join(rendered)
 
 
-@dataclass
-class _ShellLexicalContext:
-    """Independent quote state for a shell root or nested expansion."""
-
-    closing_delimiter: str | None
-    quote: str | None = None
-    parenthesis_depth: int = 0
-
-
 def _authorization_field_end(text: str, value_start: int) -> int:
-    """Bound an Authorization field through nested shell line continuations."""
+    """Bound a non-substitution Authorization field through line continuations."""
     line_start = (
         max(text.rfind("\r", 0, value_start), text.rfind("\n", 0, value_start)) + 1
     )
-    contexts = [_ShellLexicalContext(None)]
+    quote: str | None = None
     index = line_start
     while index < len(text):
-        context = contexts[-1]
         character = text[index]
-
-        if context.quote == "'":
-            if character == "'":
-                context.quote = None
-            index += 1
-            continue
-
-        if character == "\\":
+        if character == "\\" and quote != "'":
             escaped_index = index + 1
             if escaped_index < len(text) and text[escaped_index] in "\r\n":
                 index = escaped_index + 1
@@ -187,70 +170,24 @@ def _authorization_field_end(text: str, value_start: int) -> int:
                 continue
             index += 2
             continue
-
-        if character == '"':
-            context.quote = None if context.quote == '"' else '"'
+        if character in {'"', "'"}:
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
             index += 1
             continue
-        if character == "'" and context.quote is None:
-            context.quote = "'"
-            index += 1
-            continue
-
-        if character == "$" and text[index + 1 : index + 2] in {"{", "("}:
-            if len(contexts) >= 64:
-                raise _TeamContextRedactionError
-            opener = text[index + 1]
-            contexts.append(
-                _ShellLexicalContext(
-                    "}" if opener == "{" else ")",
-                    parenthesis_depth=1 if opener == "(" else 0,
-                )
-            )
-            index += 2
-            continue
-
-        if character == "`":
-            # Backtick substitutions have context-sensitive escape rules.
-            # They are outside this bounded grammar, so classification must
-            # fail closed rather than guess at a following line boundary.
-            raise _TeamContextRedactionError
-
-        if context.quote is None:
-            if context.closing_delimiter == "}" and character == "}":
-                contexts.pop()
-                index += 1
-                continue
-            if context.closing_delimiter == ")":
-                if character == "(":
-                    context.parenthesis_depth += 1
-                    index += 1
-                    continue
-                if character == ")":
-                    context.parenthesis_depth -= 1
-                    index += 1
-                    if context.parenthesis_depth == 0:
-                        contexts.pop()
-                    continue
-
         if character in "\r\n":
             continuation_start = index + 1
             if character == "\r" and text.startswith("\r\n", index):
                 continuation_start += 1
-            if (
-                len(contexts) > 1
-                or context.quote is not None
-                or (
-                    continuation_start < len(text) and text[continuation_start] in " \t"
-                )
+            if quote is not None or (
+                continuation_start < len(text) and text[continuation_start] in " \t"
             ):
                 index = continuation_start
                 continue
             return index
         index += 1
-
-    if len(contexts) > 1:
-        raise _TeamContextRedactionError
     return len(text)
 
 
@@ -265,6 +202,8 @@ def _redact_authorization_fields(text: str) -> str:
             raise _TeamContextRedactionError
         field_end = _authorization_field_end(text, value_start)
         field_value = text[value_start:field_end]
+        if any(form in field_value for form in ("$(", "${", "`")):
+            raise _TeamContextRedactionError
         if not field_value.strip() or any(
             character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n")
             for character in field_value

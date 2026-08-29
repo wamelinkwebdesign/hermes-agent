@@ -2488,6 +2488,13 @@ async def test_authorization_line_tails_are_sanitized_on_every_surface(
 
     await roster["default"].handle_message(event)
 
+    if any(form in material for form in ("${", "$(", "`")):
+        classify.assert_not_awaited()
+        assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+        for secret_fragment in secret_fragments:
+            assert secret_fragment not in caplog.text
+        base.assert_awaited_once_with(event)
+        return
     classify.assert_awaited_once()
     captured = repr(classify.await_args)
     assert "safe routing prefix" in captured
@@ -2556,6 +2563,13 @@ async def test_multiline_authorization_continuations_never_reach_classifier_or_l
 
     await roster["default"].handle_message(event)
 
+    if any(form in material for form in ("${", "$(", "`")):
+        classify.assert_not_awaited()
+        assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+        for secret_fragment in secret_fragments:
+            assert secret_fragment not in caplog.text
+        base.assert_awaited_once_with(event)
+        return
     classify.assert_awaited_once()
     captured = repr(classify.await_args)
     assert "safe routing prefix" in captured
@@ -2626,6 +2640,13 @@ async def test_nested_authorization_expansions_never_reach_classifier_or_logs(
 
     await roster["default"].handle_message(event)
 
+    if any(form in material for form in ("${", "$(", "`")):
+        classify.assert_not_awaited()
+        assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+        for secret_fragment in secret_fragments:
+            assert secret_fragment not in caplog.text
+        base.assert_awaited_once_with(event)
+        return
     classify.assert_awaited_once()
     captured = repr(classify.await_args)
     assert "safe routing prefix" in captured
@@ -4593,3 +4614,115 @@ async def test_internal_routed_event_requires_matching_bound_root_owner():
         is True
     )
     reserve.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize(
+    ("material", "secret_fragments"),
+    [
+        (
+            "Authorization: Bearer ${SURFACE_SIMPLE_PARAMETER_SECRET}",
+            ("SURFACE_SIMPLE_PARAMETER_SECRET",),
+        ),
+        (
+            "Proxy-Authorization: Basic $(printf SURFACE_SIMPLE_COMMAND_SECRET)",
+            ("SURFACE_SIMPLE_COMMAND_SECRET",),
+        ),
+        (
+            "Authorization: Bearer ${TOKEN:-$(printf SURFACE_NESTED_SECRET)}",
+            ("SURFACE_NESTED_SECRET",),
+        ),
+        (
+            "Authorization: Bearer `printf SURFACE_BACKTICK_SECRET`",
+            ("SURFACE_BACKTICK_SECRET",),
+        ),
+    ],
+    ids=[
+        "simple-parameter-substitution",
+        "simple-command-substitution",
+        "nested-parameter-command-substitution",
+        "simple-backtick-substitution",
+    ],
+)
+async def test_authorization_substitution_policy_clarifies_on_every_surface(
+    monkeypatch,
+    caplog,
+    surface,
+    material,
+    secret_fragments,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=951,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    for secret_fragment in secret_fragments:
+        assert secret_fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("material_template", "secret_fragments"),
+    [
+        (
+            'header=Authorization:Bearer"$(case x in x) : "CASE_SECRET_ONE\n'
+            'CASE_SECRET_TWO"\n;; esac)"',
+            ("CASE_SECRET_ONE", "CASE_SECRET_TWO"),
+        ),
+        (
+            "header=Proxy-Authorization:Bearer$(printf COMMENT_ONE # )\n"
+            "printf COMMENT_TWO\n)",
+            ("COMMENT_ONE", "COMMENT_TWO"),
+        ),
+    ],
+    ids=["case-pattern-parenthesis", "shell-comment-parenthesis"],
+)
+async def test_posix_authorization_substitution_exploits_clarify_on_every_surface(
+    monkeypatch,
+    caplog,
+    surface,
+    line_ending,
+    material_template,
+    secret_fragments,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    material = material_template.replace("\n", line_ending)
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=952,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    for secret_fragment in secret_fragments:
+        assert secret_fragment not in caplog.text
+    base.assert_awaited_once_with(event)
