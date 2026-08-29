@@ -16758,14 +16758,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         classification_source
                     )
                     with _profile_runtime_scope(profile_home):
+                        context_safety = TeamContextSafety()
                         classifier_text = redact_team_classifier_text(event.text)
                         if classifier_text is None:
+                            context_safety.unsafe = True
+                            context_safety.redaction_failed = True
                             classification = ClassificationDecision(
                                 "clarify",
                                 reason="invalid_input",
                             )
                         else:
-                            context_safety = TeamContextSafety()
                             context_text = await asyncio.to_thread(
                                 collect_team_context,
                                 self.session_store,

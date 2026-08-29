@@ -2193,6 +2193,251 @@ async def test_spaced_current_credentials_never_reach_classifier_or_logs(
     base.assert_awaited_once_with(event)
 
 
+def _classifier_surface_event(
+    runner,
+    roster,
+    surface,
+    material,
+    *,
+    message_id,
+):
+    if surface == "current":
+        event = _event(roster["default"], message_id, text=material)
+    elif surface == "immediate-reply":
+        event = _event(
+            roster["default"],
+            message_id,
+            text="route using the immediate reply",
+            reply_to_message_id=299,
+            reply_author_username="Ordinary_Human",
+            reply_text=material,
+        )
+    else:
+        event = _event(
+            roster["default"],
+            message_id,
+            text="route using the loaded transcript",
+        )
+
+    if surface == "transcript":
+        origin = dataclasses.replace(
+            event.source,
+            profile="default",
+            session_scope_id=f"telegram-team:{_ALLOWED_CHAT}:{message_id}",
+        )
+        entry = SimpleNamespace(session_id="redaction-root", origin=origin)
+        runner.__dict__["session_store"] = SimpleNamespace(
+            _generate_session_key=Mock(return_value="redaction-exact-root"),
+            lookup_loaded_session_by_key=Mock(return_value=entry),
+            _db=SimpleNamespace(
+                get_messages=Mock(
+                    return_value=[{"id": 1, "role": "user", "content": material}]
+                )
+            ),
+        )
+    else:
+        runner.__dict__["session_store"] = SimpleNamespace(
+            _generate_session_key=Mock(return_value="redaction-cold-root"),
+            lookup_loaded_session_by_key=Mock(return_value=None),
+        )
+    return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+async def test_structured_secret_components_never_reach_classifier_or_logs(
+    monkeypatch,
+    caplog,
+    surface,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    secrets = (
+        "A" * 40,
+        "CRITICALSECRETKEYTAIL",
+        "CRITICALJWTSECRETTAIL",
+        "CRITICALAPPTOKENTAIL",
+        "CRITICALCLIENTSECRETTAIL",
+    )
+    material = "\n".join((
+        f"AWS_SECRET_ACCESS_KEY = {secrets[0]}",
+        f"SECRET_KEY = {secrets[1]}",
+        f"JWT_SECRET_KEY = {secrets[2]}",
+        f"APP_TOKEN_VALUE = {secrets[3]}",
+        f"CLIENT_SECRET_VALUE = {secrets[4]}",
+    ))
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=323,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    for secret in secrets:
+        assert secret not in captured
+        assert secret[:10] not in captured
+        assert secret[-8:] not in captured
+        assert secret not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+async def test_sts_access_key_ids_never_reach_classifier_or_logs(
+    monkeypatch,
+    caplog,
+    surface,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    access_key_id = "ASIAABCDEFGHIJKLMNOP"
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        f"route this {access_key_id} safely",
+        message_id=324,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    for fragment in ("ASIA", "ABCDEFGHIJ", "IJKLMNOP"):
+        assert fragment not in captured
+        assert fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+async def test_full_content_is_redacted_before_classifier_truncation(
+    monkeypatch,
+    caplog,
+    surface,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    secret = "sk-CROSSBOUNDARYTOKENPREFIXANDTAIL1234567890"
+    material = " \t" * 5_995 + secret
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=325,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    for fragment in ("sk-", "CROSSBOUNDARYTOKENPREFIX", "TAIL1234567890"):
+        assert fragment not in captured
+        assert fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+async def test_routing_prose_survives_classifier_boundary(
+    monkeypatch,
+    surface,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    phrases = (
+        "I have a secret: engineering should handle this routing request.",
+        "password: manager",
+        "auth: strategy",
+        "Token: the board-game piece",
+    )
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        "\n".join(phrases),
+        message_id=326,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    for phrase in phrases:
+        assert phrase in captured
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+async def test_oversize_classifier_material_is_unsafe_and_never_classified(
+    monkeypatch,
+    surface,
+):
+    import gateway.telegram_team_classifier as classifier_module
+    import gateway.telegram_team_context as context_module
+
+    runner, roster = _runner()
+    safety_instances = []
+
+    class TrackingTeamContextSafety(context_module.TeamContextSafety):
+        def __init__(self):
+            super().__init__()
+            safety_instances.append(self)
+
+    monkeypatch.setattr(
+        context_module,
+        "TeamContextSafety",
+        TrackingTeamContextSafety,
+    )
+    material = "X" * (64 * 1_024 + 1)
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=327,
+    )
+    classify = AsyncMock(side_effect=AssertionError("oversize text must not classify"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    assert len(safety_instances) == 1
+    assert safety_instances[0].unsafe is True
+    classify.assert_not_awaited()
+    base.assert_awaited_once_with(event)
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "surface",
@@ -2331,7 +2576,7 @@ async def test_ambiguous_quoted_credentials_clarify_without_classifier(
     import gateway.telegram_team_classifier as classifier_module
 
     runner, roster = _runner()
-    ambiguous = 'password = "AMBIGUOUSSECRETFIRST\nAMBIGUOUSSECRETTAIL\\'
+    ambiguous = 'APP_TOKEN_VALUE = "AMBIGUOUSSECRETFIRST\nAMBIGUOUSSECRETTAIL\\'
     if surface == "current":
         event = _event(roster["default"], 322, text=ambiguous)
     elif surface == "immediate-reply":
@@ -2675,7 +2920,7 @@ async def test_unsafe_immediate_reply_provenance_clarifies_without_classifier(
     elif unsafe_reply == "hostile-raw-text":
         event.raw_message.reply_to_message.text = ["hostile"]
     elif unsafe_reply == "oversized-text":
-        oversized = "X" * 12_001
+        oversized = "X" * (64 * 1_024 + 1)
         event.reply_to_text = oversized
         event.raw_message.reply_to_message.text = oversized
 

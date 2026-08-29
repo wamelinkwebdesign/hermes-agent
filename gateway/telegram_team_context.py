@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import re
 from typing import Any, cast
+from urllib.parse import unquote_plus
 
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -17,37 +18,69 @@ from gateway.telegram_team_routing import (
 
 MAX_TEAM_CONTEXT_MESSAGES = 12
 MAX_TEAM_CONTEXT_CHARS = 12_000
+MAX_TEAM_CLASSIFIER_INPUT_BYTES = 64 * 1_024
 _CONTEXT_HEADER = "[UNTRUSTED TELEGRAM TEAM CONTEXT]"
 _ALLOWED_ROLES = frozenset({"user", "assistant"})
-_STRICT_SECRET_NAME = (
-    r"(?:password|passwd|passphrase|secret|token|access[_-]?token|"
-    r"refresh[_-]?token|api[_-]?key|apikey|private[_-]?key|"
-    r"client[_-]?secret|credential|auth|pw)"
+_SENSITIVE_FIELD_COMPONENTS = frozenset({
+    "apikey",
+    "auth",
+    "authorization",
+    "credential",
+    "credentials",
+    "passphrase",
+    "passwd",
+    "password",
+    "pw",
+    "secret",
+    "token",
+})
+_SENSITIVE_FIELD_COMPOUNDS = frozenset({
+    "accesskey",
+    "apikey",
+    "authkey",
+    "authtoken",
+    "clientsecret",
+    "privatekey",
+    "secretkey",
+})
+_SENSITIVE_FIELD_PAIRS = frozenset({
+    ("access", "key"),
+    ("api", "key"),
+    ("auth", "key"),
+    ("auth", "token"),
+    ("client", "secret"),
+    ("private", "key"),
+})
+_STRUCTURED_FIELD_START_RE = re.compile(
+    r"(?:(?P<line>^[ \t]*(?:export[ \t]+)?)|"
+    r"(?P<container>(?<=[{,])[ \t]*))"
+    r"(?P<key>\"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\"|"
+    r"'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'|"
+    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127})"
+    r"[ \t]*(?P<separator>[:=])[ \t]*",
+    re.MULTILINE,
 )
-_STRICT_SECRET_KEY = (
-    rf"(?:{_STRICT_SECRET_NAME}|"
-    rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}{_STRICT_SECRET_NAME})"
+_STRUCTURED_FIELD_KEY_CANDIDATE_RE = re.compile(
+    r"(?:(?P<line>^[ \t]*(?:export[ \t]+)?)|"
+    r"(?P<container>(?<=[{,])[ \t]*))"
+    r"(?P<key>[\"']?[A-Za-z0-9][A-Za-z0-9_.-]{0,127}[\"']?)"
+    r"[ \t]*[:=]",
+    re.MULTILINE,
 )
-_STRICT_ASSIGNMENT_START_RE = re.compile(
-    rf"(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
-    rf"(?P<key>{_STRICT_SECRET_KEY})(?P=key_quote)[ \t]*[:=][ \t]*",
-    re.IGNORECASE,
-)
-_AMBIGUOUS_OPEN_SECRET_KEY_RE = re.compile(
-    rf"(?<![A-Za-z0-9_.-])[\"']{_STRICT_SECRET_KEY}[ \t]*[:=]",
-    re.IGNORECASE,
-)
-_AMBIGUOUS_CLOSE_SECRET_KEY_RE = re.compile(
-    rf"(?<![A-Za-z0-9_.\-\"']){_STRICT_SECRET_KEY}[\"'][ \t]*[:=]",
-    re.IGNORECASE,
+_QUERY_FIELD_START_RE = re.compile(
+    r"(?P<boundary>[?&;])(?P<key>[A-Za-z0-9_.~+%\-]{1,256})"
+    r"[ \t]*=[ \t]*"
 )
 _STRICT_AUTHORIZATION_START_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:Proxy-)?Authorization[ \t]*[:=][ \t]*",
-    re.IGNORECASE,
+    r"^[ \t]*(?:Proxy-)?Authorization[ \t]*[:=][ \t]*",
+    re.IGNORECASE | re.MULTILINE,
 )
 _STRICT_BEARER_START_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])Bearer[ \t]+",
-    re.IGNORECASE,
+    r"^[ \t]*Bearer[ \t]+",
+    re.IGNORECASE | re.MULTILINE,
+)
+_STRICT_AWS_ACCESS_KEY_RE = re.compile(
+    r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"
 )
 _CANONICAL_REDACTION_SENTINEL_RE = re.compile(
     r"«redacted(?:-secret|:[^»]*)?»",
@@ -60,7 +93,6 @@ _CANONICAL_MASK_ARTIFACT_RE = re.compile(
     r")(?![A-Za-z0-9_-])"
 )
 _STRICT_REDACTION = "[REDACTED]"
-_MAX_STRICT_PARSE_CHARS = MAX_TEAM_CONTEXT_CHARS
 
 
 @dataclass
@@ -127,73 +159,215 @@ def _quoted_value_end(text: str, start: int, quote: str) -> int:
     raise _TeamContextRedactionError
 
 
-def _strict_redact_credential_assignments(text: str) -> str:
-    """Parse and completely mask bounded sensitive assignments and headers."""
-    if len(text) > _MAX_STRICT_PARSE_CHARS:
-        raise _TeamContextRedactionError
-    text.encode("utf-8", errors="strict")
-    redacted = _redact_authorization_fields(text)
-    redacted = _redact_bounded_fields(redacted, _STRICT_BEARER_START_RE)
+def _is_bounded_classifier_text(text: object) -> bool:
+    """Accept exact strings whose complete UTF-8 representation is at most 64 KiB."""
+    if type(text) is not str:
+        return False
+    try:
+        encoded = text.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return False
+    return len(encoded) <= MAX_TEAM_CLASSIFIER_INPUT_BYTES
+
+
+def _structured_key_components(key: str) -> tuple[str, ...]:
+    """Return decoded, case-folded identifier components."""
+    decoded = key
+    for _ in range(3):
+        next_value = unquote_plus(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return tuple(
+        component.casefold() for component in re.split(r"[_.-]+", decoded) if component
+    )
+
+
+def _is_sensitive_structured_key(key: str) -> bool:
+    """Recognize sensitive components anywhere in a structured field name."""
+    components = _structured_key_components(key)
+    if not components:
+        return False
+    if any(
+        component in _SENSITIVE_FIELD_COMPONENTS
+        or component in _SENSITIVE_FIELD_COMPOUNDS
+        for component in components
+    ):
+        return True
+    return any(
+        pair in _SENSITIVE_FIELD_PAIRS for pair in zip(components, components[1:])
+    )
+
+
+def _is_composite_sensitive_key(key: str) -> bool:
+    components = _structured_key_components(key)
+    return len(components) > 1 or any(
+        component in _SENSITIVE_FIELD_COMPOUNDS for component in components
+    )
+
+
+def _reject_malformed_structured_field_keys(text: str) -> None:
+    """Fail closed on mismatched quotes at an actual field boundary."""
+    for match in _STRUCTURED_FIELD_KEY_CANDIDATE_RE.finditer(text):
+        raw_key = match.group("key")
+        opens_quoted = raw_key[0] in {'"', "'"}
+        closes_quoted = raw_key[-1] in {'"', "'"}
+        if not (opens_quoted or closes_quoted):
+            continue
+        if opens_quoted and closes_quoted and raw_key[0] == raw_key[-1]:
+            continue
+        if _is_sensitive_structured_key(raw_key.strip("\"'")):
+            raise _TeamContextRedactionError
+
+
+def _redact_query_fields(text: str) -> str:
+    """Mask sensitive query values at exact parameter boundaries."""
     rendered: list[str] = []
-    cursor = 0
-    while match := _STRICT_ASSIGNMENT_START_RE.search(redacted, cursor):
-        if (
-            not match.group("key_quote")
-            and match.start() > 0
-            and redacted[match.start() - 1] in {'"', "'"}
-        ):
-            raise _TeamContextRedactionError
-        rendered.append(redacted[cursor : match.end()])
+    output_cursor = 0
+    search_cursor = 0
+    while match := _QUERY_FIELD_START_RE.search(text, search_cursor):
+        search_cursor = match.end()
+        if not _is_sensitive_structured_key(match.group("key")):
+            continue
         value_start = match.end()
-        if value_start >= len(redacted):
+        value_end = value_start
+        while value_end < len(text) and text[value_end] not in "&#;\r\n\t \"'<>?":
+            if text[value_end] == "\x00":
+                raise _TeamContextRedactionError
+            value_end += 1
+        if value_end == value_start:
             raise _TeamContextRedactionError
-        opening = redacted[value_start]
-        if opening in {'"', "'"}:
-            value_end = _quoted_value_end(redacted, value_start, opening)
-        else:
+        rendered.append(text[output_cursor:value_start])
+        rendered.append(_STRICT_REDACTION)
+        output_cursor = value_end
+        search_cursor = value_end
+    rendered.append(text[output_cursor:])
+    return "".join(rendered)
+
+
+def _line_colon_value_looks_credential(
+    text: str,
+    value_start: int,
+    field_end: int,
+) -> bool:
+    """Distinguish opaque values from ordinary ``label: prose`` sentences."""
+    value = text[value_start:field_end].strip()
+    if not value:
+        raise _TeamContextRedactionError
+    first_token = value.split(maxsplit=1)[0]
+    return len(first_token) >= 16 or not first_token.isalpha()
+
+
+def _redact_structured_fields(text: str) -> str:
+    """Mask boundary-anchored env/config/JSON fields without matching prose."""
+    _reject_malformed_structured_field_keys(text)
+    rendered: list[str] = []
+    output_cursor = 0
+    search_cursor = 0
+    while match := _STRUCTURED_FIELD_START_RE.search(text, search_cursor):
+        search_cursor = match.end()
+        raw_key = match.group("key")
+        quoted_key = raw_key[0] in {'"', "'"}
+        key = raw_key[1:-1] if quoted_key else raw_key
+        if not _is_sensitive_structured_key(key):
+            continue
+        is_container = match.group("container") is not None
+        if is_container and not quoted_key:
+            continue
+
+        value_start = match.end()
+        if value_start >= len(text):
+            raise _TeamContextRedactionError
+        opening = text[value_start]
+        is_quoted_value = opening in {'"', "'"}
+        if is_quoted_value:
+            value_end = _quoted_value_end(text, value_start, opening)
+        elif is_container:
             value_end = value_start
-            while (
-                value_end < len(redacted)
-                and not redacted[value_end].isspace()
-                and redacted[value_end] not in "&#;,?"
-            ):
-                if redacted[value_end] == "\x00":
+            while value_end < len(text) and text[value_end] not in ",}\r\n":
+                if text[value_end] == "\x00":
                     raise _TeamContextRedactionError
                 value_end += 1
-            if value_end == value_start:
+            if not text[value_start:value_end].strip():
                 raise _TeamContextRedactionError
-        rendered.append(_STRICT_REDACTION)
-        cursor = _bounded_field_end(redacted, value_end)
-    rendered.append(redacted[cursor:])
-    joined = "".join(rendered)
-    if _AMBIGUOUS_OPEN_SECRET_KEY_RE.search(
-        joined
-    ) or _AMBIGUOUS_CLOSE_SECRET_KEY_RE.search(joined):
-        raise _TeamContextRedactionError
+        else:
+            value_end = _bounded_field_end(text, value_start)
+            field_value = text[value_start:value_end]
+            if not field_value.strip():
+                raise _TeamContextRedactionError
+            if any(
+                character == "\x00"
+                or (ord(character) < 0x20 and character not in "\t\r\n")
+                for character in field_value
+            ):
+                raise _TeamContextRedactionError
+
+        if (
+            match.group("line") is not None
+            and match.group("separator") == ":"
+            and not quoted_key
+            and not is_quoted_value
+            and not _is_composite_sensitive_key(key)
+            and not _line_colon_value_looks_credential(text, value_start, value_end)
+        ):
+            continue
+
+        if is_quoted_value:
+            rendered.append(text[output_cursor : value_start + 1])
+            rendered.append(_STRICT_REDACTION)
+            rendered.append(opening)
+            if is_container:
+                output_cursor = value_end
+                search_cursor = value_end
+            else:
+                output_cursor = _bounded_field_end(text, value_end)
+                search_cursor = output_cursor
+        else:
+            rendered.append(text[output_cursor:value_start])
+            rendered.append(_STRICT_REDACTION)
+            output_cursor = value_end
+            search_cursor = value_end
+    rendered.append(text[output_cursor:])
+    return "".join(rendered)
+
+
+def _normalize_canonical_redactions(text: str) -> str:
     without_sentinels = _CANONICAL_REDACTION_SENTINEL_RE.sub(
         _STRICT_REDACTION,
-        joined,
+        text,
     )
     return _CANONICAL_MASK_ARTIFACT_RE.sub(_STRICT_REDACTION, without_sentinels)
 
 
+def _strict_redact_credential_assignments(text: str) -> str:
+    """Parse and completely mask bounded sensitive assignments and headers."""
+    if not _is_bounded_classifier_text(text):
+        raise _TeamContextRedactionError
+    redacted = _redact_authorization_fields(text)
+    redacted = _redact_bounded_fields(redacted, _STRICT_BEARER_START_RE)
+    redacted = _redact_query_fields(redacted)
+    redacted = _redact_structured_fields(redacted)
+    redacted = _STRICT_AWS_ACCESS_KEY_RE.sub(_STRICT_REDACTION, redacted)
+    return _normalize_canonical_redactions(redacted)
+
+
 def redact_team_classifier_text(text: object) -> str | None:
-    """Apply canonical then strict, fragment-free classifier redaction."""
-    if type(text) is not str or len(text) > _MAX_STRICT_PARSE_CHARS:
+    """Strictly redact a complete bounded value before any later truncation."""
+    if not _is_bounded_classifier_text(text):
         return None
     try:
         from agent.redact import redact_sensitive_text
 
+        strict_redacted = _strict_redact_credential_assignments(cast(str, text))
         redacted = redact_sensitive_text(
-            text,
+            strict_redacted,
             force=True,
             file_read=True,
             redact_url_credentials=True,
         )
         if type(redacted) is not str:
             return None
-        strict_redacted = _strict_redact_credential_assignments(redacted)
-        return strict_redacted if type(strict_redacted) is str else None
+        return _normalize_canonical_redactions(redacted)
     except Exception:
         return None
 
@@ -285,10 +459,10 @@ def _render_immediate_reply(
         normalized_event_id is None
         or normalized_raw_id is None
         or normalized_event_id != normalized_raw_id
-        or type(reply_to_text) is not str
-        or len(reply_to_text) > MAX_TEAM_CONTEXT_CHARS
+        or not _is_bounded_classifier_text(reply_to_text)
     ):
         return False, None
+    safe_reply_text = cast(str, reply_to_text)
 
     if require_complete_reply_provenance is True:
         normalized_raw_chat_id = _normalize_group_chat_id(raw_reply_chat_id)
@@ -307,11 +481,10 @@ def _render_immediate_reply(
             or raw_reply_present is not True
             or type(raw_external_reply_present) is not bool
             or raw_external_reply_present
-            or type(raw_reply_to_text) is not str
+            or not _is_bounded_classifier_text(raw_reply_to_text)
             or raw_reply_to_text != reply_to_text
-            or len(raw_reply_to_text) > MAX_TEAM_CONTEXT_CHARS
-            or not reply_to_text.strip()
-            or not raw_reply_to_text.strip()
+            or not safe_reply_text.strip()
+            or not cast(str, raw_reply_to_text).strip()
             or normalized_raw_chat_id != source.chat_id
             or normalized_raw_thread_id != expected_thread_id
             or raw_reply_author_is_bot is not False
@@ -320,7 +493,7 @@ def _render_immediate_reply(
     elif require_complete_reply_provenance is not False:
         return False, None
 
-    redacted = redact_team_classifier_text(reply_to_text)
+    redacted = redact_team_classifier_text(safe_reply_text)
     if redacted is None:
         raise _TeamContextRedactionError
     normalized = " ".join(redacted.split())
@@ -351,7 +524,7 @@ def _bounded_render(
             continue
         if any(row.get(key) for key in ("tool_calls", "tool_call_id", "tool_name")):
             continue
-        material = _render_message(role, content[:MAX_TEAM_CONTEXT_CHARS])
+        material = _render_message(role, content)
         if material:
             rendered.append(material)
 

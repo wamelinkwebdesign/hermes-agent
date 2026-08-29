@@ -270,6 +270,90 @@ def test_classifier_boundary_strict_redaction_failure_returns_none(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("material", "secret"),
+    [
+        ("AWS_SECRET_ACCESS_KEY = " + "A" * 40, "A" * 40),
+        ("SECRET_KEY = CRITICALSECRETKEYTAIL", "CRITICALSECRETKEYTAIL"),
+        ("JWT_SECRET_KEY = CRITICALJWTSECRETTAIL", "CRITICALJWTSECRETTAIL"),
+        ("APP_TOKEN_VALUE = CRITICALAPPTOKENTAIL", "CRITICALAPPTOKENTAIL"),
+        ("APP-TOKEN-VALUE = CRITICALDASHTOKENTAIL", "CRITICALDASHTOKENTAIL"),
+        ("jwt.secret.key = CRITICALDOTSECRETTAIL", "CRITICALDOTSECRETTAIL"),
+        (
+            "CLIENT_SECRET_VALUE = CRITICALCLIENTSECRETTAIL",
+            "CRITICALCLIENTSECRETTAIL",
+        ),
+        ("DATABASE_PASSWORD = CRITICALDATABASETAIL", "CRITICALDATABASETAIL"),
+        (
+            "authorization_credential_value = CRITICALAUTHCREDENTIALTAIL",
+            "CRITICALAUTHCREDENTIALTAIL",
+        ),
+        ("password: hunter2", "hunter2"),
+        ('{"password": "hunter2", "route": "engineering"}', "hunter2"),
+        (
+            "https://example.test/cb?APP_TOKEN_VALUE=CRITICALQUERYTAIL&route=design",
+            "CRITICALQUERYTAIL",
+        ),
+    ],
+    ids=[
+        "aws-secret-access-key",
+        "secret-key",
+        "jwt-secret-key",
+        "app-token-value",
+        "dash-separated-token",
+        "dot-separated-secret",
+        "client-secret-value",
+        "database-password",
+        "authorization-credential",
+        "line-start-password",
+        "json-password",
+        "structured-query-param",
+    ],
+)
+def test_classifier_boundary_redacts_sensitive_components_anywhere_in_structured_keys(
+    material,
+    secret,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    assert secret not in redacted
+    assert secret[:10] not in redacted
+    assert secret[-8:] not in redacted
+
+
+def test_classifier_boundary_masks_standalone_sts_access_key_id():
+    access_key_id = "ASIAABCDEFGHIJKLMNOP"
+
+    redacted = redact_team_classifier_text(f"before {access_key_id} after")
+
+    assert redacted is not None
+    assert "ASIA" not in redacted
+    assert "ABCDEFGHIJ" not in redacted
+    assert "IJKLMNOP" not in redacted
+
+
+def test_classifier_boundary_redacts_complete_input_before_context_truncation():
+    secret = "sk-CROSSBOUNDARYTOKENPREFIXANDTAIL1234567890"
+    material = " \t" * 5_995 + secret
+
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    assert "sk-" not in redacted
+    assert "CROSSBOUNDARYTOKENPREFIX" not in redacted
+    assert "TAIL1234567890" not in redacted
+
+
+def test_classifier_boundary_uses_utf8_64_kib_raw_input_bound():
+    exact_bound = "é" * (32 * 1_024)
+    over_bound = exact_bound + "x"
+
+    assert len(exact_bound.encode("utf-8")) == 64 * 1_024
+    assert redact_team_classifier_text(exact_bound) == exact_bound
+    assert redact_team_classifier_text(over_bound) is None
+
+
+@pytest.mark.parametrize(
     ("material", "secret_fragments"),
     [
         (
@@ -395,10 +479,34 @@ def test_classifier_boundary_rejects_ambiguous_quoted_assignments(material):
     assert redact_team_classifier_text(material) is None
 
 
-def test_classifier_boundary_accepts_ordinary_quoted_sensitive_words():
-    material = 'Compare "password manager" UX with the phrase "secret sauce".'
+def test_classifier_boundary_preserves_ordinary_routing_prose():
+    phrases = (
+        "I have a secret: engineering should handle this routing request.",
+        "password: manager",
+        "auth: strategy",
+        "Token: the board-game piece",
+    )
+    material = "\n".join(phrases)
 
-    assert redact_team_classifier_text(material) == material
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted == material
+    assert redacted is not None
+    for phrase in phrases:
+        assert phrase in redacted
+
+
+def test_collect_team_context_redacts_complete_row_before_output_truncation():
+    secret = "sk-CROSSBOUNDARYTOKENPREFIXANDTAIL1234567890"
+    store = _Store([{"id": 1, "role": "user", "content": " \t" * 5_995 + secret}])
+
+    context = collect_team_context(store, _source(), _ROOT_ID)
+
+    assert context.startswith("[UNTRUSTED TELEGRAM TEAM CONTEXT]")
+    assert "sk-" not in context
+    assert "CROSSBOUNDARYTOKENPREFIX" not in context
+    assert "TAIL1234567890" not in context
+    assert len(context) <= 12_000
 
 
 def test_collect_team_context_keeps_newest_material_within_character_bound():
