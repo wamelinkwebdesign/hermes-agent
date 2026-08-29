@@ -380,35 +380,35 @@ def test_classifier_boundary_does_not_match_inline_key_inside_larger_identifier(
 
 
 @pytest.mark.parametrize(
-    ("material", "secret_fragments", "retained_fragments"),
+    ("material", "secret_fragments", "expected_redacted"),
     [
         (
             'curl -H "Authorization: Digest username=alice, '
             'response=DIGESTRESPONSETOPSECRETTAIL" https://example.test',
             ("alice", "DIGESTRESPONSETOPSECRETTAIL"),
-            ("curl -H ", " https://example.test"),
+            'curl -H "[REDACTED]',
         ),
         (
             "curl -H 'Proxy-Authorization: AWS4-HMAC-SHA256 "
             "Credential=PROXYACCESS/date, Signature=PROXYSIGNATURE' --safe",
             ("PROXYACCESS", "PROXYSIGNATURE"),
-            ("curl -H ", " --safe"),
+            "curl -H '[REDACTED]",
         ),
         (
             "curl -H Authorization: Custom UNQUOTEDAUTHOPAQUE ; echo safe",
             ("UNQUOTEDAUTHOPAQUE",),
-            ("curl -H ", "echo safe"),
+            "curl -H [REDACTED]",
         ),
         (
             'curl -H "Authorization: Basic FIRSTAUTHOPAQUE" '
             "-H 'Proxy-Authorization: Custom SECONDAUTHOPAQUE' endpoint",
             ("FIRSTAUTHOPAQUE", "SECONDAUTHOPAQUE"),
-            ("curl -H ", " endpoint"),
+            'curl -H "[REDACTED]',
         ),
         (
             "Authorization: Digest username=folded,\n response=FOLDEDAUTHOPAQUE\nnext",
             ("folded", "FOLDEDAUTHOPAQUE"),
-            ("next",),
+            "[REDACTED]\nnext",
         ),
     ],
     ids=[
@@ -422,15 +422,14 @@ def test_classifier_boundary_does_not_match_inline_key_inside_larger_identifier(
 def test_classifier_boundary_parses_inline_authorization_headers(
     material,
     secret_fragments,
-    retained_fragments,
+    expected_redacted,
 ):
     redacted = redact_team_classifier_text(material)
 
     assert redacted is not None
+    assert redacted == expected_redacted
     for fragment in secret_fragments:
         assert fragment not in redacted
-    for fragment in retained_fragments:
-        assert fragment in redacted
 
 
 @pytest.mark.parametrize(
@@ -478,6 +477,60 @@ def test_classifier_boundary_redacts_concatenated_authorization_shell_word(
 
     assert redacted is not None
     assert secret_fragment not in redacted
+
+
+@pytest.mark.parametrize(
+    ("material", "secret_fragments"),
+    [
+        (
+            'safe routing prefix\ncurl -H Authorization:"Bearer '
+            'AUTH_DOUBLE_PREFIX_OPAQUE"${AUTH_DOUBLE_TAIL_FRAGMENT_OPAQUE} endpoint',
+            ("AUTH_DOUBLE_PREFIX_OPAQUE", "AUTH_DOUBLE_TAIL_FRAGMENT_OPAQUE"),
+        ),
+        (
+            "safe routing prefix\ncurl -H Authorization:'Bearer "
+            "AUTH_SINGLE_PREFIX_OPAQUE'${AUTH_SINGLE_TAIL_FRAGMENT_OPAQUE} endpoint",
+            ("AUTH_SINGLE_PREFIX_OPAQUE", "AUTH_SINGLE_TAIL_FRAGMENT_OPAQUE"),
+        ),
+        (
+            'safe routing prefix\ncurl -H Authorization:"Bearer '
+            'AUTH_UNQUOTED_PREFIX_OPAQUE"AUTH_UNQUOTED_TAIL_FRAGMENT_OPAQUE endpoint',
+            ("AUTH_UNQUOTED_PREFIX_OPAQUE", "AUTH_UNQUOTED_TAIL_FRAGMENT_OPAQUE"),
+        ),
+        (
+            'safe routing prefix\ncurl -H Authorization:"Bearer '
+            "AUTH_QUOTED_PREFIX_OPAQUE\"'AUTH_QUOTED_TAIL_FRAGMENT_OPAQUE' endpoint",
+            ("AUTH_QUOTED_PREFIX_OPAQUE", "AUTH_QUOTED_TAIL_FRAGMENT_OPAQUE"),
+        ),
+        (
+            'safe routing prefix\ncurl -H Authorization:"Bearer '
+            r'AUTH_ESCAPED_PREFIX_OPAQUE"\_AUTH_ESCAPED_TAIL_FRAGMENT_OPAQUE endpoint',
+            ("AUTH_ESCAPED_PREFIX_OPAQUE", "AUTH_ESCAPED_TAIL_FRAGMENT_OPAQUE"),
+        ),
+        (
+            "safe routing prefix\ncurl -H Proxy-Authorization:'Custom "
+            "PROXY_PREFIX_OPAQUE'${PROXY_TAIL_FRAGMENT_OPAQUE} endpoint",
+            ("PROXY_PREFIX_OPAQUE", "PROXY_TAIL_FRAGMENT_OPAQUE"),
+        ),
+    ],
+    ids=[
+        "double-quoted-value-expansion",
+        "single-quoted-value-expansion",
+        "adjacent-unquoted",
+        "adjacent-quoted",
+        "adjacent-escaped",
+        "proxy-authorization-expansion",
+    ],
+)
+def test_classifier_boundary_redacts_authorization_field_through_line_tail(
+    material,
+    secret_fragments,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted == "safe routing prefix\ncurl -H [REDACTED]"
+    for fragment in secret_fragments:
+        assert fragment not in redacted
 
 
 def test_classifier_boundary_preserves_authorization_prose_without_field_colon():
@@ -632,8 +685,43 @@ def test_classifier_boundary_rejects_malformed_percent_inside_query_key_componen
 @pytest.mark.parametrize(
     "material",
     [
+        "?config[APP_TO%/KEN_VALUE]=QUERY_SLASH_TOKEN_OPAQUE&route=design",
+        "?config[APP_TO%G0KEN_VALUE]=QUERY_NONHEX_TOKEN_OPAQUE&route=design",
+        "?config[APP_TOKEN_VALUE%]=QUERY_TRAILING_TOKEN_OPAQUE&route=design",
+        "?config[APP_TO%0KEN_VALUE]=QUERY_SHORT_TOKEN_OPAQUE&route=design",
+    ],
+    ids=["excluded-slash", "non-hex", "trailing-percent", "short-percent"],
+)
+def test_classifier_boundary_rejects_every_malformed_percent_in_query_key_candidate(
+    material,
+):
+    assert redact_team_classifier_text(material) is None
+
+
+def test_classifier_boundary_accepts_valid_percent_encoded_query_key():
+    material = "?config[APP%5FTOKEN_VALUE]=VALID_ENCODED_KEY_TOKEN_OPAQUE&route=design"
+
+    assert redact_team_classifier_text(material) == (
+        "?config[APP%5FTOKEN_VALUE]=[REDACTED]&route=design"
+    )
+
+
+def test_classifier_boundary_preserves_ordinary_percent_prose():
+    material = "Progress is 50% complete; route this ordinary request to design."
+
+    assert redact_team_classifier_text(material) == material
+
+
+def test_classifier_boundary_preserves_percent_text_in_ordinary_query_values():
+    material = "?route=design%/review&progress=50%"
+
+    assert redact_team_classifier_text(material) == material
+
+
+@pytest.mark.parametrize(
+    "material",
+    [
         'env AWS_SECRET_ACCESS_KEY="UNTERMINATEDINLINEOPAQUE',
-        'curl -H "Authorization: Bearer UNTERMINATEDAUTHOPAQUE',
         r'{"APP\u005fTOKEN\u00ZZ":"MALFORMEDJSONKEYOPAQUE"}',
         r'{"APP\u005fTOKEN\u005fVALUE":"MALFORMEDJSONVALUEOPAQUE}',
         "?config[APP_TOKEN%ZZ]=MALFORMEDQUERYKEYOPAQUE",
@@ -641,7 +729,6 @@ def test_classifier_boundary_rejects_malformed_percent_inside_query_key_componen
     ],
     ids=[
         "unterminated-inline-assignment",
-        "unterminated-authorization-header",
         "malformed-json-key-escape",
         "malformed-json-value",
         "malformed-query-key-encoding",
@@ -650,6 +737,12 @@ def test_classifier_boundary_rejects_malformed_percent_inside_query_key_componen
 )
 def test_classifier_boundary_rejects_ambiguous_inline_structured_secrets(material):
     assert redact_team_classifier_text(material) is None
+
+
+def test_classifier_boundary_masks_unterminated_outer_authorization_quote():
+    material = 'curl -H "Authorization: Bearer UNTERMINATEDAUTHOPAQUE'
+
+    assert redact_team_classifier_text(material) == 'curl -H "[REDACTED]'
 
 
 def test_classifier_boundary_masks_standalone_sts_access_key_id():

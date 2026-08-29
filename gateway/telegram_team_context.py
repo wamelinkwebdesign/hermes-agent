@@ -78,6 +78,11 @@ _QUERY_FIELD_START_RE = re.compile(
     r"(?P<key>[A-Za-z0-9_.~+%\[\]-]{1,768})[ \t]*=[ \t]*",
     re.MULTILINE,
 )
+_QUERY_KEY_CANDIDATE_RE = re.compile(
+    r"(?P<boundary>^|[?&;\s\"'])"
+    r"(?P<key>[^?&;=#\s\"'<>]+)[ \t]*=",
+    re.MULTILINE,
+)
 _STRICT_AUTHORIZATION_START_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:Proxy-)?Authorization[ \t]*[:=][ \t]*",
     re.IGNORECASE,
@@ -145,45 +150,6 @@ def _redact_bounded_fields(text: str, start_pattern: re.Pattern[str]) -> str:
     return "".join(rendered)
 
 
-def _active_quote_at(text: str, stop: int) -> str | None:
-    """Return the shell-like quote enclosing ``stop``, if one is active."""
-    quote: str | None = None
-    escaped = False
-    for character in text[:stop]:
-        if character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n"):
-            raise _TeamContextRedactionError
-        if escaped:
-            escaped = False
-            continue
-        if character == "\\":
-            escaped = True
-            continue
-        if quote is None:
-            if character in {'"', "'"}:
-                quote = character
-        elif character == quote:
-            quote = None
-    return quote
-
-
-def _closing_active_quote(text: str, start: int, quote: str) -> int:
-    """Return the index of a strict closing quote that began before ``start``."""
-    escaped = False
-    for index in range(start, len(text)):
-        character = text[index]
-        if character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n"):
-            raise _TeamContextRedactionError
-        if escaped:
-            escaped = False
-            continue
-        if character == "\\":
-            escaped = True
-            continue
-        if character == quote:
-            return index
-    raise _TeamContextRedactionError
-
-
 def _physical_line_end(text: str, start: int) -> int:
     """Return the first physical line delimiter at or after ``start``."""
     carriage_return = text.find("\r", start)
@@ -192,26 +158,21 @@ def _physical_line_end(text: str, start: int) -> int:
     return min(candidates, default=len(text))
 
 
-def _authorization_unquoted_end(text: str, field_start: int, value_start: int) -> int:
-    """Bound an unquoted header by its field or shell-command delimiter."""
-    line_start = text.rfind("\n", 0, field_start) + 1
-    if not text[line_start:field_start].strip():
-        value_end = _bounded_field_end(text, value_start)
-    else:
-        value_end = value_start
-        while value_end < len(text) and text[value_end] not in "\r\n;|&<>":
-            value_end += 1
-    value = text[value_start:value_end]
-    if not value.strip() or any(
-        character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n")
-        for character in value
-    ):
-        raise _TeamContextRedactionError
-    return value_end
+def _authorization_field_end(text: str, value_start: int) -> int:
+    """Bound one Authorization line and any folded continuation lines."""
+    field_end = _physical_line_end(text, value_start)
+    while field_end < len(text):
+        continuation_start = field_end + 1
+        if text[field_end] == "\r" and text.startswith("\r\n", field_end):
+            continuation_start += 1
+        if continuation_start >= len(text) or text[continuation_start] not in " \t":
+            break
+        field_end = _physical_line_end(text, continuation_start)
+    return field_end
 
 
 def _redact_authorization_fields(text: str) -> str:
-    """Mask complete inline or physical Authorization header values."""
+    """Mask each Authorization field through its bounded physical-line tail."""
     rendered: list[str] = []
     output_cursor = 0
     search_cursor = 0
@@ -219,35 +180,17 @@ def _redact_authorization_fields(text: str) -> str:
         value_start = match.end()
         if value_start >= len(text):
             raise _TeamContextRedactionError
-        enclosing_quote = _active_quote_at(text, match.start())
-        rendered.append(text[output_cursor:value_start])
-        if enclosing_quote is not None:
-            value_end = _closing_active_quote(text, value_start, enclosing_quote)
-            if not text[value_start:value_end].strip():
-                raise _TeamContextRedactionError
-            rendered.append(_STRICT_REDACTION)
-            next_character = value_end + 1
-            if next_character < len(text) and text[next_character] not in (
-                " \t\r\n;|&<>()"
-            ):
-                # Adjacent shell segments are part of the same word. Rather
-                # than attempting a fragile shell grammar (quotes, escapes,
-                # and expansions), conservatively mask the physical-line tail.
-                rendered.append(enclosing_quote)
-                value_end = _physical_line_end(text, next_character)
-            output_cursor = value_end
-        elif text[value_start] in {'"', "'"}:
-            opening = text[value_start]
-            value_end = _quoted_value_end(text, value_start, opening)
-            rendered.append(opening)
-            rendered.append(_STRICT_REDACTION)
-            rendered.append(opening)
-            output_cursor = value_end
-        else:
-            value_end = _authorization_unquoted_end(text, match.start(), value_start)
-            rendered.append(_STRICT_REDACTION)
-            output_cursor = value_end
-        search_cursor = value_end
+        field_end = _authorization_field_end(text, value_start)
+        field_value = text[value_start:field_end]
+        if not field_value.strip() or any(
+            character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n")
+            for character in field_value
+        ):
+            raise _TeamContextRedactionError
+        rendered.append(text[output_cursor : match.start()])
+        rendered.append(_STRICT_REDACTION)
+        output_cursor = field_end
+        search_cursor = field_end
     rendered.append(text[output_cursor:])
     return "".join(rendered)
 
@@ -331,8 +274,8 @@ def _sensitive_key_hint(raw_key: str) -> bool:
     return _is_sensitive_structured_key(hinted)
 
 
-def _strict_form_decode(value: str) -> str:
-    """Decode one URL/form component while rejecting malformed percent bytes."""
+def _validate_percent_escapes(value: str) -> None:
+    """Reject every percent occurrence that is not two ASCII hex digits."""
     index = 0
     while index < len(value):
         if value[index] != "%":
@@ -345,6 +288,11 @@ def _strict_form_decode(value: str) -> str:
         ):
             raise _TeamContextRedactionError
         index += 3
+
+
+def _strict_form_decode(value: str) -> str:
+    """Decode one URL/form component while rejecting malformed percent bytes."""
+    _validate_percent_escapes(value)
     try:
         return unquote_plus(value, encoding="utf-8", errors="strict")
     except (UnicodeError, ValueError):
@@ -359,6 +307,14 @@ def _query_path_components(raw_key: str) -> tuple[str, ...]:
             raise _TeamContextRedactionError
         return ()
     return (path_match.group("base"), *re.findall(r"\[([^\]]+)\]", decoded))
+
+
+def _reject_malformed_query_key_escapes(text: str) -> None:
+    """Validate broad URL/form key candidates before restrictive key parsing."""
+    for match in _QUERY_KEY_CANDIDATE_RE.finditer(text):
+        raw_key = match.group("key")
+        if "%" in raw_key:
+            _validate_percent_escapes(raw_key)
 
 
 def _reject_malformed_structured_field_keys(text: str) -> None:
@@ -377,6 +333,7 @@ def _reject_malformed_structured_field_keys(text: str) -> None:
 
 def _redact_query_fields(text: str) -> str:
     """Mask sensitive URL/form values, including decoded bracket paths."""
+    _reject_malformed_query_key_escapes(text)
     rendered: list[str] = []
     output_cursor = 0
     search_cursor = 0

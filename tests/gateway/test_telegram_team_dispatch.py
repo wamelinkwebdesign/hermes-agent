@@ -2309,7 +2309,7 @@ async def test_structured_secret_components_never_reach_classifier_or_logs(
             'response=ALLSURFACEDIGESTOPAQUE" '
             "-H Proxy-Authorization: Custom ALLSURFACEUNQUOTEDAUTH ; endpoint",
             ("surface", "ALLSURFACEDIGESTOPAQUE", "ALLSURFACEUNQUOTEDAUTH"),
-            "endpoint",
+            "curl -H",
         ),
         (
             "escaped-json-key",
@@ -2373,11 +2373,6 @@ async def test_alternate_structured_secrets_never_reach_any_classifier_surface(
             ("AMBIGUOUSINLINEFIRST",),
         ),
         (
-            "inline-authorization",
-            'curl -H "Authorization: Digest response=AMBIGUOUSDIGESTTAIL',
-            ("AMBIGUOUSDIGESTTAIL",),
-        ),
-        (
             "escaped-json-key",
             r'{"APP\u005fTOKEN\u00ZZ":"AMBIGUOUSJSONTAIL"}',
             ("AMBIGUOUSJSONTAIL",),
@@ -2427,48 +2422,54 @@ async def test_ambiguous_alternate_structured_secrets_clarify_on_every_surface(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
 @pytest.mark.parametrize(
-    ("material", "secret_fragment"),
+    ("material", "secret_fragments"),
     [
         (
-            'curl -H "Authorization: Digest username=a, response=SURFACE_DOUBLE_PREFIX"'
-            "SURFACE_DOUBLE_TAIL_FRAGMENT_OPAQUE endpoint",
-            "SURFACE_DOUBLE_TAIL_FRAGMENT_OPAQUE",
+            'safe routing prefix\ncurl -H Authorization:"Bearer '
+            'SURFACE_DOUBLE_PREFIX_OPAQUE"${SURFACE_DOUBLE_TAIL_FRAGMENT_OPAQUE} endpoint',
+            ("SURFACE_DOUBLE_PREFIX_OPAQUE", "SURFACE_DOUBLE_TAIL_FRAGMENT_OPAQUE"),
         ),
         (
-            "curl -H 'Authorization: Digest username=a, response=SURFACE_SINGLE_PREFIX'"
-            "SURFACE_SINGLE_TAIL_FRAGMENT_OPAQUE endpoint",
-            "SURFACE_SINGLE_TAIL_FRAGMENT_OPAQUE",
+            "safe routing prefix\ncurl -H Authorization:'Bearer "
+            "SURFACE_SINGLE_PREFIX_OPAQUE'${SURFACE_SINGLE_TAIL_FRAGMENT_OPAQUE} endpoint",
+            ("SURFACE_SINGLE_PREFIX_OPAQUE", "SURFACE_SINGLE_TAIL_FRAGMENT_OPAQUE"),
         ),
         (
-            'curl -H "Authorization: Basic SURFACE_ADJACENT_PREFIX"'
-            '"SURFACE_ADJACENT_QUOTED_TAIL_OPAQUE" endpoint',
-            "SURFACE_ADJACENT_QUOTED_TAIL_OPAQUE",
+            'safe routing prefix\ncurl -H Authorization:"Bearer '
+            'SURFACE_UNQUOTED_PREFIX_OPAQUE"SURFACE_UNQUOTED_TAIL_FRAGMENT_OPAQUE endpoint',
+            ("SURFACE_UNQUOTED_PREFIX_OPAQUE", "SURFACE_UNQUOTED_TAIL_FRAGMENT_OPAQUE"),
         ),
         (
-            'curl -H "Proxy-Authorization: Custom SURFACE_ESCAPED_PREFIX"'
-            r"SURFACE_ESCAPED\_TAIL_FRAGMENT_OPAQUE endpoint",
-            "TAIL_FRAGMENT_OPAQUE",
+            'safe routing prefix\ncurl -H Authorization:"Bearer '
+            "SURFACE_QUOTED_PREFIX_OPAQUE\"'SURFACE_QUOTED_TAIL_FRAGMENT_OPAQUE' endpoint",
+            ("SURFACE_QUOTED_PREFIX_OPAQUE", "SURFACE_QUOTED_TAIL_FRAGMENT_OPAQUE"),
         ),
         (
-            'curl -H "Authorization: Bearer SURFACE_EXPANSION_PREFIX"'
-            "${SURFACE_AUTH_EXPANSION_TAIL_FRAGMENT_OPAQUE} endpoint",
-            "SURFACE_AUTH_EXPANSION_TAIL_FRAGMENT_OPAQUE",
+            'safe routing prefix\ncurl -H Authorization:"Bearer '
+            r'SURFACE_ESCAPED_PREFIX_OPAQUE"\_SURFACE_ESCAPED_TAIL_FRAGMENT_OPAQUE endpoint',
+            ("SURFACE_ESCAPED_PREFIX_OPAQUE", "SURFACE_ESCAPED_TAIL_FRAGMENT_OPAQUE"),
+        ),
+        (
+            "safe routing prefix\ncurl -H Proxy-Authorization:'Custom "
+            "SURFACE_PROXY_PREFIX_OPAQUE'${SURFACE_PROXY_TAIL_FRAGMENT_OPAQUE} endpoint",
+            ("SURFACE_PROXY_PREFIX_OPAQUE", "SURFACE_PROXY_TAIL_FRAGMENT_OPAQUE"),
         ),
     ],
     ids=[
-        "double-quote-unquoted-tail",
-        "single-quote-unquoted-tail",
-        "adjacent-quoted-tail",
-        "escaped-tail",
-        "expansion-tail",
+        "double-quoted-value-expansion",
+        "single-quoted-value-expansion",
+        "adjacent-unquoted",
+        "adjacent-quoted",
+        "adjacent-escaped",
+        "proxy-authorization-expansion",
     ],
 )
-async def test_concatenated_authorization_shell_words_never_reach_any_surface(
+async def test_authorization_line_tails_are_sanitized_on_every_surface(
     monkeypatch,
     caplog,
     surface,
     material,
-    secret_fragment,
+    secret_fragments,
 ):
     import gateway.telegram_team_classifier as classifier_module
 
@@ -2488,8 +2489,15 @@ async def test_concatenated_authorization_shell_words_never_reach_any_surface(
     await roster["default"].handle_message(event)
 
     classify.assert_awaited_once()
-    assert secret_fragment not in repr(classify.await_args)
-    assert secret_fragment not in caplog.text
+    captured = repr(classify.await_args)
+    assert "safe routing prefix" in captured
+    assert "curl -H [REDACTED]" in captured
+    assert captured.count("[REDACTED]") == 1
+    assert "Authorization" not in captured
+    assert " endpoint" not in captured
+    for secret_fragment in secret_fragments:
+        assert secret_fragment not in captured
+        assert secret_fragment not in caplog.text
     base.assert_awaited_once_with(event)
 
 
@@ -2555,27 +2563,27 @@ async def test_malformed_json_key_escapes_never_classify_on_any_surface(
     ("material", "secret_fragment"),
     [
         (
-            "?config[APP_TO%ZZKEN_VALUE]=SURFACE_QUERY_TOKEN_OPAQUE&route=design",
-            "SURFACE_QUERY_TOKEN_OPAQUE",
+            "?config[APP_TO%/KEN_VALUE]=SURFACE_QUERY_SLASH_TOKEN_OPAQUE&route=design",
+            "SURFACE_QUERY_SLASH_TOKEN_OPAQUE",
         ),
         (
-            "?config%5BAPP_SE%ZZCRET_VALUE%5D=SURFACE_QUERY_SECRET_OPAQUE&route=design",
-            "SURFACE_QUERY_SECRET_OPAQUE",
+            "?config[APP_TO%G0KEN_VALUE]=SURFACE_QUERY_NONHEX_TOKEN_OPAQUE&route=design",
+            "SURFACE_QUERY_NONHEX_TOKEN_OPAQUE",
         ),
         (
-            "?config[DATABASE_PASS%ZZWORD]=SURFACE_QUERY_PASSWORD_OPAQUE&route=design",
-            "SURFACE_QUERY_PASSWORD_OPAQUE",
+            "?config[APP_TOKEN_VALUE%]=SURFACE_QUERY_TRAILING_TOKEN_OPAQUE&route=design",
+            "SURFACE_QUERY_TRAILING_TOKEN_OPAQUE",
         ),
         (
-            "?config%5BPRIVATE_K%ZZEY%5D=SURFACE_QUERY_KEY_OPAQUE&route=design",
-            "SURFACE_QUERY_KEY_OPAQUE",
+            "?config[APP_TO%0KEN_VALUE]=SURFACE_QUERY_SHORT_TOKEN_OPAQUE&route=design",
+            "SURFACE_QUERY_SHORT_TOKEN_OPAQUE",
         ),
     ],
     ids=[
-        "literal-bracket-token",
-        "encoded-bracket-secret",
-        "literal-bracket-password",
-        "encoded-bracket-key",
+        "excluded-slash",
+        "non-hex",
+        "trailing-percent",
+        "short-percent",
     ],
 )
 async def test_malformed_query_key_percent_escapes_never_classify_on_any_surface(
@@ -2607,6 +2615,58 @@ async def test_malformed_query_key_percent_escapes_never_classify_on_any_surface
     classify.assert_not_awaited()
     assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
     assert secret_fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize(
+    ("material", "retained_fragment", "secret_fragment"),
+    [
+        (
+            "?config[APP%5FTOKEN_VALUE]=SURFACE_VALID_ENCODED_TOKEN_OPAQUE&route=design",
+            "route=design",
+            "SURFACE_VALID_ENCODED_TOKEN_OPAQUE",
+        ),
+        (
+            "Progress is 50% complete; route this ordinary request to design.",
+            "Progress is 50% complete",
+            None,
+        ),
+    ],
+    ids=["valid-percent-escape", "ordinary-percent-prose"],
+)
+async def test_valid_query_escapes_and_percent_prose_classify_on_every_surface(
+    monkeypatch,
+    caplog,
+    surface,
+    material,
+    retained_fragment,
+    secret_fragment,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=333,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    assert retained_fragment in captured
+    if secret_fragment is not None:
+        assert secret_fragment not in captured
+        assert secret_fragment not in caplog.text
     base.assert_awaited_once_with(event)
 
 
