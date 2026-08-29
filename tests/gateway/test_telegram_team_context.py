@@ -321,6 +321,253 @@ def test_classifier_boundary_redacts_sensitive_components_anywhere_in_structured
     assert secret[-8:] not in redacted
 
 
+@pytest.mark.parametrize(
+    ("material", "secret_fragments", "retained_fragments"),
+    [
+        (
+            "env AWS_SECRET_ACCESS_KEY=INLINEAWSOPAQUEVALUE0123456789TAIL command",
+            ("INLINEAWSOPAQUEVALUE", "0123456789TAIL"),
+            ("env ", " command"),
+        ),
+        (
+            "Please inspect AWS_SECRET_ACCESS_KEY=PROSEINLINEOPAQUEVALUE0123456789",
+            ("PROSEINLINEOPAQUEVALUE", "0123456789"),
+            ("Please inspect ",),
+        ),
+        (
+            "run export APP_TOKEN_VALUE='QUOTEDINLINEOPAQUEVALUE' && deploy",
+            ("QUOTEDINLINEOPAQUEVALUE",),
+            ("run export ", " && deploy"),
+        ),
+        (
+            "env APP_TOKEN_VALUE=FIRSTINLINEOPAQUE "
+            "DATABASE_PASSWORD=SECONDINLINEOPAQUE execute",
+            ("FIRSTINLINEOPAQUE", "SECONDINLINEOPAQUE"),
+            ("env ", " execute"),
+        ),
+        (
+            "Inspect (APP_TOKEN_VALUE=PUNCTUATEDINLINEOPAQUE), then route",
+            ("PUNCTUATEDINLINEOPAQUE",),
+            ("Inspect (", "), then route"),
+        ),
+    ],
+    ids=[
+        "env-command-prefix",
+        "inline-prose-assignment",
+        "export-quoted-command",
+        "multiple-assignments",
+        "punctuation-boundary",
+    ],
+)
+def test_classifier_boundary_parses_inline_sensitive_assignments(
+    material,
+    secret_fragments,
+    retained_fragments,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    for fragment in secret_fragments:
+        assert fragment not in redacted
+    for fragment in retained_fragments:
+        assert fragment in redacted
+
+
+def test_classifier_boundary_does_not_match_inline_key_inside_larger_identifier():
+    material = "Please inspect monkey=ordinary-routing-value"
+
+    assert redact_team_classifier_text(material) == material
+
+
+@pytest.mark.parametrize(
+    ("material", "secret_fragments", "retained_fragments"),
+    [
+        (
+            'curl -H "Authorization: Digest username=alice, '
+            'response=DIGESTRESPONSETOPSECRETTAIL" https://example.test',
+            ("alice", "DIGESTRESPONSETOPSECRETTAIL"),
+            ("curl -H ", " https://example.test"),
+        ),
+        (
+            "curl -H 'Proxy-Authorization: AWS4-HMAC-SHA256 "
+            "Credential=PROXYACCESS/date, Signature=PROXYSIGNATURE' --safe",
+            ("PROXYACCESS", "PROXYSIGNATURE"),
+            ("curl -H ", " --safe"),
+        ),
+        (
+            "curl -H Authorization: Custom UNQUOTEDAUTHOPAQUE ; echo safe",
+            ("UNQUOTEDAUTHOPAQUE",),
+            ("curl -H ", "echo safe"),
+        ),
+        (
+            'curl -H "Authorization: Basic FIRSTAUTHOPAQUE" '
+            "-H 'Proxy-Authorization: Custom SECONDAUTHOPAQUE' endpoint",
+            ("FIRSTAUTHOPAQUE", "SECONDAUTHOPAQUE"),
+            ("curl -H ", " endpoint"),
+        ),
+        (
+            "Authorization: Digest username=folded,\n response=FOLDEDAUTHOPAQUE\nnext",
+            ("folded", "FOLDEDAUTHOPAQUE"),
+            ("next",),
+        ),
+    ],
+    ids=[
+        "quoted-curl-digest",
+        "quoted-proxy-authorization",
+        "unquoted-custom",
+        "multiple-headers",
+        "folded-continuation",
+    ],
+)
+def test_classifier_boundary_parses_inline_authorization_headers(
+    material,
+    secret_fragments,
+    retained_fragments,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    for fragment in secret_fragments:
+        assert fragment not in redacted
+    for fragment in retained_fragments:
+        assert fragment in redacted
+
+
+def test_classifier_boundary_preserves_authorization_prose_without_field_colon():
+    material = "The authorization team should review this ordinary routing request."
+
+    assert redact_team_classifier_text(material) == material
+
+
+@pytest.mark.parametrize(
+    ("material", "secret"),
+    [
+        (
+            r'{"APP\u005fTOKEN\u005fVALUE":"ESCAPEDUNDERSCOREJSONOPAQUE"}',
+            "ESCAPEDUNDERSCOREJSONOPAQUE",
+        ),
+        (
+            r'{"APP\u002dTOKEN\u002dVALUE":"ESCAPEDDASHJSONOPAQUE"}',
+            "ESCAPEDDASHJSONOPAQUE",
+        ),
+        (
+            r'{"\u0041PP_TOKEN_VALUE":"ESCAPEDLETTERJSONOPAQUE"}',
+            "ESCAPEDLETTERJSONOPAQUE",
+        ),
+        (
+            r'{"APP_\u0054OKEN_VALUE":"MIXEDESCAPEDJSONOPAQUE"}',
+            "MIXEDESCAPEDJSONOPAQUE",
+        ),
+        (
+            r'{"auth":{"route":"NESTEDJSONOPAQUE"},"safe":true}',
+            "NESTEDJSONOPAQUE",
+        ),
+    ],
+    ids=[
+        "escaped-underscore",
+        "escaped-dash",
+        "escaped-letter",
+        "mixed-literal-escaped",
+        "structured-json-value",
+    ],
+)
+def test_classifier_boundary_decodes_json_string_keys_before_classification(
+    material,
+    secret,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    assert secret not in redacted
+
+
+def test_classifier_boundary_preserves_ordinary_json_escaped_key():
+    material = r'{"route\u005fname":"engineering","priority":2}'
+
+    assert redact_team_classifier_text(material) == material
+
+
+@pytest.mark.parametrize(
+    ("material", "secret_fragments", "retained_fragments"),
+    [
+        (
+            "https://example.test/?config[APP_TOKEN_VALUE]=BRACKETQUERYOPAQUE"
+            "&route=design",
+            ("BRACKETQUERYOPAQUE",),
+            ("route=design",),
+        ),
+        (
+            "https://example.test/?auth[token]=NESTEDQUERYOPAQUE&ok=1",
+            ("NESTEDQUERYOPAQUE",),
+            ("ok=1",),
+        ),
+        (
+            "?config%5BAPP%5FTOKEN%5FVALUE%5D=ENCODEDBRACKETOPAQUE&safe=yes",
+            ("ENCODEDBRACKETOPAQUE",),
+            ("safe=yes",),
+        ),
+        (
+            "?config%5Bauth%5D%5Btoken%5D=ENCODEDNESTEDOPAQUE&safe=yes",
+            ("ENCODEDNESTEDOPAQUE",),
+            ("safe=yes",),
+        ),
+        (
+            "config[APP_TOKEN_VALUE]=FORMLIKEOPAQUE&route=engineering",
+            ("FORMLIKEOPAQUE",),
+            ("route=engineering",),
+        ),
+        (
+            "?auth[token]=FIRSTREPEATEDOPAQUE&auth[token]=SECONDREPEATEDOPAQUE",
+            ("FIRSTREPEATEDOPAQUE", "SECONDREPEATEDOPAQUE"),
+            ("auth[token]=",),
+        ),
+    ],
+    ids=[
+        "literal-brackets",
+        "nested-sensitive-components",
+        "encoded-brackets-components",
+        "encoded-nested-path",
+        "form-like-text",
+        "repeated-parameters",
+    ],
+)
+def test_classifier_boundary_parses_bracketed_query_paths(
+    material,
+    secret_fragments,
+    retained_fragments,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    for fragment in secret_fragments:
+        assert fragment not in redacted
+    for fragment in retained_fragments:
+        assert fragment in redacted
+
+
+@pytest.mark.parametrize(
+    "material",
+    [
+        'env AWS_SECRET_ACCESS_KEY="UNTERMINATEDINLINEOPAQUE',
+        'curl -H "Authorization: Bearer UNTERMINATEDAUTHOPAQUE',
+        r'{"APP\u005fTOKEN\u00ZZ":"MALFORMEDJSONKEYOPAQUE"}',
+        r'{"APP\u005fTOKEN\u005fVALUE":"MALFORMEDJSONVALUEOPAQUE}',
+        "?config[APP_TOKEN%ZZ]=MALFORMEDQUERYKEYOPAQUE",
+        "?config[APP_TOKEN_VALUE]=MALFORMEDQUERYVALUE%ZZ",
+    ],
+    ids=[
+        "unterminated-inline-assignment",
+        "unterminated-authorization-header",
+        "malformed-json-key-escape",
+        "malformed-json-value",
+        "malformed-query-key-encoding",
+        "malformed-query-value-encoding",
+    ],
+)
+def test_classifier_boundary_rejects_ambiguous_inline_structured_secrets(material):
+    assert redact_team_classifier_text(material) is None
+
+
 def test_classifier_boundary_masks_standalone_sts_access_key_id():
     access_key_id = "ASIAABCDEFGHIJKLMNOP"
 

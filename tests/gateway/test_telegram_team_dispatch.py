@@ -2293,6 +2293,139 @@ async def test_structured_secret_components_never_reach_classifier_or_logs(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize(
+    ("issue", "material", "secret_fragments", "retained_fragment"),
+    [
+        (
+            "inline-assignment",
+            "run (env AWS_SECRET_ACCESS_KEY=ALLSURFACEINLINEOPAQUE "
+            "APP_TOKEN_VALUE=ALLSURFACESECONDINLINE command), route",
+            ("ALLSURFACEINLINEOPAQUE", "ALLSURFACESECONDINLINE"),
+            "command",
+        ),
+        (
+            "inline-authorization",
+            'curl -H "Authorization: Digest username=surface, '
+            'response=ALLSURFACEDIGESTOPAQUE" '
+            "-H Proxy-Authorization: Custom ALLSURFACEUNQUOTEDAUTH ; endpoint",
+            ("surface", "ALLSURFACEDIGESTOPAQUE", "ALLSURFACEUNQUOTEDAUTH"),
+            "endpoint",
+        ),
+        (
+            "escaped-json-key",
+            r'{"APP\u005fTOKEN\u005fVALUE":"ALLSURFACEJSONOPAQUE","route":"design"}',
+            ("ALLSURFACEJSONOPAQUE",),
+            "design",
+        ),
+        (
+            "bracket-query-path",
+            "?config%5BAPP%5FTOKEN%5FVALUE%5D=ALLSURFACEQUERYOPAQUE"
+            "&auth[token]=ALLSURFACESECONDQUERY&route=engineering",
+            ("ALLSURFACEQUERYOPAQUE", "ALLSURFACESECONDQUERY"),
+            "engineering",
+        ),
+    ],
+)
+async def test_alternate_structured_secrets_never_reach_any_classifier_surface(
+    monkeypatch,
+    caplog,
+    surface,
+    issue,
+    material,
+    secret_fragments,
+    retained_fragment,
+):
+    del issue
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=328,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    assert retained_fragment in captured
+    for fragment in secret_fragments:
+        assert fragment not in captured
+        assert fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize(
+    ("issue", "material", "secret_fragments"),
+    [
+        (
+            "inline-assignment",
+            'env AWS_SECRET_ACCESS_KEY="AMBIGUOUSINLINEFIRST\\',
+            ("AMBIGUOUSINLINEFIRST",),
+        ),
+        (
+            "inline-authorization",
+            'curl -H "Authorization: Digest response=AMBIGUOUSDIGESTTAIL',
+            ("AMBIGUOUSDIGESTTAIL",),
+        ),
+        (
+            "escaped-json-key",
+            r'{"APP\u005fTOKEN\u00ZZ":"AMBIGUOUSJSONTAIL"}',
+            ("AMBIGUOUSJSONTAIL",),
+        ),
+        (
+            "bracket-query-path",
+            "?config[APP_TOKEN%ZZ]=AMBIGUOUSQUERYTAIL",
+            ("AMBIGUOUSQUERYTAIL",),
+        ),
+    ],
+)
+async def test_ambiguous_alternate_structured_secrets_clarify_on_every_surface(
+    monkeypatch,
+    caplog,
+    surface,
+    issue,
+    material,
+    secret_fragments,
+):
+    del issue
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=329,
+    )
+    classify = AsyncMock(
+        side_effect=AssertionError("ambiguous secret must not classify")
+    )
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    for fragment in secret_fragments:
+        assert fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
 async def test_sts_access_key_ids_never_reach_classifier_or_logs(
     monkeypatch,
     caplog,

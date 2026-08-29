@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 import re
 from typing import Any, cast
 from urllib.parse import unquote_plus
@@ -67,13 +68,19 @@ _STRUCTURED_FIELD_KEY_CANDIDATE_RE = re.compile(
     r"[ \t]*[:=]",
     re.MULTILINE,
 )
+_INLINE_ASSIGNMENT_START_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?P<key>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})"
+    r"[ \t]*(?P<operator>:=|=)[ \t]*"
+)
 _QUERY_FIELD_START_RE = re.compile(
-    r"(?P<boundary>[?&;])(?P<key>[A-Za-z0-9_.~+%\-]{1,256})"
-    r"[ \t]*=[ \t]*"
+    r"(?P<boundary>^|[?&;\s\"'])"
+    r"(?P<key>[A-Za-z0-9_.~+%\[\]-]{1,768})[ \t]*=[ \t]*",
+    re.MULTILINE,
 )
 _STRICT_AUTHORIZATION_START_RE = re.compile(
-    r"^[ \t]*(?:Proxy-)?Authorization[ \t]*[:=][ \t]*",
-    re.IGNORECASE | re.MULTILINE,
+    r"(?<![A-Za-z0-9_.-])(?:Proxy-)?Authorization[ \t]*[:=][ \t]*",
+    re.IGNORECASE,
 )
 _STRICT_BEARER_START_RE = re.compile(
     r"^[ \t]*Bearer[ \t]+",
@@ -93,6 +100,11 @@ _CANONICAL_MASK_ARTIFACT_RE = re.compile(
     r")(?![A-Za-z0-9_-])"
 )
 _STRICT_REDACTION = "[REDACTED]"
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_QUERY_PATH_RE = re.compile(
+    r"(?P<base>[A-Za-z0-9_.~-]+)"
+    r"(?P<brackets>(?:\[[A-Za-z0-9_.~-]+\])*)\Z"
+)
 
 
 @dataclass
@@ -133,9 +145,94 @@ def _redact_bounded_fields(text: str, start_pattern: re.Pattern[str]) -> str:
     return "".join(rendered)
 
 
+def _active_quote_at(text: str, stop: int) -> str | None:
+    """Return the shell-like quote enclosing ``stop``, if one is active."""
+    quote: str | None = None
+    escaped = False
+    for character in text[:stop]:
+        if character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n"):
+            raise _TeamContextRedactionError
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if quote is None:
+            if character in {'"', "'"}:
+                quote = character
+        elif character == quote:
+            quote = None
+    return quote
+
+
+def _closing_active_quote(text: str, start: int, quote: str) -> int:
+    """Return the index of a strict closing quote that began before ``start``."""
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n"):
+            raise _TeamContextRedactionError
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character == quote:
+            return index
+    raise _TeamContextRedactionError
+
+
+def _authorization_unquoted_end(text: str, field_start: int, value_start: int) -> int:
+    """Bound an unquoted header by its field or shell-command delimiter."""
+    line_start = text.rfind("\n", 0, field_start) + 1
+    if not text[line_start:field_start].strip():
+        value_end = _bounded_field_end(text, value_start)
+    else:
+        value_end = value_start
+        while value_end < len(text) and text[value_end] not in "\r\n;|&<>":
+            value_end += 1
+    value = text[value_start:value_end]
+    if not value.strip() or any(
+        character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n")
+        for character in value
+    ):
+        raise _TeamContextRedactionError
+    return value_end
+
+
 def _redact_authorization_fields(text: str) -> str:
-    """Mask Authorization values for every authentication scheme."""
-    return _redact_bounded_fields(text, _STRICT_AUTHORIZATION_START_RE)
+    """Mask complete inline or physical Authorization header values."""
+    rendered: list[str] = []
+    output_cursor = 0
+    search_cursor = 0
+    while match := _STRICT_AUTHORIZATION_START_RE.search(text, search_cursor):
+        value_start = match.end()
+        if value_start >= len(text):
+            raise _TeamContextRedactionError
+        enclosing_quote = _active_quote_at(text, match.start())
+        rendered.append(text[output_cursor:value_start])
+        if enclosing_quote is not None:
+            value_end = _closing_active_quote(text, value_start, enclosing_quote)
+            if not text[value_start:value_end].strip():
+                raise _TeamContextRedactionError
+            rendered.append(_STRICT_REDACTION)
+            output_cursor = value_end
+        elif text[value_start] in {'"', "'"}:
+            opening = text[value_start]
+            value_end = _quoted_value_end(text, value_start, opening)
+            rendered.append(opening)
+            rendered.append(_STRICT_REDACTION)
+            rendered.append(opening)
+            output_cursor = value_end
+        else:
+            value_end = _authorization_unquoted_end(text, match.start(), value_start)
+            rendered.append(_STRICT_REDACTION)
+            output_cursor = value_end
+        search_cursor = value_end
+    rendered.append(text[output_cursor:])
+    return "".join(rendered)
 
 
 def _quoted_value_end(text: str, start: int, quote: str) -> int:
@@ -171,15 +268,9 @@ def _is_bounded_classifier_text(text: object) -> bool:
 
 
 def _structured_key_components(key: str) -> tuple[str, ...]:
-    """Return decoded, case-folded identifier components."""
-    decoded = key
-    for _ in range(3):
-        next_value = unquote_plus(decoded)
-        if next_value == decoded:
-            break
-        decoded = next_value
+    """Return case-folded identifier components from an already-decoded key."""
     return tuple(
-        component.casefold() for component in re.split(r"[_.-]+", decoded) if component
+        component.casefold() for component in re.split(r"[_.-]+", key) if component
     )
 
 
@@ -206,6 +297,58 @@ def _is_composite_sensitive_key(key: str) -> bool:
     )
 
 
+def _sensitive_key_hint(raw_key: str) -> bool:
+    """Conservatively recognize sensitive intent in malformed encoded keys."""
+
+    def _decode_json_escape(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 16))
+
+    def _decode_percent_escape(match: re.Match[str]) -> str:
+        value = int(match.group(1), 16)
+        return chr(value) if value < 128 else "_"
+
+    hinted = re.sub(r"\\u([0-9A-Fa-f]{4})", _decode_json_escape, raw_key)
+    hinted = re.sub(r"%([0-9A-Fa-f]{2})", _decode_percent_escape, hinted)
+    hinted = re.sub(r"\\u[0-9A-Za-z]{0,4}|%[^\s\[\]&;=]{0,2}", "_", hinted)
+    hinted = re.sub(r"[\[\]\\\"']+", "_", hinted)
+    return _is_sensitive_structured_key(hinted)
+
+
+def _strict_form_decode(value: str) -> str:
+    """Decode one URL/form component while rejecting malformed percent bytes."""
+    index = 0
+    while index < len(value):
+        if value[index] != "%":
+            index += 1
+            continue
+        if (
+            index + 2 >= len(value)
+            or value[index + 1] not in _HEX_DIGITS
+            or value[index + 2] not in _HEX_DIGITS
+        ):
+            raise _TeamContextRedactionError
+        index += 3
+    try:
+        return unquote_plus(value, encoding="utf-8", errors="strict")
+    except (UnicodeError, ValueError):
+        raise _TeamContextRedactionError from None
+
+
+def _query_path_components(raw_key: str) -> tuple[str, ...]:
+    try:
+        decoded = _strict_form_decode(raw_key)
+    except _TeamContextRedactionError:
+        if _sensitive_key_hint(raw_key):
+            raise
+        return ()
+    path_match = _QUERY_PATH_RE.fullmatch(decoded)
+    if path_match is None:
+        if _sensitive_key_hint(decoded):
+            raise _TeamContextRedactionError
+        return ()
+    return (path_match.group("base"), *re.findall(r"\[([^\]]+)\]", decoded))
+
+
 def _reject_malformed_structured_field_keys(text: str) -> None:
     """Fail closed on mismatched quotes at an actual field boundary."""
     for match in _STRUCTURED_FIELD_KEY_CANDIDATE_RE.finditer(text):
@@ -221,21 +364,168 @@ def _reject_malformed_structured_field_keys(text: str) -> None:
 
 
 def _redact_query_fields(text: str) -> str:
-    """Mask sensitive query values at exact parameter boundaries."""
+    """Mask sensitive URL/form values, including decoded bracket paths."""
     rendered: list[str] = []
     output_cursor = 0
     search_cursor = 0
     while match := _QUERY_FIELD_START_RE.search(text, search_cursor):
         search_cursor = match.end()
-        if not _is_sensitive_structured_key(match.group("key")):
+        components = _query_path_components(match.group("key"))
+        if match.group("boundary") not in {"?", "&", ";"} and len(components) < 2:
+            # Bare form fields without brackets are handled by the inline
+            # assignment parser. This keeps quoted shell values out of the
+            # URL/form scanner while still accepting ``config[token]=...``.
+            continue
+        if not components or not any(
+            _is_sensitive_structured_key(component) for component in components
+        ):
             continue
         value_start = match.end()
+        if text.startswith(_STRICT_REDACTION, value_start):
+            continue
         value_end = value_start
         while value_end < len(text) and text[value_end] not in "&#;\r\n\t \"'<>?":
-            if text[value_end] == "\x00":
+            character = text[value_end]
+            if character == "\x00" or (
+                ord(character) < 0x20 and character not in "\t\r\n"
+            ):
                 raise _TeamContextRedactionError
             value_end += 1
         if value_end == value_start:
+            raise _TeamContextRedactionError
+        raw_value = text[value_start:value_end]
+        if "%" in raw_value:
+            _strict_form_decode(raw_value)
+        rendered.append(text[output_cursor:value_start])
+        rendered.append(_STRICT_REDACTION)
+        output_cursor = value_end
+        search_cursor = value_end
+    rendered.append(text[output_cursor:])
+    return "".join(rendered)
+
+
+def _unquoted_assignment_end(text: str, start: int) -> int:
+    """Return a bounded shell/env token end, honoring backslash escapes."""
+    index = start
+    escaped = False
+    while index < len(text):
+        character = text[index]
+        if character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n"):
+            raise _TeamContextRedactionError
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\":
+            escaped = True
+            index += 1
+            continue
+        if character.isspace() or character in ",;|&<>)]}":
+            break
+        index += 1
+    if escaped or index == start:
+        raise _TeamContextRedactionError
+    return index
+
+
+def _redact_inline_assignments(text: str) -> str:
+    """Mask sensitive ``key=value`` tokens at safe boundaries anywhere."""
+    rendered: list[str] = []
+    output_cursor = 0
+    search_cursor = 0
+    while match := _INLINE_ASSIGNMENT_START_RE.search(text, search_cursor):
+        search_cursor = match.end()
+        if not _is_sensitive_structured_key(match.group("key")):
+            continue
+        value_start = match.end()
+        if value_start >= len(text):
+            raise _TeamContextRedactionError
+        if text.startswith(_STRICT_REDACTION, value_start):
+            continue
+        opening = text[value_start]
+        rendered.append(text[output_cursor:value_start])
+        if opening in {'"', "'"}:
+            value_end = _quoted_value_end(text, value_start, opening)
+            rendered.append(opening)
+            rendered.append(_STRICT_REDACTION)
+            rendered.append(opening)
+        else:
+            value_end = _unquoted_assignment_end(text, value_start)
+            rendered.append(_STRICT_REDACTION)
+        output_cursor = value_end
+        search_cursor = value_end
+    rendered.append(text[output_cursor:])
+    return "".join(rendered)
+
+
+def _json_string_literal_end(text: str, start: int) -> int:
+    """Lexically bound one JSON double-quoted string token."""
+    escaped = False
+    for index in range(start + 1, len(text)):
+        character = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character == '"':
+            return index + 1
+    raise _TeamContextRedactionError
+
+
+def _decode_json_key_literal(raw_literal: str) -> str:
+    try:
+        decoded = json.loads(raw_literal)
+        if type(decoded) is not str:
+            raise _TeamContextRedactionError
+        decoded.encode("utf-8", errors="strict")
+        return cast(str, decoded)
+    except (_TeamContextRedactionError, UnicodeError, ValueError, TypeError):
+        raise _TeamContextRedactionError from None
+
+
+def _redact_json_fields(text: str) -> str:
+    """Decode syntactic JSON key strings and strictly bound sensitive values."""
+    decoder = json.JSONDecoder()
+    rendered: list[str] = []
+    output_cursor = 0
+    search_cursor = 0
+    while (key_start := text.find('"', search_cursor)) >= 0:
+        try:
+            key_end = _json_string_literal_end(text, key_start)
+        except _TeamContextRedactionError:
+            break
+        after_key = key_end
+        while after_key < len(text) and text[after_key] in " \t\r\n":
+            after_key += 1
+        search_cursor = key_end
+        if after_key >= len(text) or text[after_key] != ":":
+            continue
+        raw_literal = text[key_start:key_end]
+        try:
+            key = _decode_json_key_literal(raw_literal)
+        except _TeamContextRedactionError:
+            if _sensitive_key_hint(raw_literal[1:-1]):
+                raise
+            continue
+        if not _is_sensitive_structured_key(key):
+            continue
+        value_start = after_key + 1
+        while value_start < len(text) and text[value_start] in " \t\r\n":
+            value_start += 1
+        if value_start >= len(text):
+            raise _TeamContextRedactionError
+        if text.startswith(_STRICT_REDACTION, value_start):
+            continue
+        try:
+            _, value_end = decoder.raw_decode(text, value_start)
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            raise _TeamContextRedactionError from None
+        boundary = value_end
+        while boundary < len(text) and text[boundary] in " \t\r\n":
+            boundary += 1
+        if boundary < len(text) and text[boundary] not in ",}]":
             raise _TeamContextRedactionError
         rendered.append(text[output_cursor:value_start])
         rendered.append(_STRICT_REDACTION)
@@ -345,7 +635,9 @@ def _strict_redact_credential_assignments(text: str) -> str:
         raise _TeamContextRedactionError
     redacted = _redact_authorization_fields(text)
     redacted = _redact_bounded_fields(redacted, _STRICT_BEARER_START_RE)
+    redacted = _redact_json_fields(redacted)
     redacted = _redact_query_fields(redacted)
+    redacted = _redact_inline_assignments(redacted)
     redacted = _redact_structured_fields(redacted)
     redacted = _STRICT_AWS_ACCESS_KEY_RE.sub(_STRICT_REDACTION, redacted)
     return _normalize_canonical_redactions(redacted)
