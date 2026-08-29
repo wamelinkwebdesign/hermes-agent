@@ -2570,6 +2570,132 @@ async def test_multiline_authorization_continuations_never_reach_classifier_or_l
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
 @pytest.mark.parametrize(
+    ("material", "secret_fragments", "retained_fragment"),
+    [
+        (
+            'safe routing prefix\ncurl -H "Authorization: Bearer '
+            '${TOKEN:-"SURFACE_NESTED_LF_ONE\nSURFACE_NESTED_LF_TWO"}" endpoint\n'
+            "printf safe-after-nested-lf",
+            ("SURFACE_NESTED_LF_ONE", "SURFACE_NESTED_LF_TWO"),
+            "printf safe-after-nested-lf",
+        ),
+        (
+            'safe routing prefix\r\ncurl -H "Proxy-Authorization: Basic '
+            '${PROXY_TOKEN:-"SURFACE_NESTED_CRLF_ONE\r\n'
+            'SURFACE_NESTED_CRLF_TWO"}" endpoint\r\n'
+            "printf safe-after-nested-crlf",
+            ("SURFACE_NESTED_CRLF_ONE", "SURFACE_NESTED_CRLF_TWO"),
+            "printf safe-after-nested-crlf",
+        ),
+        (
+            'safe routing prefix\ncurl -H "Authorization: Bearer '
+            '$(printf "%s\n%s" "SURFACE_COMMAND_ONE" "SURFACE_COMMAND_TWO")" '
+            "endpoint\nprintf safe-after-command",
+            ("SURFACE_COMMAND_ONE", "SURFACE_COMMAND_TWO"),
+            "printf safe-after-command",
+        ),
+    ],
+    ids=[
+        "nested-parameter-lf",
+        "proxy-nested-parameter-crlf",
+        "nested-command-substitution",
+    ],
+)
+async def test_nested_authorization_expansions_never_reach_classifier_or_logs(
+    monkeypatch,
+    caplog,
+    surface,
+    material,
+    secret_fragments,
+    retained_fragment,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=335,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    assert "safe routing prefix" in captured
+    assert retained_fragment in captured
+    assert "[REDACTED]" in captured
+    for secret_fragment in secret_fragments:
+        assert secret_fragment not in captured
+        assert secret_fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize(
+    ("material", "secret_fragments"),
+    [
+        (
+            'safe routing prefix\ncurl -H "Authorization: Bearer '
+            '${TOKEN:-"SURFACE_UNCLOSED_PARAMETER_ONE\n'
+            'SURFACE_UNCLOSED_PARAMETER_TWO"\nprintf safe-after-unclosed-parameter',
+            (
+                "SURFACE_UNCLOSED_PARAMETER_ONE",
+                "SURFACE_UNCLOSED_PARAMETER_TWO",
+            ),
+        ),
+        (
+            'safe routing prefix\ncurl -H Authorization:Bearer$(printf "%s\n%s" '
+            '"SURFACE_UNCLOSED_COMMAND_ONE" "SURFACE_UNCLOSED_COMMAND_TWO"\n'
+            "printf safe-after-unclosed-command",
+            ("SURFACE_UNCLOSED_COMMAND_ONE", "SURFACE_UNCLOSED_COMMAND_TWO"),
+        ),
+    ],
+    ids=["unclosed-parameter-expansion", "unclosed-command-substitution"],
+)
+async def test_unclosed_authorization_expansions_clarify_without_logging_secrets(
+    monkeypatch,
+    caplog,
+    surface,
+    material,
+    secret_fragments,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=336,
+    )
+    classify = AsyncMock(
+        side_effect=AssertionError("unclosed Authorization expansion must not classify")
+    )
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    for secret_fragment in secret_fragments:
+        assert secret_fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize(
     ("material", "secret_fragment"),
     [
         (

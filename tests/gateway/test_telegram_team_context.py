@@ -592,6 +592,104 @@ def test_classifier_boundary_redacts_multiline_authorization_continuations(
         assert fragment not in redacted
 
 
+@pytest.mark.parametrize(
+    ("material", "secret_fragments", "expected_redacted"),
+    [
+        (
+            'curl -H "Authorization: Bearer ${TOKEN:-"PARAM_LF_ONE\n'
+            'PARAM_LF_TWO"}" endpoint\nprintf SAFE_PARAM_LF',
+            ("PARAM_LF_ONE", "PARAM_LF_TWO"),
+            'curl -H "[REDACTED]\nprintf SAFE_PARAM_LF',
+        ),
+        (
+            'curl -H "Proxy-Authorization: Basic ${PROXY_TOKEN:-"PROXY_CRLF_ONE\r\n'
+            'PROXY_CRLF_TWO"}" endpoint\r\nprintf SAFE_PROXY_CRLF',
+            ("PROXY_CRLF_ONE", "PROXY_CRLF_TWO"),
+            'curl -H "[REDACTED]\r\nprintf SAFE_PROXY_CRLF',
+        ),
+        (
+            'curl -H "Authorization: Bearer $(printf "%s\n%s" '
+            '"COMMAND_QUOTED_ONE" "COMMAND_QUOTED_TWO")" endpoint\n'
+            "printf SAFE_COMMAND_QUOTED",
+            ("COMMAND_QUOTED_ONE", "COMMAND_QUOTED_TWO"),
+            'curl -H "[REDACTED]\nprintf SAFE_COMMAND_QUOTED',
+        ),
+        (
+            'curl -H Authorization:Bearer$(printf "%s\n%s" '
+            '"COMMAND_UNQUOTED_ONE" "COMMAND_UNQUOTED_TWO") endpoint\n'
+            "printf SAFE_COMMAND_UNQUOTED",
+            ("COMMAND_UNQUOTED_ONE", "COMMAND_UNQUOTED_TWO"),
+            "curl -H [REDACTED]\nprintf SAFE_COMMAND_UNQUOTED",
+        ),
+        (
+            'curl -H "Authorization: Bearer ${TOKEN:-$(printf "%s\n%s" '
+            '"DEEP_COMMAND_ONE" "DEEP_COMMAND_TWO")}" endpoint\n'
+            "printf SAFE_DEEP_COMMAND",
+            ("DEEP_COMMAND_ONE", "DEEP_COMMAND_TWO"),
+            'curl -H "[REDACTED]\nprintf SAFE_DEEP_COMMAND',
+        ),
+        (
+            'curl -H "Authorization: Bearer ${TOKEN:-"ADJACENT_NESTED_ONE\n'
+            "ADJACENT_NESTED_TWO\"}\"'ADJACENT_SINGLE_TAIL'"
+            "${ADJACENT_EXPANSION_TAIL}ADJACENT_UNQUOTED_TAIL"
+            '"$(printf "%s" "ADJACENT_COMMAND_TAIL")" endpoint\n'
+            "printf SAFE_ADJACENT",
+            (
+                "ADJACENT_NESTED_ONE",
+                "ADJACENT_NESTED_TWO",
+                "ADJACENT_SINGLE_TAIL",
+                "ADJACENT_EXPANSION_TAIL",
+                "ADJACENT_UNQUOTED_TAIL",
+                "ADJACENT_COMMAND_TAIL",
+            ),
+            'curl -H "[REDACTED]\nprintf SAFE_ADJACENT',
+        ),
+    ],
+    ids=[
+        "nested-parameter-lf",
+        "proxy-nested-parameter-crlf",
+        "quoted-command-substitution",
+        "unquoted-command-substitution",
+        "nested-parameter-command-substitution",
+        "nested-expansion-adjacent-shell-segments",
+    ],
+)
+def test_classifier_boundary_tracks_nested_authorization_shell_contexts(
+    material,
+    secret_fragments,
+    expected_redacted,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    assert redacted == expected_redacted
+    for fragment in secret_fragments:
+        assert fragment not in redacted
+
+
+@pytest.mark.parametrize(
+    "material",
+    [
+        'curl -H "Authorization: Bearer ${TOKEN:-"UNCLOSED_PARAMETER_ONE\n'
+        'UNCLOSED_PARAMETER_TWO"\nprintf SAFE_AFTER_UNCLOSED_PARAMETER',
+        'curl -H Authorization:Bearer$(printf "%s\n%s" '
+        '"UNCLOSED_COMMAND_ONE" "UNCLOSED_COMMAND_TWO"\n'
+        "printf SAFE_AFTER_UNCLOSED_COMMAND",
+        'curl -H "Authorization: Bearer `printf "UNSUPPORTED_BACKTICK_ONE\n'
+        'UNSUPPORTED_BACKTICK_TWO"`" endpoint\nprintf SAFE_AFTER_BACKTICK',
+    ],
+    ids=[
+        "unclosed-parameter-expansion",
+        "unclosed-command-substitution",
+        "unsupported-backtick-substitution",
+    ],
+)
+def test_classifier_boundary_fails_closed_on_ambiguous_authorization_expansion(
+    material,
+):
+    assert redact_team_classifier_text(material) is None
+
+
 def test_classifier_boundary_preserves_authorization_prose_without_field_colon():
     material = "The authorization team should review this ordinary routing request."
 
