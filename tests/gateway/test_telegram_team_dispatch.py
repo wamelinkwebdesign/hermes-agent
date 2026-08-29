@@ -2504,6 +2504,72 @@ async def test_authorization_line_tails_are_sanitized_on_every_surface(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
 @pytest.mark.parametrize(
+    ("material", "secret_fragments", "retained_fragment"),
+    [
+        (
+            'safe routing prefix\ncurl -H "Authorization: Bearer '
+            'SURFACE_QUOTED_LINE_ONE\nSURFACE_QUOTED_LINE_TWO" endpoint\n'
+            "printf safe-after-header",
+            ("SURFACE_QUOTED_LINE_ONE", "SURFACE_QUOTED_LINE_TWO"),
+            "printf safe-after-header",
+        ),
+        (
+            "safe routing prefix\r\ncurl -H Proxy-Authorization: Custom "
+            "SURFACE_ESCAPED_CRLF_ONE\\\r\n"
+            '${SURFACE_EXPANSION_CRLF_TWO}"SURFACE_QUOTED_CRLF_THREE"'
+            "SURFACE_UNQUOTED_CRLF_FOUR\\_SURFACE_ESCAPED_CRLF_FIVE\r\n"
+            "printf safe-after-header",
+            (
+                "SURFACE_ESCAPED_CRLF_ONE",
+                "SURFACE_EXPANSION_CRLF_TWO",
+                "SURFACE_QUOTED_CRLF_THREE",
+                "SURFACE_UNQUOTED_CRLF_FOUR",
+                "SURFACE_ESCAPED_CRLF_FIVE",
+            ),
+            "printf safe-after-header",
+        ),
+    ],
+    ids=["quoted-lf", "proxy-backslash-crlf-adjacent-segments"],
+)
+async def test_multiline_authorization_continuations_never_reach_classifier_or_logs(
+    monkeypatch,
+    caplog,
+    surface,
+    material,
+    secret_fragments,
+    retained_fragment,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=334,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_awaited_once()
+    captured = repr(classify.await_args)
+    assert "safe routing prefix" in captured
+    assert retained_fragment in captured
+    assert "[REDACTED]" in captured
+    for secret_fragment in secret_fragments:
+        assert secret_fragment not in captured
+        assert secret_fragment not in caplog.text
+    base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize(
     ("material", "secret_fragment"),
     [
         (

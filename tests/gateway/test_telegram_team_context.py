@@ -533,6 +533,65 @@ def test_classifier_boundary_redacts_authorization_field_through_line_tail(
         assert fragment not in redacted
 
 
+@pytest.mark.parametrize(
+    ("material", "secret_fragments", "expected_redacted"),
+    [
+        (
+            'curl -H "Authorization: Bearer QUOTED_LINE_ONE\nQUOTED_LINE_TWO" endpoint',
+            ("QUOTED_LINE_ONE", "QUOTED_LINE_TWO"),
+            'curl -H "[REDACTED]',
+        ),
+        (
+            "Authorization: Bearer ESCAPED_LINE_ONE\\\n${ESCAPED_LINE_TWO}",
+            ("ESCAPED_LINE_ONE", "ESCAPED_LINE_TWO"),
+            "[REDACTED]",
+        ),
+        (
+            'Proxy-Authorization: Custom "PROXY_CRLF_ONE\r\nPROXY_CRLF_TWO"\r\n'
+            "printf safe-after-header",
+            ("PROXY_CRLF_ONE", "PROXY_CRLF_TWO"),
+            "[REDACTED]\r\nprintf safe-after-header",
+        ),
+        (
+            "curl -H Proxy-Authorization: Custom ESCAPED_CRLF_ONE\\\r\n"
+            '${EXPANSION_CRLF_TWO}"QUOTED_CRLF_THREE"UNQUOTED_CRLF_FOUR'
+            "\\_ESCAPED_CRLF_FIVE\r\nprintf safe-after-header",
+            (
+                "ESCAPED_CRLF_ONE",
+                "EXPANSION_CRLF_TWO",
+                "QUOTED_CRLF_THREE",
+                "UNQUOTED_CRLF_FOUR",
+                "ESCAPED_CRLF_FIVE",
+            ),
+            "curl -H [REDACTED]\r\nprintf safe-after-header",
+        ),
+        (
+            "Authorization: Bearer TERMINATED_HEADER\nroute this safe request",
+            ("TERMINATED_HEADER",),
+            "[REDACTED]\nroute this safe request",
+        ),
+    ],
+    ids=[
+        "inline-quoted-lf",
+        "line-start-backslash-lf",
+        "line-start-proxy-quoted-crlf",
+        "inline-proxy-backslash-crlf-adjacent-segments",
+        "terminated-header-preserves-next-line",
+    ],
+)
+def test_classifier_boundary_redacts_multiline_authorization_continuations(
+    material,
+    secret_fragments,
+    expected_redacted,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    assert redacted == expected_redacted
+    for fragment in secret_fragments:
+        assert fragment not in redacted
+
+
 def test_classifier_boundary_preserves_authorization_prose_without_field_colon():
     material = "The authorization team should review this ordinary routing request."
 

@@ -150,25 +150,45 @@ def _redact_bounded_fields(text: str, start_pattern: re.Pattern[str]) -> str:
     return "".join(rendered)
 
 
-def _physical_line_end(text: str, start: int) -> int:
-    """Return the first physical line delimiter at or after ``start``."""
-    carriage_return = text.find("\r", start)
-    line_feed = text.find("\n", start)
-    candidates = tuple(index for index in (carriage_return, line_feed) if index >= 0)
-    return min(candidates, default=len(text))
-
-
 def _authorization_field_end(text: str, value_start: int) -> int:
-    """Bound one Authorization line and any folded continuation lines."""
-    field_end = _physical_line_end(text, value_start)
-    while field_end < len(text):
-        continuation_start = field_end + 1
-        if text[field_end] == "\r" and text.startswith("\r\n", field_end):
-            continuation_start += 1
-        if continuation_start >= len(text) or text[continuation_start] not in " \t":
-            break
-        field_end = _physical_line_end(text, continuation_start)
-    return field_end
+    """Bound an Authorization field through lexical line continuations."""
+    line_start = (
+        max(text.rfind("\r", 0, value_start), text.rfind("\n", 0, value_start)) + 1
+    )
+    quote: str | None = None
+    index = line_start
+    while index < len(text):
+        character = text[index]
+        if character == "\\" and quote != "'":
+            escaped_index = index + 1
+            if escaped_index < len(text) and text[escaped_index] in "\r\n":
+                index = escaped_index + 1
+                if text[escaped_index] == "\r" and text.startswith(
+                    "\r\n", escaped_index
+                ):
+                    index += 1
+                continue
+            index += 2
+            continue
+        if character in {'"', "'"}:
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
+            index += 1
+            continue
+        if character in "\r\n":
+            continuation_start = index + 1
+            if character == "\r" and text.startswith("\r\n", index):
+                continuation_start += 1
+            if quote is not None or (
+                continuation_start < len(text) and text[continuation_start] in " \t"
+            ):
+                index = continuation_start
+                continue
+            return index
+        index += 1
+    return len(text)
 
 
 def _redact_authorization_fields(text: str) -> str:
