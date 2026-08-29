@@ -184,6 +184,14 @@ def _closing_active_quote(text: str, start: int, quote: str) -> int:
     raise _TeamContextRedactionError
 
 
+def _physical_line_end(text: str, start: int) -> int:
+    """Return the first physical line delimiter at or after ``start``."""
+    carriage_return = text.find("\r", start)
+    line_feed = text.find("\n", start)
+    candidates = tuple(index for index in (carriage_return, line_feed) if index >= 0)
+    return min(candidates, default=len(text))
+
+
 def _authorization_unquoted_end(text: str, field_start: int, value_start: int) -> int:
     """Bound an unquoted header by its field or shell-command delimiter."""
     line_start = text.rfind("\n", 0, field_start) + 1
@@ -218,6 +226,15 @@ def _redact_authorization_fields(text: str) -> str:
             if not text[value_start:value_end].strip():
                 raise _TeamContextRedactionError
             rendered.append(_STRICT_REDACTION)
+            next_character = value_end + 1
+            if next_character < len(text) and text[next_character] not in (
+                " \t\r\n;|&<>()"
+            ):
+                # Adjacent shell segments are part of the same word. Rather
+                # than attempting a fragile shell grammar (quotes, escapes,
+                # and expansions), conservatively mask the physical-line tail.
+                rendered.append(enclosing_quote)
+                value_end = _physical_line_end(text, next_character)
             output_cursor = value_end
         elif text[value_start] in {'"', "'"}:
             opening = text[value_start]
@@ -335,12 +352,7 @@ def _strict_form_decode(value: str) -> str:
 
 
 def _query_path_components(raw_key: str) -> tuple[str, ...]:
-    try:
-        decoded = _strict_form_decode(raw_key)
-    except _TeamContextRedactionError:
-        if _sensitive_key_hint(raw_key):
-            raise
-        return ()
+    decoded = _strict_form_decode(raw_key)
     path_match = _QUERY_PATH_RE.fullmatch(decoded)
     if path_match is None:
         if _sensitive_key_hint(decoded):
@@ -506,9 +518,9 @@ def _redact_json_fields(text: str) -> str:
         try:
             key = _decode_json_key_literal(raw_literal)
         except _TeamContextRedactionError:
-            if _sensitive_key_hint(raw_literal[1:-1]):
-                raise
-            continue
+            # A bounded JSON key token followed by ``:`` must decode exactly.
+            # Lossy recovery can split a sensitive component and leak its value.
+            raise
         if not _is_sensitive_structured_key(key):
             continue
         value_start = after_key + 1

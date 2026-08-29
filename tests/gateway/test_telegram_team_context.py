@@ -433,6 +433,53 @@ def test_classifier_boundary_parses_inline_authorization_headers(
         assert fragment in redacted
 
 
+@pytest.mark.parametrize(
+    ("material", "secret_fragment"),
+    [
+        (
+            'curl -H "Authorization: Digest username=a, response=DOUBLE_PREFIX"'
+            "DOUBLE_TAIL_FRAGMENT_OPAQUE endpoint",
+            "DOUBLE_TAIL_FRAGMENT_OPAQUE",
+        ),
+        (
+            "curl -H 'Authorization: Digest username=a, response=SINGLE_PREFIX'"
+            "SINGLE_TAIL_FRAGMENT_OPAQUE endpoint",
+            "SINGLE_TAIL_FRAGMENT_OPAQUE",
+        ),
+        (
+            'curl -H "Authorization: Basic ADJACENT_PREFIX"'
+            '"ADJACENT_QUOTED_TAIL_OPAQUE" endpoint',
+            "ADJACENT_QUOTED_TAIL_OPAQUE",
+        ),
+        (
+            'curl -H "Proxy-Authorization: Custom ESCAPED_PREFIX"'
+            r"ESCAPED\_TAIL_FRAGMENT_OPAQUE endpoint",
+            "TAIL_FRAGMENT_OPAQUE",
+        ),
+        (
+            'curl -H "Authorization: Bearer EXPANSION_PREFIX"'
+            "${AUTH_EXPANSION_TAIL_FRAGMENT_OPAQUE} endpoint",
+            "AUTH_EXPANSION_TAIL_FRAGMENT_OPAQUE",
+        ),
+    ],
+    ids=[
+        "double-quote-unquoted-tail",
+        "single-quote-unquoted-tail",
+        "adjacent-quoted-tail",
+        "escaped-tail",
+        "expansion-tail",
+    ],
+)
+def test_classifier_boundary_redacts_concatenated_authorization_shell_word(
+    material,
+    secret_fragment,
+):
+    redacted = redact_team_classifier_text(material)
+
+    assert redacted is not None
+    assert secret_fragment not in redacted
+
+
 def test_classifier_boundary_preserves_authorization_prose_without_field_colon():
     material = "The authorization team should review this ordinary routing request."
 
@@ -543,6 +590,43 @@ def test_classifier_boundary_parses_bracketed_query_paths(
         assert fragment not in redacted
     for fragment in retained_fragments:
         assert fragment in redacted
+
+
+@pytest.mark.parametrize(
+    "material",
+    [
+        r'{"APP_TO\u00ZZKEN_VALUE":"JSON_TOKEN_FRAGMENT_OPAQUE","route":"design"}',
+        r'{"APP_SE\u00ZZCRET_VALUE":"JSON_SECRET_FRAGMENT_OPAQUE","route":"design"}',
+        r'{"DATABASE_PASS\u00ZZWORD":"JSON_PASSWORD_FRAGMENT_OPAQUE","route":"design"}',
+        r'{"PRIVATE_K\u00ZZEY":"JSON_KEY_FRAGMENT_OPAQUE","route":"design"}',
+    ],
+    ids=["token", "secret", "password", "key"],
+)
+def test_classifier_boundary_rejects_malformed_escape_inside_json_key_component(
+    material,
+):
+    assert redact_team_classifier_text(material) is None
+
+
+@pytest.mark.parametrize(
+    "material",
+    [
+        "?config[APP_TO%ZZKEN_VALUE]=QUERY_TOKEN_FRAGMENT_OPAQUE&route=design",
+        "?config%5BAPP_SE%ZZCRET_VALUE%5D=QUERY_SECRET_FRAGMENT_OPAQUE&route=design",
+        "?config[DATABASE_PASS%ZZWORD]=QUERY_PASSWORD_FRAGMENT_OPAQUE&route=design",
+        "?config%5BPRIVATE_K%ZZEY%5D=QUERY_KEY_FRAGMENT_OPAQUE&route=design",
+    ],
+    ids=[
+        "literal-bracket-token",
+        "encoded-bracket-secret",
+        "literal-bracket-password",
+        "encoded-bracket-key",
+    ],
+)
+def test_classifier_boundary_rejects_malformed_percent_inside_query_key_component(
+    material,
+):
+    assert redact_team_classifier_text(material) is None
 
 
 @pytest.mark.parametrize(
