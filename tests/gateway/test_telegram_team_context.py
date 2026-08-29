@@ -740,6 +740,43 @@ def test_classifier_boundary_fails_closed_on_valid_posix_substitution_grammar(
     assert redact_team_classifier_text(material) is None
 
 
+@pytest.mark.parametrize(
+    "header_name",
+    ["Authorization", "Proxy-Authorization"],
+    ids=["authorization", "proxy-authorization"],
+)
+@pytest.mark.parametrize("opener", ["(", "{"], ids=["command", "parameter"])
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    "continuation_count",
+    [1, 2],
+    ids=["single-continuation", "repeated-continuation"],
+)
+def test_classifier_boundary_fails_closed_after_authorization_continuation_normalization(
+    header_name,
+    opener,
+    line_ending,
+    continuation_count,
+):
+    continuations = ("\\" + line_ending) * continuation_count
+    if opener == "(":
+        substitution = (
+            f'${continuations}(printf "%s\\n%s" '
+            '"CONTINUED_CMD_ONE" "CONTINUED_CMD_TWO")'
+        )
+    else:
+        substitution = (
+            f'${continuations}{{TOKEN:-"CONTINUED_PARAM_ONE'
+            f'{line_ending}CONTINUED_PARAM_TWO"}}'
+        )
+    material = (
+        f'curl -H "{header_name}: Bearer {substitution}" endpoint'
+        f"{line_ending}printf SAFE"
+    )
+
+    assert redact_team_classifier_text(material) is None
+
+
 def test_classifier_boundary_preserves_authorization_prose_without_field_colon():
     material = "The authorization team should review this ordinary routing request."
 

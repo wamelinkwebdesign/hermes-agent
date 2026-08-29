@@ -4726,3 +4726,71 @@ async def test_posix_authorization_substitution_exploits_clarify_on_every_surfac
     for secret_fragment in secret_fragments:
         assert secret_fragment not in caplog.text
     base.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["current", "transcript", "immediate-reply"])
+@pytest.mark.parametrize(
+    ("material", "secret_fragments"),
+    [
+        (
+            'curl -H "Authorization: Bearer $\\\n(printf "%s\\n%s" '
+            '"SURFACE_JOIN_CMD_ONE" "SURFACE_JOIN_CMD_TWO")" endpoint\n'
+            "printf SAFE",
+            ("SURFACE_JOIN_CMD_ONE", "SURFACE_JOIN_CMD_TWO"),
+        ),
+        (
+            'curl -H "Authorization: Bearer $\\\n'
+            '{TOKEN:-"SURFACE_JOIN_PARAM_ONE\nSURFACE_JOIN_PARAM_TWO"}" endpoint\n'
+            "printf SAFE",
+            ("SURFACE_JOIN_PARAM_ONE", "SURFACE_JOIN_PARAM_TWO"),
+        ),
+        (
+            'curl -H "Proxy-Authorization: Bearer $\\\r\n(printf "%s\\n%s" '
+            '"SURFACE_PROXY_CMD_ONE" "SURFACE_PROXY_CMD_TWO")" endpoint\r\n'
+            "printf SAFE",
+            ("SURFACE_PROXY_CMD_ONE", "SURFACE_PROXY_CMD_TWO"),
+        ),
+        (
+            'curl -H "Proxy-Authorization: Bearer $\\\r\n\\\r\n'
+            '{TOKEN:-"SURFACE_PROXY_PARAM_ONE\r\nSURFACE_PROXY_PARAM_TWO"}" '
+            "endpoint\r\nprintf SAFE",
+            ("SURFACE_PROXY_PARAM_ONE", "SURFACE_PROXY_PARAM_TWO"),
+        ),
+    ],
+    ids=[
+        "authorization-command-lf",
+        "authorization-parameter-lf",
+        "proxy-command-crlf",
+        "proxy-parameter-repeated-crlf",
+    ],
+)
+async def test_continued_authorization_substitutions_clarify_on_every_surface(
+    monkeypatch,
+    caplog,
+    surface,
+    material,
+    secret_fragments,
+):
+    import gateway.telegram_team_classifier as classifier_module
+
+    runner, roster = _runner()
+    event = _classifier_surface_event(
+        runner,
+        roster,
+        surface,
+        material,
+        message_id=953,
+    )
+    classify = AsyncMock(return_value=ClassificationDecision("self"))
+    monkeypatch.setattr(classifier_module, "classify_new_root", classify)
+    base = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", base)
+
+    await roster["default"].handle_message(event)
+
+    classify.assert_not_awaited()
+    assert event.metadata["telegram_team_route_reason"] == "semantic_clarify"
+    for secret_fragment in secret_fragments:
+        assert secret_fragment not in caplog.text
+    base.assert_awaited_once_with(event)

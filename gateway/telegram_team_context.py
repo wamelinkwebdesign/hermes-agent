@@ -191,6 +191,11 @@ def _authorization_field_end(text: str, value_start: int) -> int:
     return len(text)
 
 
+def _without_shell_line_continuations(value: str) -> str:
+    """Remove LF/CRLF shell continuations from an already bounded field value."""
+    return value.replace("\\\r\n", "").replace("\\\n", "")
+
+
 def _redact_authorization_fields(text: str) -> str:
     """Mask each Authorization field through its bounded physical-line tail."""
     rendered: list[str] = []
@@ -202,7 +207,8 @@ def _redact_authorization_fields(text: str) -> str:
             raise _TeamContextRedactionError
         field_end = _authorization_field_end(text, value_start)
         field_value = text[value_start:field_end]
-        if any(form in field_value for form in ("$(", "${", "`")):
+        marker_view = _without_shell_line_continuations(field_value)
+        if any(form in marker_view for form in ("$(", "${", "`")):
             raise _TeamContextRedactionError
         if not field_value.strip() or any(
             character == "\x00" or (ord(character) < 0x20 and character not in "\t\r\n")
