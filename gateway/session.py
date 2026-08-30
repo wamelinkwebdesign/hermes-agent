@@ -13,12 +13,14 @@ import hashlib
 import logging
 import os
 import json
+import re
 import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +147,32 @@ def _is_session_key_unsafe(value: object) -> bool:
     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
 
 
+_SESSION_SCOPE_ID_RE = re.compile(r"[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*\Z")
+_MAX_SESSION_SCOPE_ID_CHARS = 256
+
+
+def _normalize_session_scope_id(value: object) -> str | None:
+    """Validate one internal, colon-delimited logical session discriminator."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("session_scope_id must be a string or None")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > _MAX_SESSION_SCOPE_ID_CHARS
+        or _is_path_unsafe(normalized)
+        or not _SESSION_SCOPE_ID_RE.fullmatch(normalized)
+    ):
+        raise ValueError("invalid session_scope_id")
+    return normalized
+
+
+def _session_scope_key_segment(value: str) -> str:
+    """Encode a colon-delimited scope as one unambiguous session-key segment."""
+    return f"scope={quote(value, safe='-._~')}"
+
+
 @dataclass
 class SessionSource:
     """
@@ -219,7 +247,16 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Internal logical session discriminator. Unlike ``thread_id``, this never
+    # changes transport delivery/threading; it only scopes the Hermes session
+    # key. It is persisted/wired through to_dict/from_dict so queued and restored
+    # SessionSource values retain their routing identity. Colon-separated input
+    # is validated here and encoded into one key segment by build_session_key.
+    # Appended after all legacy fields to preserve positional-call compatibility.
+    session_scope_id: Optional[str] = None
+
     def __post_init__(self) -> None:
+        self.session_scope_id = _normalize_session_scope_id(self.session_scope_id)
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
         # (scope_id wins on conflict) so internal readers of EITHER field see the
@@ -261,6 +298,8 @@ class SessionSource:
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
         }
+        if self.session_scope_id:
+            d["session_scope_id"] = self.session_scope_id
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
         if self.chat_id_alt:
@@ -297,6 +336,7 @@ class SessionSource:
             user_id=data.get("user_id"),
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
+            session_scope_id=data.get("session_scope_id"),
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
@@ -1056,12 +1096,15 @@ def is_shared_multi_user_session(
 
     Mirrors the isolation rules in :func:`build_session_key`:
       - DMs are never shared.
+      - Scoped non-DM roots are always shared across participants.
       - Threads are shared unless ``thread_sessions_per_user`` is True.
       - Non-thread group/channel sessions are shared unless
         ``group_sessions_per_user`` is True (default: True = isolated).
     """
     if source.chat_type == "dm":
         return False
+    if source.session_scope_id:
+        return True
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
@@ -1102,6 +1145,12 @@ def build_session_key(
     that don't multiplex produce byte-identical keys to before. Only the
     multiplexing gateway passes a non-default profile.
 
+    ``source.session_scope_id`` is an optional logical conversation scope. It
+    is encoded as one ``scope=...`` segment after chat/thread identity and
+    before participant isolation. A scoped non-DM conversation is shared by
+    all participants: the scope replaces the participant suffix so every human
+    replying under the same routed root reaches one profile/root session.
+
     DM rules:
       - Slack ``scope_id`` identifies the workspace before chat/user ids. Other
         platforms retain their existing key format; in particular, Discord
@@ -1127,6 +1176,10 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+    session_scope_id = _normalize_session_scope_id(source.session_scope_id)
+    session_scope_segment = (
+        _session_scope_key_segment(session_scope_id) if session_scope_id else None
+    )
     slack_scope_id = (
         str(source.scope_id)
         if source.platform == Platform.SLACK and source.scope_id
@@ -1144,6 +1197,8 @@ def build_session_key(
             dm_parts.append(dm_chat_id)
             if source.thread_id:
                 dm_parts.append(source.thread_id)
+            if session_scope_segment:
+                dm_parts.append(session_scope_segment)
             return ":".join(str(part) for part in dm_parts)
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
@@ -1161,9 +1216,13 @@ def build_session_key(
             dm_parts.append(str(dm_participant_id))
             if source.thread_id:
                 dm_parts.append(source.thread_id)
+            if session_scope_segment:
+                dm_parts.append(session_scope_segment)
             return ":".join(str(part) for part in dm_parts)
         if source.thread_id:
             dm_parts.append(source.thread_id)
+        if session_scope_segment:
+            dm_parts.append(session_scope_segment)
         return ":".join(str(part) for part in dm_parts)
 
     participant_id = source.user_id_alt or source.user_id
@@ -1197,6 +1256,8 @@ def build_session_key(
         key_parts.append(source.chat_id)
     if effective_thread_id:
         key_parts.append(effective_thread_id)
+    if session_scope_segment:
+        key_parts.append(session_scope_segment)
 
     # In threads, default to shared sessions (all participants see the same
     # conversation).  Per-user isolation only applies when explicitly enabled
@@ -1205,7 +1266,7 @@ def build_session_key(
     if effective_thread_id and not thread_sessions_per_user:
         isolate_user = False
 
-    if isolate_user and participant_id:
+    if isolate_user and participant_id and not session_scope_segment:
         key_parts.append(str(participant_id))
 
     return ":".join(str(part) for part in key_parts)
@@ -3650,6 +3711,23 @@ class SessionStore:
             return None
         with self._lock:
             self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
+    def lookup_loaded_session_by_key(
+        self,
+        session_key: str,
+    ) -> Optional[SessionEntry]:
+        """Read one exact entry only when routing state is already loaded.
+
+        Unlike ``lookup_by_session_key``, this accessor is safe for auxiliary
+        read-only paths: it never initializes, reconciles, scans, recovers,
+        prunes, reopens, creates directories, or persists routing state.
+        """
+        if type(session_key) is not str or not session_key:
+            return None
+        with self._lock:
+            if self._loaded is not True:
+                return None
             return self._entries.get(session_key)
 
     def peek_session_id(self, session_key: str) -> Optional[str]:

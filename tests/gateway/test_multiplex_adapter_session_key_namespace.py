@@ -22,7 +22,11 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    is_shared_multi_user_session,
+)
 
 
 UID = "8693894969"
@@ -37,6 +41,18 @@ def _source(profile=None):
         user_id=UID,
         user_name="Lucas",
         profile=profile,
+    )
+
+
+def _team_source(*, root_message_id="501", user_id=UID, thread_id=None):
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001234567890",
+        chat_type="group",
+        user_id=user_id,
+        thread_id=thread_id,
+        profile="engineering",
+        session_scope_id=f"telegram-team:-1001234567890:{root_message_id}",
     )
 
 
@@ -193,3 +209,137 @@ class TestOwnerProfileKeying:
         a._session_store = _Store(active="default")
         a.set_owner_profile("medicina")
         assert a._session_key_profile(None) == "medicina"
+
+
+class TestRootScopedSessionKeys:
+    def test_scoped_non_dm_is_shared_under_default_per_user_setting(self):
+        source = _team_source()
+
+        assert is_shared_multi_user_session(source) is True
+
+    def test_unscoped_non_dm_sharing_behavior_is_unchanged(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001234567890",
+            chat_type="group",
+            user_id="alice",
+        )
+
+        assert is_shared_multi_user_session(source) is False
+        assert (
+            is_shared_multi_user_session(source, group_sessions_per_user=False)
+            is True
+        )
+
+    def test_dm_with_scope_remains_single_user(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=UID,
+            chat_type="dm",
+            user_id=UID,
+            session_scope_id="telegram-team:-1001234567890:501",
+        )
+
+        assert is_shared_multi_user_session(source) is False
+        assert (
+            is_shared_multi_user_session(source, group_sessions_per_user=False)
+            is False
+        )
+
+    def test_same_root_is_stable_and_different_roots_do_not_collide(self):
+        root_501_a = build_session_key(_team_source(root_message_id="501"), profile="engineering")
+        root_501_b = build_session_key(_team_source(root_message_id="501"), profile="engineering")
+        root_502 = build_session_key(_team_source(root_message_id="502"), profile="engineering")
+
+        assert root_501_a == root_501_b
+        assert root_501_a != root_502
+        assert root_501_a == (
+            "agent:engineering:telegram:group:-1001234567890:"
+            "scope=telegram-team%3A-1001234567890%3A501"
+        )
+
+    def test_all_participants_on_one_root_share_the_profile_root_session(self):
+        alice = build_session_key(_team_source(user_id="alice"), profile="engineering")
+        bob = build_session_key(_team_source(user_id="bob"), profile="engineering")
+
+        assert alice == bob
+        assert not alice.endswith(":alice")
+        assert not bob.endswith(":bob")
+
+    def test_scope_is_appended_after_forum_thread_without_modifying_thread_id(self):
+        source = _team_source(thread_id="forum-topic-7")
+
+        key = build_session_key(source, profile="engineering")
+
+        assert source.thread_id == "forum-topic-7"
+        assert key == (
+            "agent:engineering:telegram:group:-1001234567890:forum-topic-7:"
+            "scope=telegram-team%3A-1001234567890%3A501"
+        )
+
+    def test_forum_thread_key_is_byte_identical_when_scope_is_absent(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001234567890",
+            chat_type="group",
+            user_id="alice",
+            thread_id="forum-topic-7",
+            profile="engineering",
+        )
+
+        assert build_session_key(source, profile="engineering") == (
+            "agent:engineering:telegram:group:-1001234567890:forum-topic-7"
+        )
+
+    def test_session_scope_round_trips_but_old_rows_remain_compatible(self):
+        source = _team_source()
+
+        payload = source.to_dict()
+        restored = SessionSource.from_dict(payload)
+        legacy = SessionSource.from_dict(
+            {
+                "platform": "telegram",
+                "chat_id": "-1001234567890",
+                "chat_type": "group",
+            }
+        )
+
+        assert payload["session_scope_id"] == "telegram-team:-1001234567890:501"
+        assert restored.session_scope_id == "telegram-team:-1001234567890:501"
+        assert legacy.session_scope_id is None
+
+    @pytest.mark.parametrize(
+        "invalid_scope",
+        [
+            "telegram-team::501",
+            ":telegram-team:-1001:501",
+            "telegram-team:-1001:501:",
+            "telegram-team:../escape:501",
+            "telegram-team:-1001/escape:501",
+            "telegram-team:-1001\\escape:501",
+            "C:escape",
+            501,
+        ],
+    )
+    def test_invalid_or_ambiguous_session_scope_fails_closed(self, invalid_scope):
+        with pytest.raises(ValueError, match="session_scope_id"):
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="-1001",
+                chat_type="group",
+                session_scope_id=invalid_scope,
+            )
+
+    def test_session_scope_is_trimmed_before_keying_and_persistence(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            session_scope_id="  telegram-team:-1001:501  ",
+        )
+
+        assert source.session_scope_id == "telegram-team:-1001:501"
+        assert source.to_dict()["session_scope_id"] == "telegram-team:-1001:501"
+        assert build_session_key(source) == (
+            "agent:main:telegram:group:-1001:scope=telegram-team%3A-1001%3A501"
+        )

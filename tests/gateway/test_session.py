@@ -255,6 +255,25 @@ class TestBuildSessionContextPrompt:
 
         assert "current turn's sender prefix" not in prompt
 
+    def test_scoped_telegram_group_prompt_is_multi_user_by_default(self):
+        config = GatewayConfig()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001234567890",
+            chat_name="Team Room",
+            chat_type="group",
+            user_id="12345",
+            user_name="Alice",
+            session_scope_id="telegram-team:-1001234567890:501",
+        )
+
+        context = build_session_context(source, config)
+        prompt = build_session_context_prompt(context)
+
+        assert context.shared_multi_user_session is True
+        assert "**Session type:** Multi-user session" in prompt
+        assert "**User:**" not in prompt
+
 
     def test_local_delivery_path_uses_display_hermes_home(self):
         config = GatewayConfig()
@@ -578,6 +597,94 @@ class TestSessionStoreLookup:
         assert store.lookup_by_session_key(entry.session_key) is entry
         assert store.lookup_by_session_key("agent:main:telegram:dm:missing") is None
         assert store.lookup_by_session_key("") is None
+
+    def test_loaded_exact_lookup_cold_state_does_not_initialize_or_touch_disk(
+        self,
+        tmp_path,
+    ):
+        sessions_dir = tmp_path / "cold" / "sessions"
+        with patch(
+            "gateway.session.SessionStore._open_session_db_for_active_scope",
+            return_value=None,
+        ):
+            store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
+        ensure_loaded = MagicMock(
+            side_effect=AssertionError("read-only lookup must not initialize")
+        )
+        store._ensure_loaded_locked = ensure_loaded
+
+        assert sessions_dir.exists() is False
+        assert store.lookup_loaded_session_by_key("exact-key") is None
+
+        assert store._loaded is False
+        assert store._entries == {}
+        assert sessions_dir.exists() is False
+        ensure_loaded.assert_not_called()
+
+    def test_loaded_exact_lookup_reads_only_requested_in_memory_key(self, tmp_path):
+        sessions_dir = tmp_path / "loaded" / "sessions"
+        sessions_dir.mkdir(parents=True)
+        sentinel = sessions_dir / "sentinel.txt"
+        sentinel.write_text("unchanged", encoding="utf-8")
+        before_stat = sentinel.stat()
+        with patch(
+            "gateway.session.SessionStore._open_session_db_for_active_scope",
+            return_value=None,
+        ):
+            store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
+
+        now = datetime.now()
+        exact = SessionEntry(
+            session_key="exact-key",
+            session_id="exact-session",
+            created_at=now,
+            updated_at=now,
+        )
+        unrelated = SessionEntry(
+            session_key="unrelated-key",
+            session_id="unrelated-session",
+            created_at=now,
+            updated_at=now,
+        )
+        requested: list[str] = []
+
+        class ExactOnlyEntries(dict):
+            def get(self, key, default=None):
+                requested.append(key)
+                return super().get(key, default)
+
+            def items(self):
+                raise AssertionError("exact lookup must not scan items")
+
+            def values(self):
+                raise AssertionError("exact lookup must not scan values")
+
+            def __iter__(self):
+                raise AssertionError("exact lookup must not iterate")
+
+        store._entries = ExactOnlyEntries({
+            exact.session_key: exact,
+            unrelated.session_key: unrelated,
+        })
+        store._loaded = True
+        store._db = MagicMock(
+            side_effect=AssertionError("read-only lookup must not access the DB")
+        )
+        ensure_loaded = MagicMock(
+            side_effect=AssertionError("read-only lookup must not reconcile")
+        )
+        store._ensure_loaded_locked = ensure_loaded
+
+        assert store.lookup_loaded_session_by_key("exact-key") is exact
+        assert store.lookup_loaded_session_by_key("missing-key") is None
+
+        assert requested == ["exact-key", "missing-key"]
+        assert store._entries["unrelated-key"] is unrelated
+        assert sentinel.read_text(encoding="utf-8") == "unchanged"
+        after_stat = sentinel.stat()
+        assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+        assert after_stat.st_size == before_stat.st_size
+        ensure_loaded.assert_not_called()
 
 
 class TestSlackWorkspaceSessionIsolation:

@@ -3,6 +3,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
 from gateway.session import SessionSource
@@ -520,6 +522,273 @@ def test_bot_self_messages_are_ignored_in_dm_and_group():
     # Same guard applies in groups/supergroups.
     self_group = _group_message("status tick", chat_id=-100, from_user_id=999)
     assert adapter._should_process_message(self_group) is False
+
+
+def test_team_route_gate_receives_current_message_routing_context_only():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    adapter.set_owner_profile("engineering")
+    contexts = []
+    adapter.set_team_route_gate(lambda context: contexts.append(context) or False)
+
+    current_text = "@Woz_Bot please handle this"
+    message = _group_message(
+        current_text,
+        chat_id=-100,
+        entities=[_mention_entity(current_text, "@Woz_Bot")],
+    )
+    message.reply_to_message = SimpleNamespace(
+        message_id=17,
+        from_user=SimpleNamespace(id=321, username="Human_User"),
+        text="historical quote for @Ace_Bot and @Virgil_Bot",
+        caption=None,
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context.mentions == frozenset({"woz_bot"})
+    assert context.reply_author_username == "human_user"
+    assert context.chat_id == "-100"
+    assert context.owner_profile == "engineering"
+    assert context.owner_username == "hermes_bot"
+    assert context.message_id == "42"
+    assert context.reply_to_message_id == "17"
+
+
+def test_team_route_context_rejects_invalid_current_message_ids_without_quote_fallback():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    contexts = []
+    adapter.set_team_route_gate(lambda context: contexts.append(context) or False)
+    message = _group_message("hello", chat_id=-100)
+    message.message_id = 0
+    message.reply_to_message = SimpleNamespace(
+        message_id="01",
+        from_user=SimpleNamespace(id=321, username="Human_User"),
+        text="quoted message id 999 and @Woz_Bot",
+        caption=None,
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert contexts[0].message_id is None
+    assert contexts[0].reply_to_message_id is None
+    assert contexts[0].mentions == frozenset()
+
+
+def test_team_route_gate_extracts_entityless_current_caption_mentions():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    contexts = []
+    adapter.set_team_route_gate(lambda context: contexts.append(context) or False)
+    message = _group_message(None, chat_id=-100, caption="photo for @Virgil_Bot")
+
+    assert adapter._should_process_message(message) is False
+    assert contexts[0].mentions == frozenset({"virgil_bot"})
+
+
+@pytest.mark.parametrize(
+    ("offset", "length"),
+    [
+        ("not-an-offset", 8),
+        (0, None),
+    ],
+)
+def test_team_route_gate_skips_malformed_entity_offsets_and_lengths(offset, length):
+    adapter = _make_adapter(require_mention=False, allowed_chats=["-100"])
+    contexts = []
+    adapter.set_team_route_gate(lambda context: contexts.append(context) or False)
+    message = _group_message(
+        "@Woz_Bot",
+        chat_id=-100,
+        entities=[SimpleNamespace(type="mention", offset=offset, length=length)],
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert contexts[0].mentions == frozenset()
+
+
+def test_team_route_gate_extracts_utf16_entity_after_astral_prefix():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    contexts = []
+    adapter.set_team_route_gate(lambda context: contexts.append(context) or False)
+    prefix = "😀 ping "
+    mention = "@Woz_Bot"
+    text = prefix + mention
+    message = _group_message(
+        text,
+        chat_id=-100,
+        entities=[
+            SimpleNamespace(
+                type="mention",
+                offset=len(prefix.encode("utf-16-le")) // 2,
+                length=len(mention.encode("utf-16-le")) // 2,
+            )
+        ],
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert contexts[0].mentions == frozenset({"woz_bot"})
+
+
+def test_team_route_gate_false_precedes_guest_mode_outside_allowed_chats():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-200"],
+        guest_mode=True,
+    )
+    gate = Mock(return_value=False)
+    adapter.set_team_route_gate(gate)
+    text = "hi @hermes_bot"
+    message = _group_message(
+        text,
+        chat_id=-201,
+        entities=[_mention_entity(text)],
+    )
+
+    assert adapter._should_process_message(message) is False
+    gate.assert_called_once()
+
+
+def test_text_handler_authorization_rejects_before_team_gate_and_dispatch():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allow_from=["222"],
+        )
+        gate = Mock(return_value=True)
+        adapter.set_team_route_gate(gate)
+        adapter._enqueue_text_event = Mock()
+        update = SimpleNamespace(
+            update_id=1002,
+            message=_group_message("hello", chat_id=-100, from_user_id=111),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        gate.assert_not_called()
+        adapter._enqueue_text_event.assert_not_called()
+
+    asyncio.run(_run())
+
+
+def test_command_handler_authorization_rejects_before_team_gate_and_dispatch():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allow_from=["222"],
+        )
+        gate = Mock(return_value=True)
+        adapter.set_team_route_gate(gate)
+        adapter.handle_message = AsyncMock()
+        update = SimpleNamespace(
+            update_id=1003,
+            message=_group_message("/status", chat_id=-100, from_user_id=111),
+            effective_message=None,
+        )
+
+        await adapter._handle_command(update, SimpleNamespace())
+
+        gate.assert_not_called()
+        adapter.handle_message.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
+def test_team_route_gate_false_precedes_legacy_group_acceptance_fallbacks():
+    cases = [
+        (
+            _make_adapter(
+                require_mention=True,
+                allowed_chats=["-100"],
+                free_response_chats=["-100"],
+            ),
+            _group_message("unaddressed", chat_id=-100),
+        ),
+        (
+            _make_adapter(require_mention=True, allowed_chats=["-100"]),
+            _group_message("reply", chat_id=-100, reply_to_bot=True),
+        ),
+        (
+            _make_adapter(
+                require_mention=True,
+                allowed_chats=["-100"],
+                mention_patterns=[r"^chompy\\b"],
+            ),
+            _group_message("chompy status", chat_id=-100),
+        ),
+    ]
+
+    for adapter, message in cases:
+        adapter.set_team_route_gate(lambda context: False)
+        assert adapter._should_process_message(message) is False
+
+
+def test_team_route_gate_true_precedes_exclusive_foreign_bot_mention_fallback():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        exclusive_bot_mentions=True,
+        bot_username="ace_bot",
+    )
+    adapter.set_team_route_gate(lambda context: True)
+
+    assert adapter._should_process_message(
+        _group_message("@Foreign_Bot take this", chat_id=-100)
+    ) is True
+
+
+def test_absent_team_route_gate_preserves_legacy_routing():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-100)) is False
+    assert adapter._should_process_message(
+        _group_message("reply", chat_id=-100, reply_to_bot=True)
+    ) is True
+
+
+def test_registered_team_route_gate_exception_fails_closed_with_permissive_legacy_config():
+    adapter = _make_adapter(require_mention=False, allowed_chats=["-100"])
+
+    def broken_gate(context):
+        raise RuntimeError("route resolver unavailable")
+
+    adapter.set_team_route_gate(broken_gate)
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-100)) is False
+
+
+@pytest.mark.parametrize("invalid_decision", [None, "accept", 1])
+def test_registered_team_route_gate_invalid_decision_fails_closed_with_permissive_legacy_config(
+    invalid_decision,
+):
+    adapter = _make_adapter(require_mention=False, allowed_chats=["-100"])
+    adapter.set_team_route_gate(lambda context: invalid_decision)
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-100)) is False
+
+
+def test_team_route_gate_does_not_override_early_dm_topic_or_own_message_gates():
+    adapter = _make_adapter(
+        require_mention=False,
+        allowed_chats=["-100"],
+        allowed_topics=["8", "9"],
+        ignored_threads=[9],
+    )
+    gate = Mock(return_value=True)
+    adapter.set_team_route_gate(gate)
+
+    assert adapter._should_process_message(_dm_message("hello")) is True
+    assert adapter._should_process_message(
+        _group_message("wrong topic", chat_id=-100, thread_id=7)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("ignored", chat_id=-100, thread_id=9)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("self", chat_id=-100, thread_id=8, from_user_id=999)
+    ) is False
+    gate.assert_not_called()
 
 
 def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
