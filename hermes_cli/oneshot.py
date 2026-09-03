@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
+from hermes_cli.cli_agent_setup_mixin import saved_profile_default_route
 from hermes_cli.fallback_config import get_fallback_chain
 
 
@@ -166,6 +167,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         return
     try:
         import json
+        from agent.turn_finalizer import sanitize_route_receipt
 
         report = {
             "estimated_cost_usd": result.get("estimated_cost_usd"),
@@ -183,6 +185,9 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             "session_id": result.get("session_id"),
             "completed": result.get("completed"),
             "failed": bool(result.get("failed")) or failure is not None,
+            "route_receipt": sanitize_route_receipt(
+                result.get("route_receipt")
+            ),
             # Billing-audit field: the service tier this run REQUESTED via
             # request_overrides.extra_body (e.g. OpenAI "flex"). None when
             # unset. Lets batch pipelines verify the tier they think they're
@@ -376,6 +381,7 @@ def _run_agent(
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
+    profile_default_route = saved_profile_default_route(model_cfg)
     if isinstance(model_cfg, str):
         cfg_model = model_cfg
     else:
@@ -516,6 +522,7 @@ def _run_agent(
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
         )
+        agent._profile_default_route = dict(profile_default_route)
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.

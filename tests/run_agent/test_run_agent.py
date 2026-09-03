@@ -2702,6 +2702,10 @@ class TestHandleMaxIterations:
         assert "summary" in result.lower()
 
     def test_summary_retries_share_relay_identity(self, agent):
+        from agent.turn_context import reset_route_receipt
+        from agent.turn_finalizer import build_route_receipt
+
+        reset_route_receipt(agent)
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content=""),
             _mock_response(content="Summary"),
@@ -2733,6 +2737,17 @@ class TestHandleMaxIterations:
             relay_calls[0]["metadata"]["api_request_id"],
             outcome="success",
         )
+        receipt = build_route_receipt(
+            agent,
+            completed=True,
+            failed=False,
+            terminal_reason="max_iterations_reached(60/60)",
+        )
+        assert receipt["attempt_count"] == 2
+        assert receipt["successful_api_calls"] == 1
+        assert [
+            attempt["outcome"] for attempt in receipt["attempts"]
+        ] == ["failed", "completed"]
 
     def test_suppress_status_output_keeps_iteration_warning_off_stdout(self, agent, capsys):
         """Machine-readable mode (-Q/oneshot) must not contaminate stdout (#26155)."""
@@ -2904,6 +2919,76 @@ class TestHandleMaxIterations:
             and item.get("call_id") == "call_orphan"
             for item in input_items
         )
+
+    def test_codex_cancelled_summary_attempt_is_failed_before_valid_retry(
+        self,
+        agent,
+    ):
+        from agent.turn_context import begin_route_attempt, reset_route_receipt
+        from agent.turn_finalizer import build_route_receipt
+
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.6-sol"
+        agent._cached_system_prompt = "You are helpful."
+        reset_route_receipt(agent)
+        responses = iter([
+            SimpleNamespace(
+                status="cancelled",
+                output=[],
+                output_text="",
+                error={"message": "cancelled by provider"},
+            ),
+            SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[
+                            SimpleNamespace(
+                                type="output_text",
+                                text="Recovered summary",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ])
+
+        def fake_run_codex_stream(kwargs):
+            begin_route_attempt(
+                agent,
+                model=kwargs.get("model"),
+                provider=agent.provider,
+            )
+            return next(responses)
+
+        with patch.object(
+            agent,
+            "_run_codex_stream",
+            side_effect=fake_run_codex_stream,
+        ):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}],
+                90,
+            )
+
+        receipt = build_route_receipt(
+            agent,
+            completed=True,
+            failed=False,
+            terminal_reason="max_iterations_reached(90/90)",
+        )
+        assert result == "Recovered summary"
+        assert receipt["attempt_count"] == 2
+        assert receipt["successful_api_calls"] == 1
+        assert [
+            attempt["outcome"] for attempt in receipt["attempts"]
+        ] == ["failed", "completed"]
 
     def test_api_sanitizer_matches_responses_call_id_when_id_differs(self, agent):
         messages = [
@@ -3193,6 +3278,65 @@ class TestRunConversation:
             (hook_events[0]["api_request_id"], "success")
         ]
 
+    def test_codex_cancelled_response_is_a_failed_route_attempt(self, agent):
+        from agent.turn_context import begin_route_attempt
+
+        self._setup_agent(agent)
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.6-sol"
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+        agent._api_max_retries = 1
+        cancelled_response = SimpleNamespace(
+            status="cancelled",
+            incomplete_details=None,
+            output=[],
+            output_text="",
+            model="gpt-5.6-sol",
+            usage=None,
+            error={"message": "cancelled by provider"},
+        )
+
+        def fake_run_codex_stream(kwargs, **_kwargs):
+            # Stand in for the real transport boundary, which leaves a normal
+            # return pending until conversation-loop validation accepts it.
+            begin_route_attempt(
+                agent,
+                model=kwargs.get("model"),
+                provider=agent.provider,
+            )
+            return cancelled_response
+
+        with (
+            patch.object(
+                agent,
+                "_create_request_openai_client",
+                return_value=MagicMock(),
+            ),
+            patch.object(agent, "_close_request_openai_client"),
+            patch.object(
+                agent,
+                "_run_codex_stream",
+                side_effect=fake_run_codex_stream,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        receipt = result["route_receipt"]
+        assert result["failed"] is True
+        assert receipt["attempt_count"] == 1
+        assert receipt["successful_api_calls"] == 0
+        assert receipt["completed_route"] is None
+        assert receipt["terminal_status"] == "failed"
+        assert receipt["attempts"][0]["outcome"] == "failed"
+
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
         agent.model = "qwen3.5:9b"
@@ -3315,7 +3459,74 @@ class TestRunConversation:
             result = agent.run_conversation("private prompt")
 
         assert result is failed_result
+        assert result["route_receipt"]["completed_route"] is None
+        assert result["route_receipt"]["attempt_count"] == 0
+        assert result["route_receipt"]["terminal_status"] == "failed"
+        assert result["route_receipt"]["terminal_reason"] == "provider_failure"
         assert order == ["logical", "metrics"]
+
+    def test_route_receipt_preserves_existing_turn_exit_reason(self, agent):
+        failed_result = {
+            "final_response": "compression timed out",
+            "messages": [],
+            "completed": False,
+            "failed": True,
+            "turn_exit_reason": "context_compression_timeout",
+        }
+
+        with patch(
+            "agent.conversation_loop.run_conversation",
+            return_value=failed_result,
+        ):
+            result = agent.run_conversation("private prompt")
+
+        assert result["route_receipt"]["terminal_status"] == "failed"
+        assert result["route_receipt"]["terminal_reason"] == (
+            "context_compression_timeout"
+        )
+
+    def test_forwarder_sanitizes_preexisting_route_receipt(self, agent):
+        secret = "sk-forwarder-secret"
+        result_with_receipt = {
+            "final_response": "done",
+            "messages": [],
+            "completed": True,
+            "route_receipt": {
+                "profile_default_route": {},
+                "requested_route": {
+                    "model": "model",
+                    "provider": "provider",
+                },
+                "completed_route": {
+                    "model": "model",
+                    "provider": "provider",
+                },
+                "attempt_count": 1,
+                "attempts": [{
+                    "ordinal": 1,
+                    "model": "model",
+                    "provider": "provider",
+                    "outcome": "completed",
+                    "exception": secret,
+                }],
+                "fallback_used": False,
+                "successful_api_calls": 1,
+                "elapsed_ms": 1,
+                "terminal_status": "completed",
+                "terminal_reason": "completed",
+                "prompt": secret,
+            },
+        }
+
+        with patch(
+            "agent.conversation_loop.run_conversation",
+            return_value=result_with_receipt,
+        ):
+            result = agent.run_conversation("private prompt")
+
+        assert secret not in json.dumps(result["route_receipt"])
+        assert "prompt" not in result["route_receipt"]
+        assert "exception" not in result["route_receipt"]["attempts"][0]
 
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
@@ -6412,6 +6623,34 @@ class TestStreamingApiCall:
             "HTTP_STATUS/429" in str(call.args[0])
             for call in agent.stream_delta_callback.call_args_list
         )
+
+    def test_route_receipt_counts_each_internal_stream_retry(self, agent):
+        first_attempt = iter([])
+        second_attempt = iter([])
+        third_attempt = iter([
+            _make_chunk(content="Recovered"),
+            _make_chunk(finish_reason="stop"),
+        ])
+        agent.client.chat.completions.create.side_effect = [
+            first_attempt,
+            second_attempt,
+            third_attempt,
+        ]
+        agent.stream_delta_callback = MagicMock()
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+
+        result = agent.run_conversation("hello")
+
+        receipt = result["route_receipt"]
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert agent.client.chat.completions.create.call_count == 3
+        assert receipt["attempt_count"] == 3
+        assert receipt["successful_api_calls"] == 1
+        assert [
+            attempt["outcome"] for attempt in receipt["attempts"]
+        ] == ["failed", "failed", "completed"]
 
     def test_tool_call_accumulation(self, agent):
         # Per OpenAI streaming spec, function names are delivered atomically

@@ -46,8 +46,10 @@ from agent.turn_context import (
     PreflightCompressionTimedOut,
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
+    begin_route_attempt,
     build_turn_context,
     compose_user_api_content,
+    finish_route_attempt,
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
@@ -102,7 +104,7 @@ from agent.repetition_guard import is_repetition_dominated
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
-from agent.turn_finalizer import finalize_turn
+from agent.turn_finalizer import attach_route_receipt, finalize_turn
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -2183,12 +2185,50 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
-            user_message=user_message,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=_should_review_memory,
+        # This subprocess runtime does not expose its internal provider retry
+        # count.  Record the one observable app-server turn dispatch rather
+        # than claiming zero attempts; this is explicitly a boundary receipt,
+        # not fabricated wire-level precision inside the Codex subprocess.
+        app_server_attempt = begin_route_attempt(agent)
+        try:
+            app_server_result = agent._run_codex_app_server_turn(
+                user_message=user_message,
+                original_user_message=original_user_message,
+                messages=messages,
+                effective_task_id=effective_task_id,
+                should_review_memory=_should_review_memory,
+            )
+        except BaseException:
+            finish_route_attempt(
+                agent,
+                app_server_attempt,
+                outcome="failed",
+            )
+            raise
+        app_server_completed = bool(
+            isinstance(app_server_result, dict)
+            and app_server_result.get("completed")
+            and not app_server_result.get("failed")
+            and not app_server_result.get("interrupted")
+        )
+        finish_route_attempt(
+            agent,
+            app_server_attempt,
+            outcome="completed" if app_server_completed else "failed",
+        )
+        if not isinstance(app_server_result, dict):
+            return app_server_result
+        if app_server_result.get("interrupted"):
+            app_server_reason = "interrupted_by_user"
+        elif app_server_completed:
+            app_server_reason = "completed"
+        else:
+            app_server_reason = "provider_failure"
+        return attach_route_receipt(
+            agent,
+            app_server_result,
+            terminal_reason=app_server_result.get("turn_exit_reason")
+            or app_server_reason,
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
@@ -3200,7 +3240,7 @@ def run_conversation(
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return attach_route_receipt(agent, {
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
                                 "No fallback provider available. "
@@ -3212,7 +3252,7 @@ def run_conversation(
                             "completed": False,
                             "failed": True,
                             "error": _nous_msg,
-                        }
+                        }, terminal_reason="api_attempts_exhausted")
                 except ImportError:
                     pass
                 except Exception:
@@ -3504,22 +3544,30 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    try:
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
+                    except BaseException:
+                        # Transport-level failures normally settle themselves.
+                        # This catches middleware/post-processing errors after a
+                        # wire return so no pending attempt can later appear as
+                        # successful by omission.
+                        finish_route_attempt(agent, outcome="failed")
+                        raise
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3537,6 +3585,7 @@ def run_conversation(
                     # redirect() observed the request as active just before this
                     # call returned. Discard that now-stale response and rebuild
                     # from the correction rather than silently losing it.
+                    finish_route_attempt(agent, outcome="failed")
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
@@ -3647,6 +3696,7 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    finish_route_attempt(agent, outcome="failed")
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -3767,14 +3817,14 @@ def run_conversation(
                         logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
-                        return {
+                        return attach_route_receipt(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
                             "error": _final_response,
                             "failed": True  # Mark as failure for filtering
-                        }
+                        }, terminal_reason="invalid_response")
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
@@ -3822,6 +3872,9 @@ def run_conversation(
                         break  # rebuild this iteration from the correction
                     continue  # Retry the API call
 
+                # A transport return is only a successful API call after the
+                # active transport validator accepts its shape/status.
+                finish_route_attempt(agent, outcome="completed")
                 agent._turn_received_provider_response = True
 
                 # Check finish_reason before proceeding
@@ -3970,11 +4023,15 @@ def run_conversation(
 
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
-                    return _content_policy_blocked_result(
-                        messages,
-                        api_call_count,
-                        final_response=_refusal_response,
-                        error_detail=_refusal_text or "model declined (content_filter)",
+                    return attach_route_receipt(
+                        agent,
+                        _content_policy_blocked_result(
+                            messages,
+                            api_call_count,
+                            final_response=_refusal_response,
+                            error_detail=_refusal_text or "model declined (content_filter)",
+                        ),
+                        terminal_reason="provider_failure",
                     )
 
                 if finish_reason == "length":
@@ -5041,7 +5098,7 @@ def run_conversation(
                         "Turn abandoned: the process was shutting down "
                         "before the model call could complete."
                     )
-                    return {
+                    return attach_route_receipt(agent, {
                         "final_response": _shutdown_summary,
                         "messages": messages,
                         "api_calls": api_call_count,
@@ -5050,7 +5107,7 @@ def run_conversation(
                         "error": _shutdown_summary,
                         "failure_reason": "interpreter_shutdown",
                         "failure_retryable": False,
-                    }
+                    }, terminal_reason="interpreter_shutdown")
 
                 # ── Classify the error for structured recovery decisions ──
                 _compressor = getattr(agent, "context_compressor", None)
@@ -6703,34 +6760,42 @@ def run_conversation(
                             f"Provider message: {_nonretryable_summary}\n\n"
                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
                         )
-                        return _content_policy_blocked_result(
-                            messages,
-                            api_call_count,
-                            final_response=_policy_response,
-                            error_detail=_nonretryable_summary,
+                        return attach_route_receipt(
+                            agent,
+                            _content_policy_blocked_result(
+                                messages,
+                                api_call_count,
+                                final_response=_policy_response,
+                                error_detail=_nonretryable_summary,
+                            ),
+                            terminal_reason="provider_failure",
                         )
                     # Billing walls are the common non-retryable abort: enrich
                     # the result with the same structured recovery descriptor as
                     # the max-retries path so every surface (CLI, TUI, desktop)
                     # renders one consistent billing signal.
                     if classified.reason == FailoverReason.billing:
-                        return _billing_failure_result(
-                            classified=classified,
-                            summary=_nonretryable_summary,
-                            messages=messages,
-                            api_call_count=api_call_count,
-                            provider=_provider,
-                            base_url=_base,
-                            model=_model,
+                        return attach_route_receipt(
+                            agent,
+                            _billing_failure_result(
+                                classified=classified,
+                                summary=_nonretryable_summary,
+                                messages=messages,
+                                api_call_count=api_call_count,
+                                provider=_provider,
+                                base_url=_base,
+                                model=_model,
+                            ),
+                            terminal_reason="provider_failure",
                         )
-                    return {
+                    return attach_route_receipt(agent, {
                         "final_response": _nonretryable_summary,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
-                    }
+                    }, terminal_reason="provider_failure")
 
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary
@@ -6934,7 +6999,7 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
-                    return {
+                    return attach_route_receipt(agent, {
                         "final_response": _final_response,
                         "messages": messages,
                         "api_calls": api_call_count,
@@ -6956,7 +7021,7 @@ def run_conversation(
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,
-                    }
+                    }, terminal_reason="api_attempts_exhausted")
 
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None

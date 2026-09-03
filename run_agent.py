@@ -9185,6 +9185,53 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        _route_receipt_forwarder_started_at = time.monotonic()
+
+        def _ensure_route_receipt(result, *, terminal_reason=None, reset=False):
+            """Attach once; never replace the loop's already-finalized receipt."""
+            if not isinstance(result, dict):
+                return result
+            if isinstance(result.get("route_receipt"), dict):
+                # Middleware/tests can supply a pre-existing result dict. Never
+                # forward that receipt verbatim: reconstruct the exact public
+                # allowlist before any CLI or usage-file surface can serialize
+                # arbitrary nested fields.
+                from agent.turn_finalizer import sanitize_route_receipt
+
+                result["route_receipt"] = sanitize_route_receipt(
+                    result["route_receipt"]
+                )
+                return result
+            if reset or not isinstance(
+                getattr(self, "_route_receipt_attempts", None), list
+            ):
+                # Forwarder-only early exits occur before the conversation
+                # prologue's normal per-turn reset.  Initialize them here so
+                # they cannot inherit attempts from a prior turn.
+                from agent.turn_context import reset_route_receipt
+
+                reset_route_receipt(self)
+                self._route_receipt_started_at = _route_receipt_forwarder_started_at
+            from agent.turn_finalizer import attach_route_receipt
+
+            if terminal_reason is None:
+                existing_reason = result.get("turn_exit_reason")
+                if isinstance(existing_reason, str) and existing_reason.strip():
+                    terminal_reason = existing_reason.strip()
+                elif result.get("interrupted"):
+                    terminal_reason = "interrupted_by_user"
+                elif result.get("failed"):
+                    terminal_reason = "provider_failure"
+                elif result.get("completed"):
+                    terminal_reason = "completed"
+                else:
+                    terminal_reason = "unknown"
+            return attach_route_receipt(
+                self,
+                result,
+                terminal_reason=terminal_reason,
+            )
+
         # A review deliberately shares this agent's session_id for prompt-cache
         # parity. Fence review startup or interrupt an admitted request, then
         # await that request's exit before opening any live-turn Relay or task
@@ -9391,7 +9438,11 @@ class AIAgent:
                         except Exception:
                             self._interrupt_requested = False
                             self._interrupt_message = None
-                        return interrupt_result
+                        return _ensure_route_receipt(
+                            interrupt_result,
+                            terminal_reason="interrupted_by_user",
+                            reset=True,
+                        )
                     # Fail closed like gateway TurnLeaseTimeoutError: do not
                     # enter load/run/flush, and surface a resend notice instead
                     # of a bare TimeoutError that looks like a hang.
@@ -9412,14 +9463,14 @@ class AIAgent:
                             exc_info=True,
                         )
                     relay_outcome = "timed_out"
-                    return {
+                    return _ensure_route_receipt({
                         "final_response": timeout_msg,
                         "messages": list(conversation_history or []),
                         "api_calls": 0,
                         "completed": False,
                         "failed": True,
                         "error": f"session_turn_lease_timeout:{session_id}",
-                    }
+                    }, terminal_reason="timed_out", reset=True)
 
                 # Assign only after admission so finally release cannot target a
                 # holder string that never owned the row. Persist paths read
@@ -9735,6 +9786,7 @@ class AIAgent:
                         persist_user_platform_id=persist_user_platform_id,
                         moa_config=moa_config,
                     )
+                    result = _ensure_route_receipt(result)
                 finally:
                     # The lease remains held through relay/task finalization, but
                     # those post-loop steps must not receive a late refresh

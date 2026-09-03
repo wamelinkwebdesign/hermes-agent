@@ -34,7 +34,11 @@ from agent.error_classifier import (
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
 )
 from agent.errors import EmptyStreamError
-from agent.turn_context import substitute_api_content
+from agent.turn_context import (
+    begin_route_attempt,
+    finish_route_attempt,
+    substitute_api_content,
+)
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
@@ -537,6 +541,97 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     return 0.0
 
 
+_CODEX_GPT56_DEEP_REASONING_EFFORTS = frozenset({
+    "high", "xhigh", "max", "ultra",
+})
+_CODEX_GPT56_DEEP_REASONING_STALE_FLOOR_SECONDS = 240.0
+_CODEX_GPT56_DEEP_REASONING_EVENT_IDLE_FLOOR_SECONDS = 60.0
+
+
+def _is_codex_gpt56_deep_reasoning_request(api_kwargs: Any) -> bool:
+    """Return whether the emitted Codex request needs deep-think patience.
+
+    This deliberately inspects the final request kwargs, not the agent's
+    configured reasoning level: transport clamping and request overrides may
+    change what is actually emitted.  The ``-900k`` picker alias is naturally
+    included in the gpt-5.6 family and therefore receives the same policy as
+    its base model.
+    """
+    if not isinstance(api_kwargs, dict):
+        return False
+
+    from agent.native_compaction import is_native_compaction_model
+
+    if not is_native_compaction_model(api_kwargs.get("model")):
+        return False
+    reasoning = api_kwargs.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return False
+    effort = str(reasoning.get("effort") or "").strip().lower()
+    return effort in _CODEX_GPT56_DEEP_REASONING_EFFORTS
+
+
+def _nonstream_stale_timeout_is_explicit(agent) -> bool:
+    """Whether operator config must win over implicit Codex policy floors."""
+    if get_provider_stale_timeout(agent.provider, agent.model) is not None:
+        return True
+    return os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None
+
+
+def _apply_codex_gpt56_deep_reasoning_stale_floor(
+    stale_timeout: float,
+    *,
+    eligible: bool,
+    timeout_is_explicit: bool,
+) -> float:
+    """Apply the implicit 240s total-stale floor when policy is eligible.
+
+    ``stale_timeout`` is the already-scaled result from
+    ``_compute_non_stream_stale_timeout``.  Applying the floor here means a
+    generic run-budget cap cannot reintroduce the observed 60/90s false kill,
+    while explicit operator configuration remains authoritative.
+    """
+    if not eligible or timeout_is_explicit:
+        return stale_timeout
+    return max(stale_timeout, _CODEX_GPT56_DEEP_REASONING_STALE_FLOOR_SECONDS)
+
+
+def _codex_event_stale_timeout_default(
+    est_tokens: int,
+    *,
+    deep_reasoning_gpt56: bool,
+) -> float:
+    """Resolve the implicit SSE event-idle timeout for a Codex request."""
+    if est_tokens > 100_000:
+        timeout = 180.0
+    elif est_tokens > 50_000:
+        timeout = 120.0
+    elif est_tokens > 10_000:
+        timeout = 60.0
+    else:
+        timeout = 12.0
+
+    if deep_reasoning_gpt56:
+        timeout = max(
+            timeout,
+            _CODEX_GPT56_DEEP_REASONING_EVENT_IDLE_FLOOR_SECONDS,
+        )
+    return timeout
+
+
+def _resolve_codex_event_stale_timeout(
+    est_tokens: int,
+    *,
+    deep_reasoning_gpt56: bool,
+) -> float:
+    """Resolve event-idle timeout, preserving the explicit env override."""
+    default = _codex_event_stale_timeout_default(
+        est_tokens,
+        deep_reasoning_gpt56=deep_reasoning_gpt56,
+    )
+    return _env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", default)
+
+
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     """Return a normalized OpenRouter provider.sort value or None."""
     if not isinstance(raw_sort, str):
@@ -933,7 +1028,22 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    def _wire_request(call, *, model=None, provider=None):
+        attempt = begin_route_attempt(
+            agent,
+            model=model,
+            provider=provider,
+        )
+        try:
+            return call()
+        except BaseException:
+            finish_route_attempt(agent, attempt, outcome="failed")
+            raise
+
     if agent.api_mode == "codex_responses":
+        # ``run_codex_stream`` owns accounting around each one of its internal
+        # physical retries.  Wrapping the outer dispatch here would double
+        # count the final stream.
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
             api_kwargs,
@@ -947,7 +1057,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
-        return agent._anthropic_messages_create(api_kwargs, client=request_client)
+        return _wire_request(
+            lambda: agent._anthropic_messages_create(
+                api_kwargs,
+                client=request_client,
+            ),
+            model=api_kwargs.get("model"),
+        )
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
         # normalize_converse_response produces an OpenAI-compatible
@@ -964,7 +1080,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
-            raw_response = client.converse(**api_kwargs)
+            raw_response = _wire_request(
+                lambda: client.converse(**api_kwargs),
+                model=api_kwargs.get("modelId"),
+            )
         except Exception as _bedrock_exc:
             # A model that refuses cachePoint in one section (Nova rejects it
             # inside toolConfig.tools, #97281) fails every turn otherwise —
@@ -973,7 +1092,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 _bedrock_exc, api_kwargs
             )
             if _retry_kwargs is not None:
-                raw_response = client.converse(**_retry_kwargs)
+                raw_response = _wire_request(
+                    lambda: client.converse(**_retry_kwargs),
+                    model=_retry_kwargs.get("modelId"),
+                )
                 return normalize_converse_response(raw_response)
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
@@ -998,9 +1120,15 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
-        return agent.client.chat.completions.create(**api_kwargs)
+        return _wire_request(
+            lambda: agent.client.chat.completions.create(**api_kwargs),
+            model=api_kwargs.get("model"),
+        )
     request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+    return _wire_request(
+        lambda: request_client.chat.completions.create(**api_kwargs),
+        model=api_kwargs.get("model"),
+    )
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -1559,9 +1687,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _codex_watchdog_enabled = agent.api_mode == "codex_responses"
     _openai_codex_backend = _is_openai_codex_backend(agent)
     _est_tokens_for_codex_watchdog = estimate_request_context_tokens(api_kwargs)
+    _deep_reasoning_codex_gpt56 = (
+        _codex_watchdog_enabled
+        and _openai_codex_backend
+        and _is_codex_gpt56_deep_reasoning_request(api_kwargs)
+    )
+    _stale_timeout_is_explicit = (
+        _nonstream_stale_timeout_is_explicit(agent)
+        if _deep_reasoning_codex_gpt56
+        else False
+    )
+    _stale_timeout = _apply_codex_gpt56_deep_reasoning_stale_floor(
+        _stale_timeout,
+        eligible=_deep_reasoning_codex_gpt56,
+        timeout_is_explicit=_stale_timeout_is_explicit,
+    )
     if _codex_watchdog_enabled and _openai_codex_backend:
         _codex_floor = openai_codex_stale_timeout_floor(_est_tokens_for_codex_watchdog)
-        if _codex_floor:
+        # The size floor predates the gpt-5.6 deep-reasoning policy and is
+        # also implicit.  For an eligible request, do not let it re-override
+        # an explicit provider/model or environment timeout after the policy
+        # above deliberately preserved that operator choice.
+        if _codex_floor and not _stale_timeout_is_explicit:
             _stale_timeout = max(_stale_timeout, _codex_floor)
 
     # ── Codex absolute hard ceiling (#64507) ──────────────────────────
@@ -1587,14 +1734,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     ):
         _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
 
-    if _est_tokens_for_codex_watchdog > 100_000:
-        _codex_idle_timeout_default = 180.0
-    elif _est_tokens_for_codex_watchdog > 50_000:
-        _codex_idle_timeout_default = 120.0
-    elif _est_tokens_for_codex_watchdog > 10_000:
-        _codex_idle_timeout_default = 60.0
-    else:
-        _codex_idle_timeout_default = 12.0
+    _codex_idle_timeout_default = _codex_event_stale_timeout_default(
+        _est_tokens_for_codex_watchdog,
+        deep_reasoning_gpt56=_deep_reasoning_codex_gpt56,
+    )
 
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
@@ -1641,9 +1784,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _ttfb_timeout = _ttfb_cap
 
     _codex_idle_enabled = _codex_watchdog_enabled
-    _codex_idle_timeout = _env_float(
-        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
-        _codex_idle_timeout_default,
+    _codex_idle_timeout = _resolve_codex_event_stale_timeout(
+        _est_tokens_for_codex_watchdog,
+        deep_reasoning_gpt56=_deep_reasoning_codex_gpt56,
     )
     if _codex_idle_timeout <= 0:
         _codex_idle_enabled = False
@@ -3075,24 +3218,80 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"
 
-    def _managed_summary_call(request, callback, *, retry_count: int):
+    def _summary_response_rejected(response) -> bool:
+        status = str(getattr(response, "status", "") or "").strip().lower()
+        return status in {"failed", "cancelled"}
+
+    def _accepted_summary_text(normalized, *, response=None) -> str:
+        """Return only summary text accepted for user-visible completion."""
+        if _summary_response_rejected(response):
+            return ""
+        content = getattr(normalized, "content", None)
+        if not isinstance(content, str):
+            return ""
+        text = content.strip()
+        if "<think>" in text:
+            text = re.sub(
+                r"<think>.*?</think>\s*",
+                "",
+                text,
+                flags=re.DOTALL,
+            ).strip()
+        return text
+
+    def _managed_summary_call(
+        request,
+        callback,
+        *,
+        normalize,
+        retry_count: int,
+    ):
         from agent import relay_llm
 
-        return relay_llm.execute_current(
-            request,
-            callback,
-            name=str(getattr(agent, "provider", "") or "provider"),
-            model_name=str(getattr(agent, "model", "") or ""),
-            metadata={
-                "api_mode": str(
-                    getattr(agent, "api_mode", "") or "chat_completions"
+        route_attempt = {"value": None}
+
+        def _physical_summary_call(next_request):
+            token = begin_route_attempt(
+                agent,
+                model=(
+                    next_request.get("model")
+                    if isinstance(next_request, dict)
+                    else None
                 ),
-                "api_request_id": summary_api_request_id,
-                "call_role": "iteration_summary",
-                "retry_count": retry_count,
-            },
-            defer_logical_completion=True,
-        )
+            )
+            route_attempt["value"] = token
+            try:
+                return callback(next_request)
+            except BaseException:
+                finish_route_attempt(agent, token, outcome="failed")
+                raise
+
+        try:
+            response = relay_llm.execute_current(
+                request,
+                _physical_summary_call,
+                name=str(getattr(agent, "provider", "") or "provider"),
+                model_name=str(getattr(agent, "model", "") or ""),
+                metadata={
+                    "api_mode": str(
+                        getattr(agent, "api_mode", "") or "chat_completions"
+                    ),
+                    "api_request_id": summary_api_request_id,
+                    "call_role": "iteration_summary",
+                    "retry_count": retry_count,
+                },
+                defer_logical_completion=True,
+            )
+            normalized = normalize(response)
+        except BaseException:
+            token = route_attempt["value"]
+            if token is not None:
+                finish_route_attempt(agent, token, outcome="failed")
+            raise
+        # A normalized response is still pending here.  Empty/rejected text is
+        # not an accepted summary and must be settled failed by the caller;
+        # only non-empty sanitized text completes the physical attempt.
+        return response, normalized, route_attempt["value"]
 
     # Shared constant so compaction recognizers can identify this runtime nudge
     # by its stable content after SessionDB projection strips metadata flags
@@ -3219,10 +3418,25 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
-            _ct_sum = agent._get_transport()
-            _cnr_sum = _ct_sum.normalize_response(summary_response)
-            final_response = (_cnr_sum.content or "").strip()
+            try:
+                summary_response = agent._run_codex_stream(codex_kwargs)
+                _ct_sum = agent._get_transport()
+                _cnr_sum = (
+                    None
+                    if _summary_response_rejected(summary_response)
+                    else _ct_sum.normalize_response(summary_response)
+                )
+            except BaseException:
+                finish_route_attempt(agent, outcome="failed")
+                raise
+            final_response = _accepted_summary_text(
+                _cnr_sum,
+                response=summary_response,
+            )
+            finish_route_attempt(
+                agent,
+                outcome="completed" if final_response else "failed",
+            )
         else:
             summary_kwargs = {
                 "model": agent.model,
@@ -3299,45 +3513,76 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     base_url=getattr(agent, "_anthropic_base_url", None),
                 )
                 _ant_kw = _merge_nous_portal_messages_extra_body(agent, _ant_kw)
-                summary_response = _managed_summary_call(
+                summary_response, _summary_result, summary_attempt = _managed_summary_call(
                     _ant_kw,
                     agent._anthropic_messages_create,
+                    normalize=lambda response: _tsum.normalize_response(
+                        response,
+                        strip_tool_prefix=agent._is_anthropic_oauth,
+                    ),
                     retry_count=0,
                 )
-                _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
-                final_response = (_summary_result.content or "").strip()
+                final_response = _accepted_summary_text(
+                    _summary_result,
+                    response=summary_response,
+                )
+                if summary_attempt is not None:
+                    finish_route_attempt(
+                        agent,
+                        summary_attempt,
+                        outcome="completed" if final_response else "failed",
+                    )
             else:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
-                summary_response = _managed_summary_call(
+                summary_response, _summary_result, summary_attempt = _managed_summary_call(
                     summary_kwargs,
                     lambda request: summary_client.chat.completions.create(**request),
+                    normalize=agent._get_transport().normalize_response,
                     retry_count=0,
                 )
-                _summary_result = agent._get_transport().normalize_response(summary_response)
-                final_response = (_summary_result.content or "").strip()
+                final_response = _accepted_summary_text(
+                    _summary_result,
+                    response=summary_response,
+                )
+                if summary_attempt is not None:
+                    finish_route_attempt(
+                        agent,
+                        summary_attempt,
+                        outcome="completed" if final_response else "failed",
+                    )
 
         if final_response:
-            if "<think>" in final_response:
-                final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-            if final_response:
-                summary_call_outcome = "success"
-                append_message(
-                    messages,
-                    {"role": "assistant", "content": final_response},
-                )
-            else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+            summary_call_outcome = "success"
+            append_message(
+                messages,
+                {"role": "assistant", "content": final_response},
+            )
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
-                _ct_retry = agent._get_transport()
-                _cnr_retry = _ct_retry.normalize_response(retry_response)
-                final_response = (_cnr_retry.content or "").strip()
+                try:
+                    retry_response = agent._run_codex_stream(codex_kwargs)
+                    _ct_retry = agent._get_transport()
+                    _cnr_retry = (
+                        None
+                        if _summary_response_rejected(retry_response)
+                        else _ct_retry.normalize_response(retry_response)
+                    )
+                except BaseException:
+                    finish_route_attempt(agent, outcome="failed")
+                    raise
+                final_response = _accepted_summary_text(
+                    _cnr_retry,
+                    response=retry_response,
+                )
+                finish_route_attempt(
+                    agent,
+                    outcome="completed" if final_response else "failed",
+                )
             elif agent.api_mode == "anthropic_messages":
                 _tretry = agent._get_transport()
                 _ant_kw2 = _tretry.build_kwargs(
@@ -3351,13 +3596,25 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     base_url=getattr(agent, "_anthropic_base_url", None),
                 )
                 _ant_kw2 = _merge_nous_portal_messages_extra_body(agent, _ant_kw2)
-                retry_response = _managed_summary_call(
+                retry_response, _retry_result, retry_attempt = _managed_summary_call(
                     _ant_kw2,
                     agent._anthropic_messages_create,
+                    normalize=lambda response: _tretry.normalize_response(
+                        response,
+                        strip_tool_prefix=agent._is_anthropic_oauth,
+                    ),
                     retry_count=1,
                 )
-                _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
-                final_response = (_retry_result.content or "").strip()
+                final_response = _accepted_summary_text(
+                    _retry_result,
+                    response=retry_response,
+                )
+                if retry_attempt is not None:
+                    finish_route_attempt(
+                        agent,
+                        retry_attempt,
+                        outcome="completed" if final_response else "failed",
+                    )
             else:
                 summary_kwargs = {
                     "model": agent.model,
@@ -3375,25 +3632,29 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
                 )
-                summary_response = _managed_summary_call(
+                retry_response, _retry_result, retry_attempt = _managed_summary_call(
                     summary_kwargs,
                     lambda request: summary_client.chat.completions.create(**request),
+                    normalize=agent._get_transport().normalize_response,
                     retry_count=1,
                 )
-                _retry_result = agent._get_transport().normalize_response(summary_response)
-                final_response = (_retry_result.content or "").strip()
+                final_response = _accepted_summary_text(
+                    _retry_result,
+                    response=retry_response,
+                )
+                if retry_attempt is not None:
+                    finish_route_attempt(
+                        agent,
+                        retry_attempt,
+                        outcome="completed" if final_response else "failed",
+                    )
 
             if final_response:
-                if "<think>" in final_response:
-                    final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-                if final_response:
-                    summary_call_outcome = "success"
-                    append_message(
-                        messages,
-                        {"role": "assistant", "content": final_response},
-                    )
-                else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
+                summary_call_outcome = "success"
+                append_message(
+                    messages,
+                    {"role": "assistant", "content": final_response},
+                )
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
@@ -3576,6 +3837,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # callbacks — same UX as Anthropic and chat_completions streaming.
     if agent.api_mode == "bedrock_converse":
         result = {"response": None, "error": None}
+        bedrock_route_attempt = {"value": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}
         # Wire-level liveness for the boto3 converse_stream worker: the worker
@@ -3628,9 +3890,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
+                    route_attempt = begin_route_attempt(
+                        agent,
+                        model=final_kwargs.get("modelId"),
+                    )
+                    bedrock_route_attempt["value"] = route_attempt
                     try:
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
+                        finish_route_attempt(
+                            agent,
+                            route_attempt,
+                            outcome="failed",
+                        )
                         # Bedrock refuses a cachePoint block in one section for
                         # some families (Nova: toolConfig.tools, #97281) and
                         # fails the whole request. Drop that marker and reopen
@@ -3639,9 +3911,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             _bedrock_exc, final_kwargs
                         )
                         if _retry_kwargs is not None:
-                            return client.converse_stream(**_retry_kwargs).get(
-                                "stream", []
+                            retry_attempt = begin_route_attempt(
+                                agent,
+                                model=_retry_kwargs.get("modelId"),
                             )
+                            bedrock_route_attempt["value"] = retry_attempt
+                            try:
+                                return client.converse_stream(
+                                    **_retry_kwargs
+                                ).get("stream", [])
+                            except BaseException:
+                                finish_route_attempt(
+                                    agent,
+                                    retry_attempt,
+                                    outcome="failed",
+                                )
+                                raise
                         # InvokeModel-only policies cannot open a stream. Keep
                         # the fallback inside the same managed Relay attempt so
                         # the real provider request and terminal response still
@@ -3658,9 +3943,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
-                            return normalize_converse_response(
-                                client.converse(**final_kwargs)
+                            fallback_attempt = begin_route_attempt(
+                                agent,
+                                model=final_kwargs.get("modelId"),
                             )
+                            bedrock_route_attempt["value"] = fallback_attempt
+                            try:
+                                return normalize_converse_response(
+                                    client.converse(**final_kwargs)
+                                )
+                            except BaseException:
+                                finish_route_attempt(
+                                    agent,
+                                    fallback_attempt,
+                                    outcome="failed",
+                                )
+                                raise
                         if is_stale_connection_error(_bedrock_exc):
                             invalidate_runtime_client(region)
                         raise
@@ -3743,6 +4041,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 result["response"] = stream.final_response or streamed_response
             except Exception as e:
+                finish_route_attempt(
+                    agent,
+                    bedrock_route_attempt["value"],
+                    outcome="failed",
+                )
                 result["error"] = e
             finally:
                 if stream is not None:
@@ -3985,6 +4288,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         "discarded_bytes": 0,
     }
     managed_stream_holder = {"stream": None}
+    current_route_attempt = {"value": None}
 
     def _set_managed_stream(stream: Any) -> Any:
         managed_stream_holder["stream"] = stream
@@ -4159,7 +4463,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
-            return request_client.chat.completions.create(**stream_kwargs)
+            route_attempt = begin_route_attempt(
+                agent,
+                model=stream_kwargs.get("model"),
+            )
+            current_route_attempt["value"] = route_attempt
+            try:
+                return request_client.chat.completions.create(**stream_kwargs)
+            except BaseException:
+                finish_route_attempt(
+                    agent,
+                    route_attempt,
+                    outcome="failed",
+                )
+                raise
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
@@ -4794,9 +5111,30 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
-            manager = request_client.messages.stream(**final_kwargs)
+            route_attempt = begin_route_attempt(
+                agent,
+                model=final_kwargs.get("model"),
+            )
+            current_route_attempt["value"] = route_attempt
+            try:
+                manager = request_client.messages.stream(**final_kwargs)
+            except BaseException:
+                finish_route_attempt(
+                    agent,
+                    route_attempt,
+                    outcome="failed",
+                )
+                raise
             _stream_context["manager"] = manager
-            return manager.__enter__()
+            try:
+                return manager.__enter__()
+            except BaseException:
+                finish_route_attempt(
+                    agent,
+                    route_attempt,
+                    outcome="failed",
+                )
+                raise
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream
@@ -5011,6 +5349,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     )
                     return  # success
                 except Exception as e:
+                    # The wire opener leaves a normal return pending until the
+                    # conversation loop accepts validation.  A stream failure
+                    # after open belongs to this physical attempt and must be
+                    # settled before an internal reconnect begins.
+                    finish_route_attempt(
+                        agent,
+                        current_route_attempt["value"],
+                        outcome="failed",
+                    )
                     _emit_stream_end(final_text="", finished=False, error=str(e))
                     _close_managed_stream()
                     # If the main poll loop force-closed this request because

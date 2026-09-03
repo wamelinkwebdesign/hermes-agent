@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.turn_context import begin_route_attempt, finish_route_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -1628,6 +1629,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         intercepted_events = []
         writer_token = {"value": None}
+        route_attempt = {"value": None}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = _sanitize_consumer_codex_request(
@@ -1636,7 +1638,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             stream_kwargs["stream"] = True
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
-            return active_client.responses.create(**stream_kwargs)
+            attempt_token = begin_route_attempt(
+                agent,
+                model=stream_kwargs.get("model"),
+            )
+            route_attempt["value"] = attempt_token
+            try:
+                return active_client.responses.create(**stream_kwargs)
+            except BaseException:
+                finish_route_attempt(
+                    agent,
+                    attempt_token,
+                    outcome="failed",
+                )
+                raise
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt
@@ -1696,6 +1711,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
+            finish_route_attempt(
+                agent,
+                route_attempt["value"],
+                outcome="failed",
+            )
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); "
@@ -1713,6 +1733,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             raise
         except _APIConnectionError as exc:
+            finish_route_attempt(
+                agent,
+                route_attempt["value"],
+                outcome="failed",
+            )
             _log_codex_request_failure(
                 agent,
                 exc,
@@ -1743,6 +1768,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                finish_route_attempt(
+                    agent,
+                    route_attempt["value"],
+                    outcome="failed",
+                )
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -1760,8 +1790,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             except RuntimeError:
                 if event_stream.final_response is not None:
                     return event_stream.final_response
+                finish_route_attempt(
+                    agent,
+                    route_attempt["value"],
+                    outcome="failed",
+                )
                 raise
             except _APIConnectionError as exc:
+                finish_route_attempt(
+                    agent,
+                    route_attempt["value"],
+                    outcome="failed",
+                )
                 _log_codex_request_failure(
                     agent,
                     exc,

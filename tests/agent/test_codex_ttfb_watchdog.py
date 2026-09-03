@@ -57,6 +57,158 @@ def _make_codex_agent(tmp_path, monkeypatch):
     return agent
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.6-sol",
+        "gpt-5.6-sol-900k",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-sol-900k",
+    ],
+)
+@pytest.mark.parametrize("effort", ["high", "xhigh", "max", "ultra"])
+def test_gpt56_deep_reasoning_policy_matches_wire_aliases(model, effort):
+    from agent import chat_completion_helpers as h
+
+    assert h._is_codex_gpt56_deep_reasoning_request({
+        "model": model,
+        "reasoning": {"effort": effort},
+    })
+
+
+@pytest.mark.parametrize(
+    "api_kwargs",
+    [
+        {"model": "gpt-5.5", "reasoning": {"effort": "high"}},
+        {"model": "gpt-5.6-sol", "reasoning": {"effort": "medium"}},
+        {"model": "gpt-5.6-sol"},
+        {"model": "gpt-5.6-sol", "reasoning": "high"},
+    ],
+)
+def test_gpt56_deep_reasoning_policy_rejects_negative_cases(api_kwargs):
+    from agent import chat_completion_helpers as h
+
+    assert not h._is_codex_gpt56_deep_reasoning_request(api_kwargs)
+
+
+def test_deep_reasoning_total_floor_survives_generic_run_budget_cap():
+    """A 60s result from generic scaling is raised after that scaling."""
+    from agent import chat_completion_helpers as h
+
+    assert h._apply_codex_gpt56_deep_reasoning_stale_floor(
+        60.0,
+        eligible=True,
+        timeout_is_explicit=False,
+    ) == 240.0
+    assert h._apply_codex_gpt56_deep_reasoning_stale_floor(
+        600.0,
+        eligible=True,
+        timeout_is_explicit=False,
+    ) == 600.0
+
+
+def test_non_codex_and_lower_effort_defaults_are_unchanged():
+    from agent import chat_completion_helpers as h
+
+    assert h._apply_codex_gpt56_deep_reasoning_stale_floor(
+        90.0,
+        eligible=False,
+        timeout_is_explicit=False,
+    ) == 90.0
+    assert h._codex_event_stale_timeout_default(
+        0,
+        deep_reasoning_gpt56=False,
+    ) == 12.0
+
+
+def test_deep_reasoning_small_context_event_idle_default_is_60s():
+    from agent import chat_completion_helpers as h
+
+    assert h._codex_event_stale_timeout_default(
+        0,
+        deep_reasoning_gpt56=True,
+    ) == 60.0
+    assert h._codex_event_stale_timeout_default(
+        9_999,
+        deep_reasoning_gpt56=True,
+    ) == 60.0
+
+
+def test_explicit_total_stale_overrides_retain_precedence(monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = SimpleNamespace(provider="openai-codex", model="gpt-5.6-sol")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    monkeypatch.setattr(h, "get_provider_stale_timeout", lambda *_args: 37.0)
+    assert h._nonstream_stale_timeout_is_explicit(agent)
+    assert h._apply_codex_gpt56_deep_reasoning_stale_floor(
+        37.0,
+        eligible=True,
+        timeout_is_explicit=True,
+    ) == 37.0
+
+    monkeypatch.setattr(h, "get_provider_stale_timeout", lambda *_args: None)
+    monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "41")
+    assert h._nonstream_stale_timeout_is_explicit(agent)
+    assert h._apply_codex_gpt56_deep_reasoning_stale_floor(
+        41.0,
+        eligible=True,
+        timeout_is_explicit=True,
+    ) == 41.0
+
+
+def test_explicit_event_idle_override_retains_precedence(monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "17")
+    assert h._resolve_codex_event_stale_timeout(
+        0,
+        deep_reasoning_gpt56=True,
+    ) == 17.0
+
+
+def test_codex_hard_ceiling_wins_over_deep_reasoning_floor(tmp_path, monkeypatch):
+    """The existing absolute ceiling is applied after the new 240s floor."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    agent.model = "gpt-5.6-sol"
+    monkeypatch.setattr(
+        agent, "_compute_non_stream_stale_timeout", lambda *_args, **_kwargs: 60.0
+    )
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", "30")
+
+    class NeverFinishesThread:
+        def __init__(self, *, target, daemon):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            return True
+
+    clock = {"now": 0.0}
+
+    def advancing_time():
+        clock["now"] += 10.0
+        return clock["now"]
+
+    monkeypatch.setattr(h.threading, "Thread", NeverFinishesThread)
+    monkeypatch.setattr(h.time, "time", advancing_time)
+
+    with pytest.raises(TimeoutError, match=r"threshold: 30s"):
+        h.interruptible_api_call(agent, {
+            "model": "gpt-5.6-sol",
+            "input": "hi",
+            "reasoning": {"effort": "high"},
+        })
+
+
 
 
 
@@ -345,7 +497,4 @@ def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkey
         assert "with no response" in str(excinfo.value)
     finally:
         stop["flag"] = True
-
-
-
 

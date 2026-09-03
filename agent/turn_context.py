@@ -52,6 +52,107 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+def _route_receipt_lock(agent: Any) -> threading.Lock:
+    """Return the per-agent lock protecting cross-thread attempt accounting."""
+    lock = getattr(agent, "_route_receipt_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        agent._route_receipt_lock = lock
+    return lock
+
+
+def reset_route_receipt(agent: Any) -> None:
+    """Reset privacy-safe physical-route accounting for one user turn."""
+    primary = getattr(agent, "_primary_runtime", None) or {}
+    requested_model = primary.get("model") or getattr(agent, "model", None)
+    requested_provider = primary.get("provider") or getattr(agent, "provider", None)
+    with _route_receipt_lock(agent):
+        agent._route_receipt_started_at = time.monotonic()
+        agent._route_receipt_attempts = []
+        agent._route_receipt_requested_route = {
+            "model": str(requested_model or "").strip() or None,
+            "provider": str(requested_provider or "").strip() or None,
+        }
+
+
+def begin_route_attempt(
+    agent: Any,
+    *,
+    model: Any = None,
+    provider: Any = None,
+) -> dict:
+    """Record one observed provider/app-server dispatch as pending.
+
+    A normal transport return is not success yet: the conversation loop must
+    validate and accept the response first.  Transport exceptions finish the
+    returned token as failed at their wire boundary; downstream validation
+    finishes the most recent pending token.
+    """
+    try:
+        fallback_activated = int(
+            getattr(agent, "_fallback_index", 0) or 0
+        ) > 0
+    except (TypeError, ValueError, OverflowError):
+        fallback_activated = False
+
+    resolved_model = model if model is not None else getattr(agent, "model", None)
+    resolved_provider = (
+        provider if provider is not None else getattr(agent, "provider", None)
+    )
+    attempt = {
+        "model": str(resolved_model or "").strip() or None,
+        "provider": str(resolved_provider or "").strip() or None,
+        "outcome": "pending",
+        # Internal-only provenance.  This marker never enters the public
+        # receipt; it prevents harmless route alias normalization from being
+        # misclassified as configured fallback activation.
+        "fallback_activated": fallback_activated,
+    }
+    lock = _route_receipt_lock(agent)
+    with lock:
+        attempts = getattr(agent, "_route_receipt_attempts", None)
+        if not isinstance(attempts, list):
+            attempts = []
+            agent._route_receipt_attempts = attempts
+        attempt["ordinal"] = len(attempts) + 1
+        attempts.append(attempt)
+    return attempt
+
+
+def finish_route_attempt(
+    agent: Any,
+    attempt: dict | None = None,
+    *,
+    outcome: str,
+) -> None:
+    """Settle one pending attempt as ``completed`` or ``failed`` once."""
+    if outcome not in {"completed", "failed"}:
+        raise ValueError("route attempt outcome must be completed or failed")
+    lock = _route_receipt_lock(agent)
+    with lock:
+        attempts = getattr(agent, "_route_receipt_attempts", None)
+        if attempt is None:
+            if not isinstance(attempts, list):
+                return
+            attempt = next(
+                (
+                    candidate
+                    for candidate in reversed(attempts)
+                    if isinstance(candidate, dict)
+                    and candidate.get("outcome") == "pending"
+                ),
+                None,
+            )
+        elif not isinstance(attempts, list) or not any(
+            candidate is attempt for candidate in attempts
+        ):
+            # A worker from a cancelled prior turn may unwind after the next
+            # turn reset. Never let its stale token mutate current accounting.
+            return
+        if isinstance(attempt, dict) and attempt.get("outcome") == "pending":
+            attempt["outcome"] = outcome
+
+
 def _preflight_request_tokens(
     agent: Any,
     messages: List[Dict[str, Any]],
@@ -602,6 +703,10 @@ def build_turn_context(
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
+    # Route provenance is per-turn, never per-session.  Reset after primary
+    # restoration so requested_route represents the invocation's primary
+    # runtime even when the prior turn finished on a fallback.
+    reset_route_receipt(agent)
 
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.

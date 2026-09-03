@@ -783,6 +783,12 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     if visited is None:
         visited = set()
 
+    # Explicit zero-tool sentinel for governed one-shot/evaluation runs.
+    # Keep this distinct from ``enabled_toolsets=None``, which means use the
+    # configured/default tool inventory.
+    if name == "none":
+        return []
+
     # Special aliases that represent all tools across every toolset
     # This ensures future toolsets are automatically included without changes.
     if name in {"all", "*"}:
@@ -960,8 +966,10 @@ def validate_toolset(name: str) -> bool:
     Returns:
         bool: True if valid, False otherwise
     """
-    # Accept special alias names for convenience
-    if name in {"all", "*"}:
+    # Accept special alias names for convenience. ``none`` is the explicit
+    # empty set; it is useful when a caller must prove that no tools were
+    # available rather than merely observing that none happened to be called.
+    if name in {"all", "*", "none"}:
         return True
     if name in TOOLSETS:
         return True

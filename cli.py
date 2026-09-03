@@ -51,7 +51,10 @@ logger = logging.getLogger(__name__)
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
 from hermes_cli.fallback_config import get_fallback_chain
-from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+from hermes_cli.cli_agent_setup_mixin import (
+    CLIAgentSetupMixin,
+    saved_profile_default_route,
+)
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
 from agent.interrupt_compat import request_hard_interrupt
@@ -935,6 +938,24 @@ def _sync_process_session_id(session_id: str) -> None:
     from gateway.session_context import set_current_session_id
 
     set_current_session_id(session_id)
+
+
+def _emit_quiet_route_receipt(result, *, stream=None) -> None:
+    """Write the compact machine-readable -Q route receipt to stderr only."""
+    if not isinstance(result, dict):
+        return
+    from agent.turn_finalizer import sanitize_route_receipt
+
+    receipt = sanitize_route_receipt(result.get("route_receipt"))
+    if receipt is None:
+        return
+    target = stream if stream is not None else sys.stderr
+    target.write(
+        "route_receipt: "
+        + json.dumps(receipt, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    )
+    target.flush()
 
 # Cron job system for scheduled tasks (execution is handled by the gateway)
 def get_job(*args, **kwargs):
@@ -5359,6 +5380,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # being discarded and replaced by the outer merged ``model.provider``
         # (typically ``"auto"``, which is authoritative at runtime resolution).
         _config_model, _nested_provider = _split_model_config_default(_raw_default)
+        # Freeze the saved profile route before command-line overrides,
+        # environment resolution, provider auto-detection, or fallback can
+        # mutate the live runtime.  This is provenance only; it never affects
+        # routing.
+        self._profile_default_route = saved_profile_default_route(_model_config)
         _DEFAULT_CONFIG_MODEL = ""
         # Track whether the user passed -m / --model so resume knows not to
         # clobber an explicit override with the session's stored model.
@@ -22264,6 +22290,7 @@ def main(
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                        _emit_quiet_route_receipt(result)
 
                         # Ensure proper exit code for automation wrappers.
                         #

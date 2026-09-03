@@ -121,6 +121,10 @@ class TestValidateToolset:
         assert validate_toolset("web") is True
         assert validate_toolset("terminal") is True
 
+    def test_none_is_explicit_empty_toolset(self):
+        assert validate_toolset("none") is True
+        assert resolve_toolset("none") == []
+
 
     def test_invalid(self):
         assert validate_toolset("nonexistent") is False
@@ -355,4 +359,3 @@ class TestResolveToolsetMemo:
         second = resolve_toolset("hermes-cli", include_registry=False)
         assert first == second
         assert first  # non-empty sanity
-

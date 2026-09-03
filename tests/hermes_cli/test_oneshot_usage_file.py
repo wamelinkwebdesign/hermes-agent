@@ -22,6 +22,32 @@ def _result(**overrides):
         "session_id": "abc123",
         "completed": True,
         "failed": False,
+        "route_receipt": {
+            "profile_default_route": {
+                "model": "claude-opus-5-max-cli",
+                "provider": "custom:claude-max-bridge",
+            },
+            "requested_route": {
+                "model": "openai/gpt-5.5",
+                "provider": "openrouter",
+            },
+            "completed_route": {
+                "model": "openai/gpt-5.5",
+                "provider": "openrouter",
+            },
+            "attempt_count": 1,
+            "attempts": [{
+                "ordinal": 1,
+                "model": "openai/gpt-5.5",
+                "provider": "openrouter",
+                "outcome": "completed",
+            }],
+            "fallback_used": False,
+            "successful_api_calls": 1,
+            "elapsed_ms": 12,
+            "terminal_status": "completed",
+            "terminal_reason": "text_response",
+        },
     }
     base.update(overrides)
     return base
@@ -38,6 +64,7 @@ class TestWriteUsageFile:
         assert report["model"] == "openai/gpt-5.5"
         assert report["api_calls"] == 3
         assert report["failed"] is False
+        assert report["route_receipt"] == _result()["route_receipt"]
         assert "failure" not in report
 
     def test_none_path_is_noop(self, tmp_path):
@@ -54,4 +81,23 @@ class TestWriteUsageFile:
         # Missing result fields serialize as null, not KeyError.
         assert report["estimated_cost_usd"] is None
 
+    def test_route_receipt_is_allowlist_sanitized(self, tmp_path):
+        secret = "sk-usage-file-secret"
+        result = _result()
+        result["route_receipt"] = {
+            **result["route_receipt"],
+            "prompt": secret,
+            "attempts": [{
+                **result["route_receipt"]["attempts"][0],
+                "exception": secret,
+            }],
+        }
+        path = tmp_path / "usage.json"
 
+        _write_usage_file(str(path), result)
+
+        report = json.loads(path.read_text())
+        serialized = json.dumps(report["route_receipt"])
+        assert secret not in serialized
+        assert "prompt" not in report["route_receipt"]
+        assert "exception" not in report["route_receipt"]["attempts"][0]

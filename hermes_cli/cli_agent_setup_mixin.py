@@ -21,6 +21,33 @@ from rich.markup import escape as _escape
 from utils import base_url_host_matches
 
 
+def saved_profile_default_route(model_config) -> dict[str, str | None]:
+    """Return the model/provider saved in the active profile config.
+
+    This deliberately reads only ``model_config``.  Invocation overrides,
+    environment variables, provider auto-detection, and fallback activation
+    belong to different receipt fields and must not rewrite profile provenance.
+    """
+    from hermes_cli.config import split_model_config_default
+
+    if isinstance(model_config, dict):
+        raw_default = (
+            model_config.get("default")
+            or model_config.get("model")
+            or ""
+        )
+        model, nested_provider = split_model_config_default(raw_default)
+        provider = nested_provider or str(model_config.get("provider") or "").strip()
+    else:
+        model, nested_provider = split_model_config_default(model_config or "")
+        provider = nested_provider
+
+    return {
+        "model": str(model or "").strip() or None,
+        "provider": str(provider or "").strip() or None,
+    }
+
+
 def _single_query_clarify_callback(question: str, choices=None, multi_select=False) -> str:
     """Clarify has no interactive surface in a single-query (-q) turn.
 
@@ -577,6 +604,13 @@ class CLIAgentSetupMixin:
                 notice_callback=self._on_notice,
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
+            )
+            # Saved-profile provenance is intentionally attached after agent
+            # construction: AIAgent's primary runtime already represents the
+            # invocation (including CLI overrides), while this value remains
+            # the unmodified profile default for route receipts.
+            self.agent._profile_default_route = dict(
+                getattr(self, "_profile_default_route", {}) or {}
             )
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a

@@ -29,7 +29,7 @@ def _quiet_branch() -> str:
     start = source.index(_QUIET_ANCHOR)
     # A generous window covers the whole branch body up to the
     # run_conversation call and beyond.
-    return source[start : start + 8000]
+    return source[start : start + 10000]
 
 
 def test_quiet_branch_clears_reasoning_callback():
@@ -103,3 +103,10 @@ def test_quiet_branch_neutralizations_precede_run_conversation():
         assert branch.index(attr) < run_idx, (
             f"`{attr}` must run before run_conversation in the quiet branch"
         )
+
+
+def test_quiet_route_receipt_is_emitted_after_session_id_to_stderr():
+    branch = _quiet_branch()
+    session_idx = branch.index('print(f"\\nsession_id: {cli.session_id}", file=sys.stderr)')
+    receipt_idx = branch.index("_emit_quiet_route_receipt(result)")
+    assert session_idx < receipt_idx

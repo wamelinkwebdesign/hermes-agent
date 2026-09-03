@@ -85,6 +85,11 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
+        receipt = result["route_receipt"]
+        assert receipt["attempt_count"] == 1
+        assert receipt["successful_api_calls"] == 1
+        assert receipt["completed_route"] == receipt["requested_route"]
+        assert receipt["attempts"][0]["outcome"] == "completed"
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):

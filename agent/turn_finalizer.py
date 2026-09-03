@@ -24,12 +24,244 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+
+
+_ROUTE_RECEIPT_TERMINAL_REASONS = frozenset({
+    "all_retries_exhausted_no_response",
+    "api_attempts_exhausted",
+    "approval_denied",
+    "budget_exhausted",
+    "compaction_handoff_not_actionable",
+    "completed",
+    "compression_deferred",
+    "context_compression_timeout",
+    "empty_response_exhausted",
+    "error",
+    "error_near_max_iterations",
+    "fallback_prior_turn_content",
+    "guardrail_halt",
+    "interpreter_shutdown",
+    "interrupt",
+    "interrupted_by_user",
+    "interrupted_during_api_call",
+    "invalid_response",
+    "local_processing_error",
+    "max_iterations_reached",
+    "ollama_runtime_context_too_small",
+    "partial_stream_recovery",
+    "provider_failure",
+    "repeated_outer_errors",
+    "review_input_budget_exhausted",
+    "session_persistence_failed",
+    "system_aborted",
+    "text_response",
+    "timed_out",
+    "unknown",
+})
+_ROUTE_RECEIPT_TERMINAL_STATUSES = frozenset({
+    "completed",
+    "failed",
+    "incomplete",
+    "interrupted",
+    "partial",
+})
+
+
+def _route_value(value):
+    """Bound a model/provider label without deriving data from exceptions."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:256] or None
+
+
+def _route_pair(value) -> dict[str, str | None]:
+    value = value if isinstance(value, dict) else {}
+    return {
+        "model": _route_value(value.get("model")),
+        "provider": _route_value(value.get("provider")),
+    }
+
+
+def _terminal_reason(value) -> str:
+    # Some internal reasons carry diagnostic detail in parentheses, including
+    # exception text.  Only the static category before that detail is eligible
+    # for this public receipt.
+    category = str(value or "unknown").split("(", 1)[0].strip()
+    if category in _ROUTE_RECEIPT_TERMINAL_REASONS:
+        return category
+    return "unknown"
+
+
+def _receipt_attempts(value) -> list[dict]:
+    """Reconstruct public attempt rows from the exact safe field allowlist."""
+    raw_attempts = value if isinstance(value, list) else []
+    attempts = []
+    for raw in raw_attempts:
+        if not isinstance(raw, dict):
+            continue
+        outcome = raw.get("outcome")
+        if outcome not in {"completed", "failed"}:
+            # Pending/unrecognized attempts fail closed in an externally
+            # visible terminal receipt.
+            outcome = "failed"
+        attempts.append({
+            "ordinal": len(attempts) + 1,
+            "model": _route_value(raw.get("model")),
+            "provider": _route_value(raw.get("provider")),
+            "outcome": outcome,
+        })
+    return attempts
+
+
+def _nonnegative_int(value) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def sanitize_route_receipt(value) -> dict | None:
+    """Rebuild an existing receipt for safe CLI/usage-file publication.
+
+    This is a defense-in-depth boundary for results supplied by middleware or
+    tests: unknown keys (including prompts, URLs, credentials, or arbitrary
+    exception data) are discarded, and all nested objects are reconstructed
+    from the same strict public schema as a locally-built receipt.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    attempts = _receipt_attempts(value.get("attempts"))
+    successful = [
+        attempt for attempt in attempts if attempt["outcome"] == "completed"
+    ]
+    raw_completed_route = value.get("completed_route")
+    if successful:
+        completed_route = (
+            _route_pair(raw_completed_route)
+            if isinstance(raw_completed_route, dict)
+            else {
+                "model": successful[-1]["model"],
+                "provider": successful[-1]["provider"],
+            }
+        )
+    else:
+        completed_route = None
+
+    terminal_status = value.get("terminal_status")
+    if terminal_status not in _ROUTE_RECEIPT_TERMINAL_STATUSES:
+        terminal_status = "incomplete"
+
+    return {
+        "profile_default_route": _route_pair(value.get("profile_default_route")),
+        "requested_route": _route_pair(value.get("requested_route")),
+        "completed_route": completed_route,
+        "attempt_count": len(attempts),
+        "attempts": attempts,
+        "fallback_used": bool(attempts) and value.get("fallback_used") is True,
+        "successful_api_calls": len(successful),
+        "elapsed_ms": _nonnegative_int(value.get("elapsed_ms")),
+        "terminal_status": terminal_status,
+        "terminal_reason": _terminal_reason(value.get("terminal_reason")),
+    }
+
+
+def build_route_receipt(
+    agent,
+    *,
+    completed: bool,
+    failed: bool,
+    partial: bool = False,
+    interrupted: bool = False,
+    terminal_reason: str = "unknown",
+) -> dict:
+    """Build the strict, privacy-safe route receipt for the current turn.
+
+    The object is reconstructed from an explicit key allowlist.  It never
+    includes URLs, credentials, prompts, response bodies, or exception text.
+    """
+    raw_attempts = getattr(agent, "_route_receipt_attempts", None) or []
+    attempts = _receipt_attempts(raw_attempts)
+
+    requested_route = _route_pair(
+        getattr(agent, "_route_receipt_requested_route", None)
+    )
+    profile_default_route = _route_pair(
+        getattr(agent, "_profile_default_route", None)
+    )
+    successful = [attempt for attempt in attempts if attempt["outcome"] == "completed"]
+    completed_route = None
+    if successful:
+        completed_route = {
+            "model": successful[-1]["model"],
+            "provider": successful[-1]["provider"],
+        }
+
+    # A route string can legitimately change during request normalization
+    # without activating Hermes' configured fallback chain.  Derive this flag
+    # only from the internal per-attempt activation marker captured alongside
+    # the physical call.  The marker itself is deliberately not exposed in the
+    # public receipt; the receipt remains reconstructed from the strict field
+    # allowlist above.
+    fallback_used = any(
+        raw.get("fallback_activated") is True
+        for raw in raw_attempts
+        if isinstance(raw, dict)
+    )
+    failed_without_response = bool(attempts) and not successful
+
+    if interrupted:
+        terminal_status = "interrupted"
+    elif failed or failed_without_response:
+        terminal_status = "failed"
+    elif partial:
+        terminal_status = "partial"
+    elif completed:
+        terminal_status = "completed"
+    else:
+        terminal_status = "incomplete"
+
+    started_at = getattr(agent, "_route_receipt_started_at", None)
+    try:
+        elapsed_ms = max(0, int((time.monotonic() - float(started_at)) * 1000))
+    except (TypeError, ValueError, OverflowError):
+        elapsed_ms = 0
+
+    return {
+        "profile_default_route": profile_default_route,
+        "requested_route": requested_route,
+        "completed_route": completed_route,
+        "attempt_count": len(attempts),
+        "attempts": attempts,
+        "fallback_used": fallback_used,
+        "successful_api_calls": len(successful),
+        "elapsed_ms": elapsed_ms,
+        "terminal_status": terminal_status,
+        "terminal_reason": _terminal_reason(terminal_reason),
+    }
+
+
+def attach_route_receipt(agent, result: dict, *, terminal_reason: str | None = None) -> dict:
+    """Attach a receipt to an early-return result and return the same dict."""
+    result["route_receipt"] = build_route_receipt(
+        agent,
+        completed=bool(result.get("completed")),
+        failed=bool(result.get("failed")),
+        partial=bool(result.get("partial")),
+        interrupted=bool(result.get("interrupted")),
+        terminal_reason=terminal_reason or result.get("turn_exit_reason") or "unknown",
+    )
+    return result
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
@@ -741,6 +973,14 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    result["route_receipt"] = build_route_receipt(
+        agent,
+        completed=completed,
+        failed=failed,
+        partial=False,
+        interrupted=interrupted,
+        terminal_reason=_turn_exit_reason,
+    )
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
