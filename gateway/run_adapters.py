@@ -523,6 +523,19 @@ class GatewayAdapterLifecycleMixin:
         try:
             while self._running:
                 try:
+                    team_dispatch = getattr(self, "_team_dispatch", None)
+                    if team_dispatch is not None:
+                        try:
+                            await team_dispatch.tick()
+                        except Exception as exc:
+                            logger.warning("Team dispatch poll failed (%s)", type(exc).__name__)
+                    public_handoff = getattr(self, "_public_handoff", None)
+                    if public_handoff is not None:
+                        try:
+                            await public_handoff.tick()
+                        except Exception as exc:
+                            # An unreadable public spool must not starve private CLI handoffs.
+                            logger.warning("Public handoff poll failed (%s)", type(exc).__name__)
                     for profile_name, profile_home in _handoff_watch_scopes(self):
                         async with _scope(profile_home):
                             await _tick(profile_name)
@@ -533,6 +546,9 @@ class GatewayAdapterLifecycleMixin:
                 await asyncio.sleep(interval)
         finally:
             # Bounded drain: cancelling would strand in-flight rows in 'running'.
+            team_dispatch = getattr(self, "_team_dispatch", None)
+            if team_dispatch is not None:
+                await team_dispatch.close()
             pending_tasks = [t for t in inflight.values() if not t.done()]
             if pending_tasks:
                 with _log_suppressed(logging.DEBUG, "Handoff drain raised", exc_info=True):
@@ -1103,6 +1119,10 @@ class GatewayAdapterLifecycleMixin:
         )
         adapter.set_platform_event_handler(platform_event_handler or self._primary_platform_event_handler())
         adapter._busy_text_mode = (self._busy_text_mode if busy_text_mode is None else busy_text_mode)
+        from gateway.run_public_handoff import install_public_handoff
+        from gateway.run_team_dispatch import install_team_dispatch
+        install_team_dispatch(self, adapter)
+        install_public_handoff(self, adapter)
 
     def _configure_profile_adapter(
         self, adapter: BasePlatformAdapter, profile_name: str, platform: Platform

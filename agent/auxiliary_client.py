@@ -1387,6 +1387,19 @@ class _CodexCompletionsAdapter:
             "model": wire_model, "instructions": instructions,
             "input": input_items or [{"role": "user", "content": ""}], "store": False,
         }
+        # Structured output is a wire contract, not merely prompt compliance.
+        # Responses flattens Chat Completions' json_schema envelope into text.format.
+        response_format = kwargs.get("response_format")
+        if response_format is not None:
+            import copy
+            if response_format.get("type") == "json_schema":
+                resp_kwargs["text"] = {"format": {
+                    **copy.deepcopy(response_format["json_schema"]), "type": "json_schema",
+                }}
+            elif response_format.get("type") in {"json_object", "text"}:
+                resp_kwargs["text"] = {"format": {"type": response_format["type"]}}
+            else:
+                raise ValueError("unsupported_responses_format")
         # Forward the chat.completions timeout; otherwise a Codex stream can sit behind a
         # dead-looking CLI until the user force-interrupts.
         timeout = kwargs.get("timeout")
@@ -4681,6 +4694,16 @@ def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
                        "or auxiliary.<task>.model for per-task aux routing).")
         return None, None
     no_token_msg = "resolve_provider_client: openai-codex requested but no Codex OAuth token found (run: hermes model)"
+    if req.explicit_base_url and req.explicit_api_key:
+        # A host may already have resolved the exact credential/endpoint. Do not
+        # rotate or re-resolve that route while constructing its bounded call.
+        client = _create_openai_client(
+            api_key=req.explicit_api_key, base_url=req.explicit_base_url,
+            default_headers=_codex_cloudflare_headers(req.explicit_api_key, base_url=req.explicit_base_url),
+        )
+        if not req.raw_codex:
+            client = CodexAuxiliaryClient(client, model)
+        return _route_client(req, client, model)
     if req.raw_codex:
         # Raw OpenAI client for callers needing responses.stream() (main agent loop).
         codex_token = _read_codex_access_token()

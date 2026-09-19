@@ -3502,6 +3502,62 @@ class TelegramAdapter(BasePlatformAdapter):
                 retryable=(self._looks_like_connect_timeout(e) or self._looks_like_pool_timeout(e) or not is_timeout),
                 error_kind=error_kind)
 
+    def prepare_public_handoff(self, content):
+        """Prepare before fencing; never use a transport error to choose plain text.
+
+        The raw answer retains the dispatch cap. Bounding the escaped payload
+        also bounds rendered UTF-16 length, including table expansion. If markup
+        expansion exceeds Telegram's limit, choose plain text locally instead.
+        """
+        if not content.strip() or utf16_len(content) > 4000:
+            raise ValueError("invalid_handoff_length")
+        formatted = self.format_message(content)
+        if utf16_len(formatted) > self.MAX_MESSAGE_LENGTH:
+            return content, None
+        # _escape_bare_bracket scans back only 1999 characters. An encoded URL
+        # of that length can lose its closing delimiter. Choose plain mode here,
+        # before the send fence, rather than relying on a Telegram parse retry.
+        for link in re.finditer(r'\]\(((?:\\.|[^\\)])*)', formatted, re.DOTALL):
+            if len(link.group(1)) >= 1999:
+                return content, None
+        return formatted, ParseMode.MARKDOWN_V2
+
+    async def send_public_handoff(self, chat_id, thread_id, reply_to, content, bot_id, *, parse_mode=None):
+        """One prepared attempt, no chunking, rich fallback, retry or topic fallback.
+
+        The caller MUST have persisted its pre-send fence. Any exception, including
+        a mismatched Telegram receipt, is an uncertain delivery, never safe replay.
+        """
+        if str(getattr(self._bot, "id", "")) != bot_id:
+            raise ValueError("transport_identity_changed")
+        kwargs = {"chat_id": int(chat_id), "text": content, "reply_to_message_id": int(reply_to),
+                  "parse_mode": parse_mode}
+        if thread_id is not None:
+            kwargs["message_thread_id"] = int(thread_id)
+        sent = await self._bot.send_message(**kwargs)
+        actual_thread = str(sent.message_thread_id) if sent.message_thread_id is not None else None
+        reply_thread_echo = None
+        if thread_id is None and actual_thread is not None:
+            # Telegram replies in the source thread of reply_to_message_id and echoes that
+            # id even in non-forum groups (telegram-bot-api #798). Accept only an echo of
+            # the anchor we sent; it is not a routing identity and the persisted receipt
+            # keeps the requested thread_id (None), with the echo recorded for audit.
+            if actual_thread == str(int(reply_to)):
+                reply_thread_echo = actual_thread
+            else:
+                raise ValueError("delivery_identity_mismatch")
+        elif actual_thread != thread_id:
+            raise ValueError("delivery_identity_mismatch")
+        if str(sent.chat.id) != chat_id or str(sent.from_user.id) != bot_id:
+            raise ValueError("delivery_identity_mismatch")
+        if not isinstance(sent.message_id, int) or sent.message_id <= 0:
+            raise ValueError("missing_delivery_id")
+        receipt = {"bot_id": bot_id, "chat_id": chat_id, "thread_id": thread_id,
+                   "message_id": str(sent.message_id)}
+        if reply_thread_echo is not None:
+            receipt["reply_thread_echo"] = reply_thread_echo
+        return receipt
+
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a status message, or edit the previous one with the same ``(chat_id, status_key)``; if the
@@ -5893,6 +5949,9 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id_str = self._chat_id_str(message)
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
+        from gateway.public_handoff_policy import native_excludes_self
+        if native_excludes_self(self, message):
+            return False
         # Resolve once; _message_mentions_bot is not re-called below in guest mode.
         guest_mention = self._is_guest_mention(message)
         # allowed_chats whitelist: outside chats pass only via the guest-mode explicit mention.
@@ -5963,6 +6022,17 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)
 
+    async def _team_consumes(self, message):
+        handler = getattr(self, "_team_dispatch_handler", None)
+        if handler is None:
+            return False
+        try:
+            result = await handler(message)
+            return result if type(result) is bool else True
+        except Exception as exc:
+            logger.error("Team ingress rejected: %s", exc, exc_info=True)
+            return True
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""
         msg = self._effective_update_message(update)
@@ -5971,6 +6041,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        if await self._team_consumes(msg):
+            return
+        public_handler = getattr(self, "_public_handoff_handler", None)
+        if public_handler is not None and await public_handler(msg):
             return
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
@@ -5982,10 +6057,15 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if not self._should_process_message(msg, is_command=True):
-            return
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        if await self._team_consumes(msg):
+            return
+        public_handler = getattr(self, "_public_handoff_handler", None)
+        if public_handler is not None and await public_handler(msg):
+            return
+        if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
         event = await self._build_triggered_event(msg, update, MessageType.COMMAND)
@@ -6003,6 +6083,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        if await self._team_consumes(msg):
+            return
+        public_handler = getattr(self, "_public_handoff_handler", None)
+        if public_handler is not None and await public_handler(msg):
             return
         if not self._gate_or_observe(msg, update, MessageType.LOCATION):
             return
@@ -6033,14 +6118,31 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped batching key; topic recovery first so DM-topic batches coalesce on the recovered lane."""
+        if getattr(event, "_team_batch_key", None):
+            return event._team_batch_key
         self._apply_topic_recovery(event)
         return super()._text_batch_key(event)
+
+    async def handle_message(self, event: MessageEvent):
+        if getattr(event, "_team_request", None) is not None:
+            handler = getattr(self, "_team_batch_handler", None)
+            if handler is not None:
+                return await handler(event)
+            return
+        return await super().handle_message(event)
+
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text chunk, or hold it while delayed delivery must be dropped."""
         if self._should_drop_delayed_delivery():
             self._hold_inbound_event(event, where="text-enqueue")
             return
+        if getattr(event, "_team_request", None) is not None:
+            existing = self._pending_text_batches.get(self._text_batch_key(event))
+            if existing is not None:
+                from gateway.team_dispatch_batch import merge_ids
+                if not merge_ids(existing, event):
+                    return
         super()._enqueue_text_event(event)
 
     async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:
@@ -6281,6 +6383,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg, level=logging.INFO, what="media from unauthorized user")
+            return
+        if await self._team_consumes(msg):
+            return
+        public_handler = getattr(self, "_public_handoff_handler", None)
+        if public_handler is not None and await public_handler(msg):
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
