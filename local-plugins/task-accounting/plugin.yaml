@@ -1,0 +1,16 @@
+name: task-accounting
+version: "0.1.0"
+description: "Opt-in local-only content-free task accounting pilot. No tools or prompt changes."
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_auxiliary_call
+  - post_auxiliary_call
+  - subagent_start
+  - subagent_stop
+config_schema:
+  enabled:
+    type: bool
+    default: false
+    description: "Collect allowlisted metadata to the active profile's private local SQLite file."

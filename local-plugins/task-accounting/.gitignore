@@ -1,0 +1,6 @@
+.test-runtime/
+__pycache__/
+*.pyc
+# Local verification receipts may contain operator paths.
+evidence/
+IMPLEMENTATION.md
